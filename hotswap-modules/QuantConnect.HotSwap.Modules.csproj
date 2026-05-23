@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>QuantConnect.HotSwap.Modules</AssemblyName>
+    <RootNamespace>QuantConnect.HotSwap.Modules</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Lean/Common/QuantConnect.csproj" />
+    <ProjectReference Include="../Lean/Algorithm/QuantConnect.Algorithm.csproj" />
+  </ItemGroup>
+</Project>

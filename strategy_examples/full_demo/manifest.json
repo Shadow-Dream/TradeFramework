@@ -1,0 +1,98 @@
+{
+  "name": "full-demo-devkit",
+  "modules": [
+    {
+      "key": "input.full",
+      "kind": "Input",
+      "activationMode": "ScriptRunner",
+      "entryPoint": "python.full-demo.input",
+      "version": "devkit",
+      "parameters": {
+        "command": "python3",
+        "arguments": "{{releaseRoot}}/strategy.py worker",
+        "workingDirectory": "{{releaseRoot}}"
+      },
+      "hotSwapMode": "Live"
+    },
+    {
+      "key": "signal.full",
+      "kind": "Signal",
+      "activationMode": "RemoteService",
+      "entryPoint": "python.full-demo.signal",
+      "version": "devkit",
+      "parameters": {
+        "baseUrl": "http://127.0.0.1:8765"
+      },
+      "hotSwapMode": "Live"
+    },
+    {
+      "key": "target.full",
+      "kind": "Target",
+      "activationMode": "ScriptRunner",
+      "entryPoint": "python.full-demo.target",
+      "version": "devkit",
+      "parameters": {
+        "command": "python3",
+        "arguments": "{{releaseRoot}}/strategy.py worker",
+        "workingDirectory": "{{releaseRoot}}"
+      },
+      "hotSwapMode": "Live"
+    },
+    {
+      "key": "constraint.full",
+      "kind": "Constraint",
+      "activationMode": "RemoteService",
+      "entryPoint": "python.full-demo.constraint",
+      "version": "devkit",
+      "parameters": {
+        "baseUrl": "http://127.0.0.1:8765"
+      },
+      "hotSwapMode": "RequiresPause"
+    },
+    {
+      "key": "execution.full",
+      "kind": "Execution",
+      "activationMode": "OutOfProcessWorker",
+      "entryPoint": "python.full-demo.execution",
+      "version": "devkit",
+      "parameters": {
+        "command": "python3",
+        "arguments": "{{releaseRoot}}/strategy.py worker",
+        "workingDirectory": "{{releaseRoot}}"
+      },
+      "hotSwapMode": "RequiresPause"
+    },
+    {
+      "key": "market.full",
+      "kind": "MarketRule",
+      "activationMode": "RemoteService",
+      "entryPoint": "python.full-demo.market",
+      "version": "devkit",
+      "parameters": {
+        "baseUrl": "http://127.0.0.1:8765"
+      },
+      "hotSwapMode": "RequiresFlatNoOrders"
+    },
+    {
+      "key": "analyzer.full",
+      "kind": "Analyzer",
+      "activationMode": "ScriptRunner",
+      "entryPoint": "python.full-demo.analyzer",
+      "version": "devkit",
+      "parameters": {
+        "command": "python3",
+        "arguments": "{{releaseRoot}}/strategy.py worker",
+        "workingDirectory": "{{releaseRoot}}"
+      },
+      "hotSwapMode": "RequiresPause"
+    }
+  ],
+  "inputs": ["input.full"],
+  "universe": [],
+  "signal": ["signal.full"],
+  "target": ["target.full"],
+  "constraint": ["constraint.full"],
+  "execution": ["execution.full"],
+  "marketRule": "market.full",
+  "analyzer": ["analyzer.full"]
+}
