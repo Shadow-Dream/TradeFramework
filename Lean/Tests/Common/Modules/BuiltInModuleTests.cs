@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.IO;
 using NodaTime;
 using QuantConnect.Algorithm;
 using QuantConnect.Algorithm.Framework.Alphas;
@@ -60,7 +61,7 @@ namespace QuantConnect.Tests.Common.Modules
             using var provider = new DefaultDataProvider();
 
             Assert.That(provider, Is.InstanceOf<IModule>());
-            Assert.That(provider.Kind, Is.EqualTo(ModuleKind.Input));
+            Assert.That(provider.Kind, Is.EqualTo(ModuleKind.DataSource));
             Assert.That(provider.ActivationMode, Is.EqualTo(ModuleActivationMode.BuiltIn));
             Assert.That(provider.HotSwapMode, Is.EqualTo(ModuleHotSwapMode.Live));
         }
@@ -71,7 +72,7 @@ namespace QuantConnect.Tests.Common.Modules
             var history = new TestHistoryProvider();
 
             Assert.That(history, Is.InstanceOf<IModule>());
-            Assert.That(history.Kind, Is.EqualTo(ModuleKind.Input));
+            Assert.That(history.Kind, Is.EqualTo(ModuleKind.DataSource));
             Assert.That(history.ActivationMode, Is.EqualTo(ModuleActivationMode.BuiltIn));
             Assert.That(history.HotSwapMode, Is.EqualTo(ModuleHotSwapMode.Live));
         }
@@ -146,6 +147,95 @@ namespace QuantConnect.Tests.Common.Modules
             Assert.That(module, Is.InstanceOf<EmaCrossAlphaModel>());
             Assert.That(module.Key, Is.EqualTo("signal.ema"));
             Assert.That(((EmaCrossAlphaModel)module).Name, Is.EqualTo("EmaCrossAlphaModel(8,21,Daily)"));
+        }
+
+        [Test]
+        public void PipelineManifestJsonLoaderParsesAlphaGraph()
+        {
+            var path = Path.Combine(TestContext.CurrentContext.WorkDirectory, "alpha-graph-pipeline.json");
+            File.WriteAllText(path, $$"""
+            {
+              "name": "alpha-graph-test",
+              "modules": [
+                {
+                  "key": "alpha.source",
+                  "kind": "Signal",
+                  "activationMode": "BuiltIn",
+                  "entryPoint": "{{typeof(NullAlphaModel).FullName}}",
+                  "version": "builtin",
+                  "hotSwapMode": "Live",
+                  "parameters": {}
+                },
+                {
+                  "key": "alpha.model",
+                  "kind": "Signal",
+                  "activationMode": "BuiltIn",
+                  "entryPoint": "{{typeof(NullAlphaModel).FullName}}",
+                  "version": "builtin",
+                  "hotSwapMode": "Live",
+                  "parameters": {}
+                }
+              ],
+              "signal": [],
+              "alphaGraph": {
+                "nodes": ["alpha.source", "alpha.model"],
+                "outputs": {
+                  "insights": ["insight_1"]
+                },
+                "bindings": {
+                  "alpha.source": {
+                    "instanceId": "alpha.source",
+                    "moduleId": "price-source",
+                    "version": "20260524-001",
+                    "config": {},
+                    "inputs": {},
+                    "outputs": {
+                      "price": "price_1"
+                    }
+                  },
+                  "alpha.model": {
+                    "instanceId": "alpha.model",
+                    "moduleId": "direction-to-price-insight",
+                    "version": "20260524-001",
+                    "config": {
+                      "period": 20
+                    },
+                    "inputs": {
+                      "price": "price_1"
+                    },
+                    "outputs": {
+                      "insight": "insight_1"
+                    }
+                  }
+                },
+                "edges": [
+                  {
+                    "wire": "price_1",
+                    "from": {
+                      "node": "alpha.source",
+                      "port": "price",
+                      "type": "series.price"
+                    },
+                    "to": {
+                      "node": "alpha.model",
+                      "port": "price",
+                      "type": "series.price"
+                    }
+                  }
+                ]
+              }
+            }
+            """);
+
+            var manifest = PipelineManifestJsonLoader.Load(path);
+
+            Assert.That(manifest.SignalModules, Is.Empty);
+            Assert.That(manifest.AlphaGraph.HasNodes, Is.True);
+            Assert.That(manifest.AlphaGraph.Nodes, Is.EqualTo(new[] { "alpha.source", "alpha.model" }));
+            Assert.That(manifest.AlphaGraph.Outputs["insights"], Is.EqualTo(new[] { "insight_1" }));
+            Assert.That(manifest.AlphaGraph.Bindings["alpha.model"].Inputs["price"], Is.EqualTo("price_1"));
+            Assert.That(manifest.AlphaGraph.Bindings["alpha.model"].Config["period"], Is.EqualTo("20"));
+            Assert.That(manifest.AlphaGraph.Edges, Has.Count.EqualTo(1));
         }
 
         private sealed class TestAlphaModel : AlphaModel

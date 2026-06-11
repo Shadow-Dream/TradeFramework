@@ -401,9 +401,11 @@ public sealed class MyAnalyzerModule : IAnalyzerModule
 
 | activationMode | 需要的 manifest 参数 | 说明 |
 | --- | --- | --- |
-| `RemoteService` | `baseUrl` | Engine 通过 HTTP 调用远程服务 |
+| `RemoteService` | `baseUrl`，`backend.kind/moduleId/version/protocolVersion/contractHash/deploymentId` | Engine 通过 HTTP 调用远程服务；提交 API 用 `backend` 固定远程后端版本 |
 | `ScriptRunner` | `command`，可选 `arguments` / `workingDirectory` | Engine 每次通过 JSON line 进程协议调用脚本 |
 | `OutOfProcessWorker` | `command`，可选 `arguments` / `workingDirectory` | Engine 通过 JSON line worker 进程调用 |
+
+`RemoteService` 的 `backend` 是 RPC 模块的版本管理边界。`baseUrl` 可以指向远程机器或云服务，但 `backend.deploymentId` 必须是不可变部署，例如镜像 digest、release id 或 git commit；不能使用 `latest`、`main`、`dev` 这类浮动目标。`backend.contractHash` 固定该服务声明支持的协议、组件类型和 action 集合，格式为 `sha256:<64-hex>`。
 
 当前 transport wrapper 支持：
 

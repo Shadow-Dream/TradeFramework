@@ -266,8 +266,9 @@ namespace QuantConnect.Algorithm
                 return;
             }
 
+            var lanesManifestPath = Config.Get("pipeline-lanes-manifest");
             var manifestPath = Config.Get("pipeline-manifest");
-            if (string.IsNullOrWhiteSpace(manifestPath))
+            if (string.IsNullOrWhiteSpace(lanesManifestPath) && string.IsNullOrWhiteSpace(manifestPath))
             {
                 return;
             }
@@ -277,7 +278,11 @@ namespace QuantConnect.Algorithm
                 new ScriptRunnerModuleFactory(),
                 new ReflectionModuleFactory(),
                 new ExternalAssemblyModuleFactory()));
-            var loadedPipeline = runtime.LoadAsync(PipelineManifestJsonLoader.Load(manifestPath)).GetAwaiter().GetResult();
+            var activeManifestPath = string.IsNullOrWhiteSpace(lanesManifestPath) ? manifestPath : lanesManifestPath;
+            Func<PipelineManifest> loadManifest = string.IsNullOrWhiteSpace(lanesManifestPath)
+                ? () => PipelineManifestJsonLoader.Load(manifestPath)
+                : () => PipelineLanesManifestJsonLoader.Load(lanesManifestPath);
+            var loadedPipeline = runtime.LoadAsync(loadManifest()).GetAwaiter().GetResult();
             PipelineBinder.Bind(this, loadedPipeline);
             ActivePipeline = loadedPipeline;
             _pipelineConfigured = true;
@@ -286,7 +291,7 @@ namespace QuantConnect.Algorithm
             if (interval > 0)
             {
                 _pipelineHotReloadService?.Dispose();
-                _pipelineHotReloadService = new PipelineHotReloadService(this, runtime, manifestPath, loadedPipeline, TimeSpan.FromMilliseconds(interval));
+                _pipelineHotReloadService = new PipelineHotReloadService(this, runtime, activeManifestPath, loadManifest, loadedPipeline, TimeSpan.FromMilliseconds(interval));
             }
         }
 

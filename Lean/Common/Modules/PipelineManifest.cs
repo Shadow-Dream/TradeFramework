@@ -35,6 +35,7 @@ namespace QuantConnect.Modules
         public IReadOnlyList<string> ExecutionModules { get; }
         public string MarketRuleModule { get; }
         public IReadOnlyList<string> AnalyzerModules { get; }
+        public AlphaGraphManifest AlphaGraph { get; }
 
         public PipelineManifest(
             string name,
@@ -46,7 +47,8 @@ namespace QuantConnect.Modules
             IEnumerable<string> constraintModules = null,
             IEnumerable<string> executionModules = null,
             string marketRuleModule = null,
-            IEnumerable<string> analyzerModules = null)
+            IEnumerable<string> analyzerModules = null,
+            AlphaGraphManifest alphaGraph = null)
         {
             if (string.IsNullOrWhiteSpace(name))
             {
@@ -63,6 +65,7 @@ namespace QuantConnect.Modules
             ExecutionModules = Freeze(executionModules);
             MarketRuleModule = marketRuleModule;
             AnalyzerModules = Freeze(analyzerModules);
+            AlphaGraph = alphaGraph ?? AlphaGraphManifest.Empty;
 
             Validate();
         }
@@ -99,6 +102,7 @@ namespace QuantConnect.Modules
             foreach (var key in ConstraintModules) yield return key;
             foreach (var key in ExecutionModules) yield return key;
             foreach (var key in AnalyzerModules) yield return key;
+            foreach (var key in AlphaGraph.Nodes) yield return key;
             if (!string.IsNullOrWhiteSpace(MarketRuleModule)) yield return MarketRuleModule;
         }
 

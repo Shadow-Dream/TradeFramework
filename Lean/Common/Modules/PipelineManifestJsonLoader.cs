@@ -52,7 +52,8 @@ namespace QuantConnect.Modules
                 ParseStage(root, "constraint"),
                 ParseStage(root, "execution"),
                 (string)root["marketRule"],
-                ParseStage(root, "analyzer"));
+                ParseStage(root, "analyzer"),
+                ParseAlphaGraph(root["alphaGraph"]));
         }
 
         private static ModuleConfiguration ParseModule(JToken token)
@@ -79,6 +80,113 @@ namespace QuantConnect.Modules
         {
             return root[key]?.Values<string>().Where(x => !string.IsNullOrWhiteSpace(x)).ToArray()
                 ?? Array.Empty<string>();
+        }
+
+        private static AlphaGraphManifest ParseAlphaGraph(JToken token)
+        {
+            if (token == null || token.Type == JTokenType.Null)
+            {
+                return AlphaGraphManifest.Empty;
+            }
+
+            var root = (JObject)token;
+            var nodes = root["nodes"]?.Values<string>().Where(x => !string.IsNullOrWhiteSpace(x)).ToArray()
+                ?? Array.Empty<string>();
+            var outputs = ParseStringListDictionary(root["outputs"] as JObject);
+            var bindings = ParseBindings(root["bindings"] as JObject);
+            var edges = (root["edges"] as JArray)?.Select(ParseEdge).ToArray()
+                ?? Array.Empty<AlphaGraphEdge>();
+
+            return new AlphaGraphManifest(nodes, outputs, bindings, edges);
+        }
+
+        private static IReadOnlyDictionary<string, IReadOnlyList<string>> ParseStringListDictionary(JObject root)
+        {
+            var result = new Dictionary<string, IReadOnlyList<string>>();
+            if (root == null)
+            {
+                return result;
+            }
+
+            foreach (var property in root.Properties())
+            {
+                result[property.Name] = property.Value.Values<string>().Where(x => !string.IsNullOrWhiteSpace(x)).ToArray();
+            }
+
+            return result;
+        }
+
+        private static IReadOnlyDictionary<string, AlphaGraphNodeBinding> ParseBindings(JObject root)
+        {
+            var result = new Dictionary<string, AlphaGraphNodeBinding>();
+            if (root == null)
+            {
+                return result;
+            }
+
+            foreach (var property in root.Properties())
+            {
+                var value = (JObject)property.Value;
+                result[property.Name] = new AlphaGraphNodeBinding(
+                    (string)value["instanceId"] ?? property.Name,
+                    (string)value["moduleId"],
+                    (string)value["version"],
+                    ParseStringDictionary(value["inputs"] as JObject),
+                    ParseStringDictionary(value["outputs"] as JObject),
+                    ParseValueDictionary(value["config"] as JObject));
+            }
+
+            return result;
+        }
+
+        private static IReadOnlyDictionary<string, string> ParseStringDictionary(JObject root)
+        {
+            var result = new Dictionary<string, string>();
+            if (root == null)
+            {
+                return result;
+            }
+
+            foreach (var property in root.Properties())
+            {
+                result[property.Name] = (string)property.Value ?? string.Empty;
+            }
+
+            return result;
+        }
+
+        private static IReadOnlyDictionary<string, string> ParseValueDictionary(JObject root)
+        {
+            var result = new Dictionary<string, string>();
+            if (root == null)
+            {
+                return result;
+            }
+
+            foreach (var property in root.Properties())
+            {
+                result[property.Name] = property.Value.Type == JTokenType.String
+                    ? (string)property.Value
+                    : property.Value.ToString(Newtonsoft.Json.Formatting.None);
+            }
+
+            return result;
+        }
+
+        private static AlphaGraphEdge ParseEdge(JToken token)
+        {
+            return new AlphaGraphEdge(
+                (string)token["wire"],
+                ParseEndpoint(token["from"]),
+                ParseEndpoint(token["to"]));
+        }
+
+        private static AlphaGraphEndpoint ParseEndpoint(JToken token)
+        {
+            return new AlphaGraphEndpoint(
+                (string)token?["node"],
+                (string)token?["port"],
+                (string)token?["type"]);
         }
     }
 }

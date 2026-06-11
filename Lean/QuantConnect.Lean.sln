@@ -24,6 +24,8 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "QuantConnect.Indicators", "
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "QuantConnect.Tests", "Tests\QuantConnect.Tests.csproj", "{F15E0E67-E6CA-4BE4-BA36-54D73C5ACC11}"
 EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "QuantConnect.Modules.Tests", "Tests.Modules\QuantConnect.Modules.Tests.csproj", "{A6D91A7B-1D1B-4AC8-A71E-7B77A2A92024}"
+EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "QuantConnect.Queues", "Queues\QuantConnect.Queues.csproj", "{D6633172-1368-4DF6-9444-825C3E00C819}"
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "QuantConnect.Messaging", "Messaging\QuantConnect.Messaging.csproj", "{F2E90E2D-BA25-40E2-B39A-0BA31E68F7F8}"
@@ -90,6 +92,10 @@ Global
 		{F15E0E67-E6CA-4BE4-BA36-54D73C5ACC11}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{F15E0E67-E6CA-4BE4-BA36-54D73C5ACC11}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{F15E0E67-E6CA-4BE4-BA36-54D73C5ACC11}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A6D91A7B-1D1B-4AC8-A71E-7B77A2A92024}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A6D91A7B-1D1B-4AC8-A71E-7B77A2A92024}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A6D91A7B-1D1B-4AC8-A71E-7B77A2A92024}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A6D91A7B-1D1B-4AC8-A71E-7B77A2A92024}.Release|Any CPU.Build.0 = Release|Any CPU
 		{D6633172-1368-4DF6-9444-825C3E00C819}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{D6633172-1368-4DF6-9444-825C3E00C819}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{D6633172-1368-4DF6-9444-825C3E00C819}.Release|Any CPU.ActiveCfg = Release|Any CPU

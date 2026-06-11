@@ -20,7 +20,7 @@
 - `entryPoint` 是否存在；
 - 类型是否实现 `IModule` 或对应可插拔接口；
 - 构造函数是否能用实例 config 创建；
-- RemoteService 是否实现协议并通过 `CheckHealth`；
+- RemoteService 是否实现协议、通过 `CheckHealth`，以及提交的 `backend` 指纹是否匹配不可变部署；
 - ScriptRunner/OutOfProcessWorker 的 `command` 是否可执行；
 - 模块声明的 `hotSwapMode` 是否合理。
 
@@ -74,7 +74,7 @@ Lean 预置模块也已支持按构造函数参数名绑定 config。例如：
 
 部分可用，但正确语义应该是“新增版本并切换接入”，不是覆盖。
 
-当前 custom 模块可以重新 `add-module` 同一个 key 来覆盖，但这会破坏可复现性，不适合作为正式替换语义。内置模块已经禁止覆盖和删除。
+当前 custom 模块不能重新 `add-module` 同一个 `kind/moduleId/version`。这符合可复现性要求：正式替换必须发布新版本，再把 pipeline 接到新版本实例。
 
 推荐前端实现：
 

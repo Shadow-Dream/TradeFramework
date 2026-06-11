@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import importlib.util
 import json
 import shutil
@@ -145,6 +146,30 @@ def build_plugin(work_dir, lean_root, inputs, universe_symbols):
     return plugin_dir / "bin" / "Debug" / "net10.0" / "GeneratedStrategyModules.dll"
 
 
+def remote_parameters(remote_url, kind, module_id, version, commands):
+    protocol_version = "lean-module-v1"
+    contract_payload = {
+        "kind": kind,
+        "moduleId": module_id,
+        "protocolVersion": protocol_version,
+        "commands": sorted(commands),
+    }
+    contract_hash = "sha256:" + hashlib.sha256(
+        json.dumps(contract_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "baseUrl": remote_url,
+        "backend": {
+            "kind": kind,
+            "moduleId": module_id,
+            "version": version,
+            "protocolVersion": protocol_version,
+            "contractHash": contract_hash,
+            "deploymentId": f"local-devkit:{contract_hash.removeprefix('sha256:')[:16]}",
+        },
+    }
+
+
 def manifest(strategy_id, version, remote_url):
     return {
         "name": f"{strategy_id}-{version}",
@@ -173,7 +198,13 @@ def manifest(strategy_id, version, remote_url):
                 "activationMode": "RemoteService",
                 "entryPoint": "strategy-devkit.signal",
                 "version": version,
-                "parameters": {"baseUrl": remote_url},
+                "parameters": remote_parameters(
+                    remote_url,
+                    "Signal",
+                    "strategy-devkit.signal",
+                    version,
+                    ["initialize", "pause", "resume", "restore", "snapshot", "health", "update_signal"],
+                ),
                 "hotSwapMode": "Live",
             },
             {
@@ -195,7 +226,13 @@ def manifest(strategy_id, version, remote_url):
                 "activationMode": "RemoteService",
                 "entryPoint": "strategy-devkit.constraint",
                 "version": version,
-                "parameters": {"baseUrl": remote_url},
+                "parameters": remote_parameters(
+                    remote_url,
+                    "Constraint",
+                    "strategy-devkit.constraint",
+                    version,
+                    ["initialize", "pause", "resume", "restore", "snapshot", "health", "manage_risk"],
+                ),
                 "hotSwapMode": "RequiresPause",
             },
             {
@@ -217,7 +254,23 @@ def manifest(strategy_id, version, remote_url):
                 "activationMode": "RemoteService",
                 "entryPoint": "strategy-devkit.market",
                 "version": version,
-                "parameters": {"baseUrl": remote_url},
+                "parameters": remote_parameters(
+                    remote_url,
+                    "MarketRule",
+                    "strategy-devkit.market",
+                    version,
+                    [
+                        "initialize",
+                        "pause",
+                        "resume",
+                        "restore",
+                        "snapshot",
+                        "health",
+                        "can_submit_order",
+                        "can_execute_order",
+                        "describe_market_rule",
+                    ],
+                ),
                 "hotSwapMode": "RequiresFlatNoOrders",
             },
             {

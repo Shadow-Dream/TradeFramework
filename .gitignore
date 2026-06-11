@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 *.log
+.runtime/
+.tmp_*.png
 
 bin/
 obj/

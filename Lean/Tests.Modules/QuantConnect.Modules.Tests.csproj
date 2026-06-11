@@ -37,6 +37,7 @@
     <Compile Include="..\Tests\Common\Modules\ObservationKeyTests.cs" Link="Common\Modules\ObservationKeyTests.cs" />
     <Compile Include="..\Tests\Common\Modules\PipelineManifestTests.cs" Link="Common\Modules\PipelineManifestTests.cs" />
     <Compile Include="..\Tests\Common\Modules\BuiltInModuleTests.cs" Link="Common\Modules\BuiltInModuleTests.cs" />
+    <Compile Include="..\Tests\Common\Modules\JsonInputModuleTests.cs" Link="Common\Modules\JsonInputModuleTests.cs" />
     <Compile Include="..\Tests\Common\Modules\PortfolioIntentTests.cs" Link="Common\Modules\PortfolioIntentTests.cs" />
     <Compile Include="..\Tests\Common\Modules\AnalyzerModuleTests.cs" Link="Common\Modules\AnalyzerModuleTests.cs" />
     <Compile Include="..\Tests\Common\Modules\ModuleControlPlaneTests.cs" Link="Common\Modules\ModuleControlPlaneTests.cs" />

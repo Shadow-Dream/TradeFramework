@@ -25,13 +25,16 @@ namespace QuantConnect.Algorithm.Modules
     {
         public static LoadedPipeline TryLoadConfiguredPipeline()
         {
+            var lanesManifestPath = Config.Get("pipeline-lanes-manifest");
             var manifestPath = Config.Get("pipeline-manifest");
-            if (string.IsNullOrWhiteSpace(manifestPath))
+            if (string.IsNullOrWhiteSpace(lanesManifestPath) && string.IsNullOrWhiteSpace(manifestPath))
             {
                 return null;
             }
 
-            var manifest = PipelineManifestJsonLoader.Load(manifestPath);
+            var manifest = string.IsNullOrWhiteSpace(lanesManifestPath)
+                ? PipelineManifestJsonLoader.Load(manifestPath)
+                : PipelineLanesManifestJsonLoader.Load(lanesManifestPath);
             var runtime = new PipelineRuntime(new ModuleControlPlane(
                 new RemoteServiceModuleFactory(),
                 new ScriptRunnerModuleFactory(),

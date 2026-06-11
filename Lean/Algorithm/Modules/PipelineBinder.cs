@@ -135,6 +135,10 @@ namespace QuantConnect.Algorithm.Modules
         private static void BindSignals(QCAlgorithm algorithm, LoadedPipeline pipeline)
         {
             var models = ResolveMany<IAlphaModel>(pipeline, pipeline.Manifest.SignalModules);
+            if (pipeline.Manifest.AlphaGraph.HasNodes)
+            {
+                models.Insert(0, new CompiledAlphaGraphModule(pipeline.Manifest.AlphaGraph, pipeline.Modules));
+            }
             if (models.Count == 0) return;
             algorithm.SetAlpha(models[0]);
             for (var i = 1; i < models.Count; i++) algorithm.AddAlpha(models[i]);

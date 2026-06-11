@@ -55,10 +55,10 @@ def manifest(plugin_dll: Path, base_url: str, strategy: str) -> dict:
         "name": f"remote-script-hotswap-{strategy.lower()}",
         "modules": [
             {
-                "key": "data.main",
-                "kind": "Data",
+                "key": "input.main",
+                "kind": "Input",
                 "activationMode": "InProcessPlugin",
-                "entryPoint": f"QuantConnect.HotSwap.Modules.{prefix}DataModule",
+                "entryPoint": f"QuantConnect.HotSwap.Modules.{prefix}InputModule",
                 "parameters": {"assemblyPath": str(plugin_dll)},
                 "hotSwapMode": "Live",
             },
@@ -115,7 +115,7 @@ def manifest(plugin_dll: Path, base_url: str, strategy: str) -> dict:
                 "hotSwapMode": "RequiresFlatNoOrders",
             },
         ],
-        "data": ["data.main"],
+        "inputs": ["input.main"],
         "signal": ["signal.main"],
         "target": ["target.main"],
         "constraint": ["risk.main"],

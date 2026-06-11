@@ -56,6 +56,7 @@ namespace QuantConnect.Modules
             await loadRange(manifest.InputModules).ConfigureAwait(false);
             await loadRange(manifest.UniverseModules).ConfigureAwait(false);
             await loadRange(manifest.SignalModules).ConfigureAwait(false);
+            await loadRange(manifest.AlphaGraph.Nodes).ConfigureAwait(false);
             await loadRange(manifest.TargetModules).ConfigureAwait(false);
             await loadRange(manifest.ConstraintModules).ConfigureAwait(false);
             await loadRange(manifest.ExecutionModules).ConfigureAwait(false);

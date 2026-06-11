@@ -23,7 +23,7 @@
 
 模块按下面 8 类抽象：
 
-1. `DataModule`
+1. `InputModule`
 2. `UniverseModule`
 3. `SignalModule`
 4. `TargetModule`
@@ -201,14 +201,16 @@ pipeline 必须配置化。
 
 ## 6. 各层重构方案
 
-### 6.1 数据层
+### 6.1 输入与数据源层
 
 #### 目标抽象
 
-- `DataModule`
+- 策略 pipeline 暴露 `InputModule`，只负责登记 Engine 应加入哪些市场输入。
+- Engine 基础设施内部保留 `DataSource`，用于本地数据、历史数据、map/factor file provider 等真实数据读取能力。
 
 #### 当前 Lean 映射
 
+- `IInputModule` 对应策略输入登记。
 - `IDataProvider`
 - `IMapFileProvider`
 - `IFactorFileProvider`
@@ -226,10 +228,10 @@ pipeline 必须配置化。
 
 #### 重构要求
 
-1. 所有预置类都注册为内置 `DataModule`
-2. 外部 `data provider`、下载器、历史源也作为同类模块注册
-3. `CompositeDataProvider` 和 `HistoryProviderManager` 作为内置组合模块保留
-4. 用户可根据接口自己新增 data provider
+1. 面向策略开发者的预置输入注册器注册为内置 `InputModule`，例如可配置 JSON 输入。
+2. 外部数据 provider、下载器、历史源如果开放插件化，应注册为 Engine 内部 `DataSource`，不要混入策略 pipeline stage。
+3. `CompositeDataProvider` 和 `HistoryProviderManager` 作为内置组合模块保留。
+4. 用户需要动态选输入时实现 `InputModule`；需要接入真实数据源时走单独的 `DataSource` contract。
 
 #### 热插边界
 

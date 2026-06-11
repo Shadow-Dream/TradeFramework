@@ -31,6 +31,7 @@ namespace QuantConnect.Algorithm.Modules
         private readonly QCAlgorithm _algorithm;
         private readonly PipelineRuntime _runtime;
         private readonly string _manifestPath;
+        private readonly Func<PipelineManifest> _loadManifest;
         private readonly Timer _timer;
         private LoadedPipeline _current;
         private PipelineManifest _pendingManifest;
@@ -39,10 +40,22 @@ namespace QuantConnect.Algorithm.Modules
         private int _pollInProgress;
 
         public PipelineHotReloadService(QCAlgorithm algorithm, PipelineRuntime runtime, string manifestPath, LoadedPipeline current, TimeSpan pollInterval)
+            : this(algorithm, runtime, manifestPath, () => PipelineManifestJsonLoader.Load(manifestPath), current, pollInterval)
+        {
+        }
+
+        public PipelineHotReloadService(
+            QCAlgorithm algorithm,
+            PipelineRuntime runtime,
+            string manifestPath,
+            Func<PipelineManifest> loadManifest,
+            LoadedPipeline current,
+            TimeSpan pollInterval)
         {
             _algorithm = algorithm ?? throw new ArgumentNullException(nameof(algorithm));
             _runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
             _manifestPath = manifestPath ?? throw new ArgumentNullException(nameof(manifestPath));
+            _loadManifest = loadManifest ?? throw new ArgumentNullException(nameof(loadManifest));
             _current = current ?? throw new ArgumentNullException(nameof(current));
             _lastWriteUtc = File.GetLastWriteTimeUtc(_manifestPath);
             _timer = new Timer(_ => Poll(), null, pollInterval, pollInterval);
@@ -65,7 +78,7 @@ namespace QuantConnect.Algorithm.Modules
                         return;
                     }
 
-                    _pendingManifest = PipelineManifestJsonLoader.Load(_manifestPath);
+                    _pendingManifest = _loadManifest();
                     _pendingWriteUtc = latestWrite;
                 }
             }

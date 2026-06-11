@@ -26,9 +26,9 @@ public static class StrategySymbols
     public static readonly Symbol Qqq = Symbol.Create("QQQ", SecurityType.Equity, Market.USA);
 }
 
-public sealed class StrategyADataModule : IDataSubscriptionModule
+public sealed class StrategyAInputModule : IInputModule
 {
-    private readonly ModuleState _moduleState = new(typeof(StrategyADataModule), ModuleKind.Data, ModuleHotSwapMode.Live);
+    private readonly ModuleState _moduleState = new(typeof(StrategyAInputModule), ModuleKind.Input, ModuleHotSwapMode.Live);
 
     public string Key => _moduleState.Key;
     public ModuleKind Kind => _moduleState.Kind;
@@ -36,23 +36,23 @@ public sealed class StrategyADataModule : IDataSubscriptionModule
     public string Version => _moduleState.Version;
     public ModuleHotSwapMode HotSwapMode => _moduleState.HotSwapMode;
 
-    public ValueTask InitializeAsync(ModuleConfiguration configuration, CancellationToken cancellationToken = default) => _moduleState.InitializeAsync(configuration, cancellationToken);
-    public ValueTask PauseAsync(CancellationToken cancellationToken = default) => _moduleState.PauseAsync(cancellationToken);
-    public ValueTask ResumeAsync(CancellationToken cancellationToken = default) => _moduleState.ResumeAsync(cancellationToken);
-    public ValueTask<ModuleSnapshot> CreateSnapshotAsync(CancellationToken cancellationToken = default) => _moduleState.CreateSnapshotAsync(cancellationToken);
-    public ValueTask RestoreSnapshotAsync(ModuleSnapshot snapshot, CancellationToken cancellationToken = default) => _moduleState.RestoreSnapshotAsync(snapshot, cancellationToken);
-    public ValueTask<ModuleHealthCheckResult> CheckHealthAsync(CancellationToken cancellationToken = default) => _moduleState.CheckHealthAsync(cancellationToken);
+    public ValueTask Initialize(ModuleConfiguration configuration, CancellationToken cancellationToken = default) => _moduleState.Initialize(configuration, cancellationToken);
+    public ValueTask Pause(CancellationToken cancellationToken = default) => _moduleState.Pause(cancellationToken);
+    public ValueTask Resume(CancellationToken cancellationToken = default) => _moduleState.Resume(cancellationToken);
+    public ValueTask<ModuleSnapshot> CreateSnapshot(CancellationToken cancellationToken = default) => _moduleState.CreateSnapshot(cancellationToken);
+    public ValueTask RestoreSnapshot(ModuleSnapshot snapshot, CancellationToken cancellationToken = default) => _moduleState.RestoreSnapshot(snapshot, cancellationToken);
+    public ValueTask<ModuleHealthCheckResult> CheckHealth(CancellationToken cancellationToken = default) => _moduleState.CheckHealth(cancellationToken);
 
-    public IEnumerable<DataSubscriptionRequest> CreateSubscriptions(QCAlgorithm algorithm)
+    public IEnumerable<InputRegistration> CreateInputs(QCAlgorithm algorithm)
     {
-        Log.Trace($"DATA_A:{algorithm.Time:yyyy-MM-dd}");
-        yield return new DataSubscriptionRequest(StrategySymbols.Spy, Resolution.Daily);
+        Log.Trace($"INPUT_A:{algorithm.Time:yyyy-MM-dd}");
+        yield return InputRegistration.Create(StrategySymbols.Spy, Resolution.Daily);
     }
 }
 
-public sealed class StrategyBDataModule : IDataSubscriptionModule
+public sealed class StrategyBInputModule : IInputModule
 {
-    private readonly ModuleState _moduleState = new(typeof(StrategyBDataModule), ModuleKind.Data, ModuleHotSwapMode.Live);
+    private readonly ModuleState _moduleState = new(typeof(StrategyBInputModule), ModuleKind.Input, ModuleHotSwapMode.Live);
 
     public string Key => _moduleState.Key;
     public ModuleKind Kind => _moduleState.Kind;
@@ -60,17 +60,17 @@ public sealed class StrategyBDataModule : IDataSubscriptionModule
     public string Version => _moduleState.Version;
     public ModuleHotSwapMode HotSwapMode => _moduleState.HotSwapMode;
 
-    public ValueTask InitializeAsync(ModuleConfiguration configuration, CancellationToken cancellationToken = default) => _moduleState.InitializeAsync(configuration, cancellationToken);
-    public ValueTask PauseAsync(CancellationToken cancellationToken = default) => _moduleState.PauseAsync(cancellationToken);
-    public ValueTask ResumeAsync(CancellationToken cancellationToken = default) => _moduleState.ResumeAsync(cancellationToken);
-    public ValueTask<ModuleSnapshot> CreateSnapshotAsync(CancellationToken cancellationToken = default) => _moduleState.CreateSnapshotAsync(cancellationToken);
-    public ValueTask RestoreSnapshotAsync(ModuleSnapshot snapshot, CancellationToken cancellationToken = default) => _moduleState.RestoreSnapshotAsync(snapshot, cancellationToken);
-    public ValueTask<ModuleHealthCheckResult> CheckHealthAsync(CancellationToken cancellationToken = default) => _moduleState.CheckHealthAsync(cancellationToken);
+    public ValueTask Initialize(ModuleConfiguration configuration, CancellationToken cancellationToken = default) => _moduleState.Initialize(configuration, cancellationToken);
+    public ValueTask Pause(CancellationToken cancellationToken = default) => _moduleState.Pause(cancellationToken);
+    public ValueTask Resume(CancellationToken cancellationToken = default) => _moduleState.Resume(cancellationToken);
+    public ValueTask<ModuleSnapshot> CreateSnapshot(CancellationToken cancellationToken = default) => _moduleState.CreateSnapshot(cancellationToken);
+    public ValueTask RestoreSnapshot(ModuleSnapshot snapshot, CancellationToken cancellationToken = default) => _moduleState.RestoreSnapshot(snapshot, cancellationToken);
+    public ValueTask<ModuleHealthCheckResult> CheckHealth(CancellationToken cancellationToken = default) => _moduleState.CheckHealth(cancellationToken);
 
-    public IEnumerable<DataSubscriptionRequest> CreateSubscriptions(QCAlgorithm algorithm)
+    public IEnumerable<InputRegistration> CreateInputs(QCAlgorithm algorithm)
     {
-        Log.Trace($"DATA_B:{algorithm.Time:yyyy-MM-dd}");
-        yield return new DataSubscriptionRequest(StrategySymbols.Qqq, Resolution.Daily);
+        Log.Trace($"INPUT_B:{algorithm.Time:yyyy-MM-dd}");
+        yield return InputRegistration.Create(StrategySymbols.Qqq, Resolution.Daily);
     }
 }
 

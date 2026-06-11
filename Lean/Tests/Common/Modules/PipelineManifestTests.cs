@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using QuantConnect.Modules;
 using NUnit.Framework;
 
@@ -73,6 +74,83 @@ namespace QuantConnect.Tests.Common.Modules
 
             Assert.That(manifest.SignalModules.Count, Is.EqualTo(1));
             Assert.That(manifest.MarketRuleModule, Is.EqualTo("broker.bitget"));
+        }
+
+        [Test]
+        public void PipelineLanesManifestJsonLoaderComposesActiveLanes()
+        {
+            var root = TestContext.CurrentContext.WorkDirectory;
+            var laneOne = Path.Combine(root, "lane-one-pipeline.json");
+            var laneTwo = Path.Combine(root, "lane-two-pipeline.json");
+            var lanes = Path.Combine(root, "pipeline-lanes.json");
+            var manifest = """
+            {
+              "name": "lane",
+              "modules": [
+                {"key":"input","kind":"Input","activationMode":"BuiltIn","entryPoint":"InputEntry","version":"1","hotSwapMode":"Live"},
+                {"key":"alpha","kind":"Signal","activationMode":"BuiltIn","entryPoint":"AlphaEntry","version":"1","hotSwapMode":"Live"},
+                {"key":"target","kind":"Target","activationMode":"BuiltIn","entryPoint":"TargetEntry","version":"1","hotSwapMode":"Live"},
+                {"key":"exec","kind":"Execution","activationMode":"BuiltIn","entryPoint":"ExecEntry","version":"1","hotSwapMode":"RequiresPause"}
+              ],
+              "inputs":["input"],
+              "signal":["alpha"],
+              "target":["target"],
+              "execution":["exec"]
+            }
+            """;
+
+            File.WriteAllText(laneOne, manifest.Replace("\"name\": \"lane\"", "\"name\": \"lane-one\""));
+            File.WriteAllText(laneTwo, manifest.Replace("\"name\": \"lane\"", "\"name\": \"lane-two\""));
+            File.WriteAllText(lanes, $$"""
+            {
+              "schemaVersion": 1,
+              "lanes": [
+                {"laneId":"main","manifestPath":"{{laneOne}}"},
+                {"laneId":"research","manifestPath":"{{laneTwo}}"}
+              ]
+            }
+            """);
+
+            var composed = PipelineLanesManifestJsonLoader.Load(lanes);
+
+            Assert.That(composed.InputModules, Is.EquivalentTo(new[] { "main::input", "research::input" }));
+            Assert.That(composed.SignalModules, Is.EquivalentTo(new[] { "main::alpha", "research::alpha" }));
+            Assert.That(composed.TargetModules, Is.EquivalentTo(new[] { "main::target", "research::target" }));
+            Assert.That(composed.ExecutionModules, Is.EqualTo(new[] { "main::exec" }));
+        }
+
+        [Test]
+        public void PipelineLanesManifestJsonLoaderRejectsConflictingExecutionModules()
+        {
+            var root = TestContext.CurrentContext.WorkDirectory;
+            var laneOne = Path.Combine(root, "lane-one-execution.json");
+            var laneTwo = Path.Combine(root, "lane-two-execution.json");
+            var lanes = Path.Combine(root, "pipeline-lanes-conflict.json");
+            var manifest = """
+            {
+              "name": "lane",
+              "modules": [
+                {"key":"target","kind":"Target","activationMode":"BuiltIn","entryPoint":"TargetEntry","version":"1","hotSwapMode":"Live"},
+                {"key":"exec","kind":"Execution","activationMode":"BuiltIn","entryPoint":"ExecEntry","version":"1","hotSwapMode":"RequiresPause"}
+              ],
+              "target":["target"],
+              "execution":["exec"]
+            }
+            """;
+
+            File.WriteAllText(laneOne, manifest);
+            File.WriteAllText(laneTwo, manifest.Replace("ExecEntry", "OtherExecEntry"));
+            File.WriteAllText(lanes, $$"""
+            {
+              "schemaVersion": 1,
+              "lanes": [
+                {"laneId":"main","manifestPath":"{{laneOne}}"},
+                {"laneId":"research","manifestPath":"{{laneTwo}}"}
+              ]
+            }
+            """);
+
+            Assert.Throws<NotSupportedException>(() => PipelineLanesManifestJsonLoader.Load(lanes));
         }
     }
 }

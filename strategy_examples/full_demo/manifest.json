@@ -21,7 +21,15 @@
       "entryPoint": "python.full-demo.signal",
       "version": "devkit",
       "parameters": {
-        "baseUrl": "http://127.0.0.1:8765"
+        "baseUrl": "http://127.0.0.1:8765",
+        "backend": {
+          "kind": "Signal",
+          "moduleId": "python.full-demo.signal",
+          "version": "devkit",
+          "protocolVersion": "lean-module-v1",
+          "contractHash": "sha256:5b7b58f4f3da0f3f6db6431ea3fc1a263171bfffcc24143ac22b7c2fc1fed0b2",
+          "deploymentId": "local-full-demo:5b7b58f4f3da0f3f"
+        }
       },
       "hotSwapMode": "Live"
     },
@@ -45,7 +53,15 @@
       "entryPoint": "python.full-demo.constraint",
       "version": "devkit",
       "parameters": {
-        "baseUrl": "http://127.0.0.1:8765"
+        "baseUrl": "http://127.0.0.1:8765",
+        "backend": {
+          "kind": "Constraint",
+          "moduleId": "python.full-demo.constraint",
+          "version": "devkit",
+          "protocolVersion": "lean-module-v1",
+          "contractHash": "sha256:e3211c64c08789d3ececfb149c99d51de3278f6ffb905556599ab529e2f78311",
+          "deploymentId": "local-full-demo:e3211c64c08789d3"
+        }
       },
       "hotSwapMode": "RequiresPause"
     },
@@ -69,7 +85,15 @@
       "entryPoint": "python.full-demo.market",
       "version": "devkit",
       "parameters": {
-        "baseUrl": "http://127.0.0.1:8765"
+        "baseUrl": "http://127.0.0.1:8765",
+        "backend": {
+          "kind": "MarketRule",
+          "moduleId": "python.full-demo.market",
+          "version": "devkit",
+          "protocolVersion": "lean-module-v1",
+          "contractHash": "sha256:472902a62874e49c604b9e57293d362564e5afc879f29cfaca2ee34ab5af92a2",
+          "deploymentId": "local-full-demo:472902a62874e49c"
+        }
       },
       "hotSwapMode": "RequiresFlatNoOrders"
     },

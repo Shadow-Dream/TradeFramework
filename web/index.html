@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trade Engine</title>
+    <link rel="stylesheet" href="/vendor/litegraph/litegraph.css" />
+    <link rel="stylesheet" href="/vendor/x6/x6.css" />
+    <link rel="stylesheet" href="/styles.css?v=20260607-app83" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Trade Engine</h1>
+        <p id="endpoint">localhost:30808</p>
+      </div>
+      <div class="toolbar">
+        <label class="lane-control" for="laneSelect">
+          <span>Lane</span>
+          <select id="laneSelect"></select>
+        </label>
+        <button id="refreshBtn" type="button">Refresh</button>
+        <span id="health" class="status">Checking</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="layout">
+        <nav class="side" aria-label="Views">
+          <button class="nav-btn active" data-view="overview" type="button">Overview</button>
+          <button class="nav-btn" data-view="pipeline" type="button">Pipeline</button>
+          <button class="nav-btn" data-view="modules" type="button">Modules</button>
+          <button class="nav-btn" data-view="data" type="button">Data</button>
+          <button class="nav-btn" data-view="backtests" type="button">Backtests</button>
+          <button class="nav-btn" data-view="results" type="button">Results</button>
+          <button class="nav-btn" data-view="artifacts" type="button">Artifacts</button>
+          <button class="nav-btn" data-view="manifest" type="button">Manifest</button>
+        </nav>
+
+        <section class="content">
+          <div id="overview" class="view active">
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Runtime</h2>
+                <span id="manifestHash" class="muted"></span>
+              </div>
+              <div id="overviewRuntimeList" class="overview-grid"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Repositories</h2>
+              </div>
+              <div id="repoList" class="repo-list"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Data & Results</h2>
+              </div>
+              <div id="overviewDataList" class="overview-grid"></div>
+            </div>
+          </div>
+
+          <div id="modules" class="view">
+            <div class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>Module Repository</h2>
+                  <span id="moduleKindStatus" class="muted"></span>
+                </div>
+                <input id="moduleFilter" class="filter" placeholder="Filter modules" />
+              </div>
+              <div class="module-browser">
+                <div id="moduleKindMenu" class="kind-menu"></div>
+                <div id="moduleTable" class="table"></div>
+              </div>
+            </div>
+          </div>
+
+          <div id="pipeline" class="view">
+            <div class="pipeline-shell">
+              <section class="pipeline-subcontent">
+                <div id="pipelineComposerSection" class="pipeline-section active">
+                  <div class="panel">
+                    <div class="panel-head">
+                      <div>
+                        <h2>Pipeline Builder</h2>
+                        <span id="pipelineStatus" class="muted"></span>
+                      </div>
+                    </div>
+                    <div class="form-grid pipeline-form">
+                      <label>
+                        <span>Lane</span>
+                        <input id="pipelineLaneId" placeholder="main" />
+                      </label>
+                      <label>
+                        <span>Strategy</span>
+                        <input id="pipelineStrategyId" placeholder="my-strategy" />
+                      </label>
+                      <label>
+                        <span>Version</span>
+                        <input id="pipelineVersion" placeholder="20260526-001" />
+                      </label>
+                      <label>
+                        <span>Name</span>
+                        <input id="pipelineName" placeholder="my-strategy-20260526-001" />
+                      </label>
+                      <select id="pipelineMarketRule" hidden></select>
+                      <button id="loadPipelineBtn" type="button">Load Current</button>
+                      <button id="attachPipelineBtn" type="button">Attach</button>
+                    </div>
+                    <div id="pipelineLoadError" class="dialog-error" hidden></div>
+                    <div id="pipelineAttachError" class="dialog-error" hidden></div>
+                    <div class="flow-viewport">
+                      <div id="pipelineStageGrid" class="flow-board"></div>
+                    </div>
+                  </div>
+                  <div class="panel">
+                    <div class="panel-head">
+                      <h2>Active Lanes</h2>
+                    </div>
+                    <div id="laneTable" class="table"></div>
+                  </div>
+                </div>
+                <div id="pipelineAlphaSection" class="pipeline-section">
+                  <div class="panel">
+                    <div class="panel-head">
+                      <div>
+                        <h2>Alpha Blueprint</h2>
+                        <span class="muted">Hot-swappable signal graph editor for the selected lane</span>
+                      </div>
+                    </div>
+                    <div id="blueprintMeta" class="overview-grid"></div>
+                  </div>
+                  <div class="panel">
+                    <div class="panel-head">
+                      <h2>Graph Editor</h2>
+                    </div>
+                    <div id="blueprintRouteBar" class="blueprint-route-bar" hidden>
+                      <button id="blueprintBackToPipelineBtn" type="button">Back to Pipeline</button>
+                      <span class="muted">Alpha is the Signal stage detail view.</span>
+                    </div>
+                    <div id="pipelineBlueprintError" class="dialog-error" hidden></div>
+                    <div id="pipelineAlphaGraphError" class="dialog-error" hidden></div>
+                    <div id="alphaGraphBuilder" class="alpha-graph-builder"></div>
+                    <textarea id="pipelineAlphaGraph" class="spec-editor blueprint-raw" spellcheck="false" hidden></textarea>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </div>
+
+          <div id="instances" class="view">
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Configured Instances</h2>
+                <input id="instanceFilter" class="filter" placeholder="Filter instances" />
+              </div>
+              <div id="instanceTable" class="table"></div>
+            </div>
+          </div>
+
+          <div id="data" class="view">
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Market Data</h2>
+                <input id="dataSearch" class="filter" placeholder="Search symbol or dataset" />
+              </div>
+              <div class="form-grid">
+                <label>
+                  <span>Source</span>
+                  <select id="downloadSource">
+                    <option value="robinhood">Robinhood</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Symbol</span>
+                  <input id="downloadSymbol" value="AAPL" />
+                </label>
+                <label>
+                  <span>Start</span>
+                  <input id="downloadStart" type="date" value="2026-01-01" />
+                </label>
+                <label>
+                  <span>End</span>
+                  <input id="downloadEnd" type="date" />
+                </label>
+                <label>
+                  <span>Interval</span>
+                  <select id="downloadInterval">
+                    <option value="5m">5 Minute</option>
+                    <option value="10m">10 Minute</option>
+                    <option value="h">Hourly</option>
+                    <option value="d">Daily</option>
+                  </select>
+                </label>
+                <label id="downloadApiKeyField" hidden>
+                  <span>API Key</span>
+                  <input id="downloadApiKey" placeholder="demo" />
+                </label>
+                <button id="downloadDataBtn" type="button">Download</button>
+              </div>
+              <div id="dataDownloadError" class="dialog-error" hidden></div>
+              <div class="form-grid upload-grid">
+                <label>
+                  <span>Dataset</span>
+                  <input id="uploadDatasetId" placeholder="upload-spy-daily" />
+                </label>
+                <label>
+                  <span>Symbol</span>
+                  <input id="uploadSymbol" placeholder="SPY" />
+                </label>
+                <label class="file-label">
+                  <span>CSV</span>
+                  <input id="uploadCsv" type="file" accept=".csv,text/csv" />
+                </label>
+                <button id="uploadDataBtn" type="button">Upload</button>
+              </div>
+              <div id="dataUploadError" class="dialog-error" hidden></div>
+              <div id="dataSearchList" class="compact-list"></div>
+              <div id="datasetTable" class="table"></div>
+            </div>
+          </div>
+
+          <div id="backtests" class="view">
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Backtest Entry</h2>
+                <span id="backtestStatus" class="muted"></span>
+              </div>
+              <div class="form-grid">
+                <label>
+                  <span>Lane</span>
+                  <select id="backtestLane"></select>
+                </label>
+                <label>
+                  <span>Dataset</span>
+                  <select id="backtestDataset"></select>
+                </label>
+                <label>
+                  <span>Name</span>
+                  <input id="backtestName" placeholder="ma-cross-check" />
+                </label>
+                <label>
+                  <span>Runner</span>
+                  <select id="backtestRunner">
+                    <option value="local-ohlcv-benchmark">Local OHLCV Benchmark</option>
+                  </select>
+                </label>
+                <button id="runBacktestBtn" type="button">Run</button>
+              </div>
+              <div id="backtestEntryError" class="dialog-error" hidden></div>
+              <div id="backtestTable" class="table"></div>
+            </div>
+          </div>
+
+          <div id="results" class="view">
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Result Visualization</h2>
+                <div class="toolbar">
+                  <select id="resultBacktest"></select>
+                  <button id="addChartBtn" type="button">Add Chart</button>
+                </div>
+              </div>
+              <div id="resultsActionError" class="dialog-error" hidden></div>
+              <div id="metricStrip" class="metric-strip"></div>
+              <div id="chartArea" class="chart-area"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Advanced Spec</h2>
+                <button id="saveVisualizationBtn" type="button">Save Spec</button>
+              </div>
+              <div id="visualizationSpecError" class="dialog-error" hidden></div>
+              <textarea id="visualizationSpec" class="spec-editor blueprint-raw" spellcheck="false" hidden></textarea>
+            </div>
+          </div>
+
+          <div id="artifacts" class="view">
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Artifacts</h2>
+              </div>
+              <div id="artifactTable" class="table"></div>
+            </div>
+          </div>
+
+          <div id="manifest" class="view">
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Live Manifest</h2>
+              </div>
+              <pre id="manifestJson" class="json"></pre>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <dialog id="unloadDialog" class="action-dialog">
+      <h2 id="unloadDialogTitle">Unload Module</h2>
+      <p id="unloadDialogText"></p>
+      <div class="dialog-actions">
+        <button id="cancelUnloadBtn" type="button">Cancel</button>
+        <button id="confirmUnloadBtn" type="button">Unload</button>
+      </div>
+    </dialog>
+
+    <dialog id="moduleLoadDialog" class="action-dialog module-load-dialog">
+      <h2 id="moduleLoadDialogTitle">Load Module</h2>
+      <div class="dialog-form">
+        <label>
+          <span>Instance</span>
+          <input id="moduleLoadInstanceId" />
+        </label>
+        <p id="moduleLoadDialogError" class="dialog-error" hidden></p>
+        <section>
+          <span class="dialog-section-label">Config</span>
+          <div id="moduleLoadConfigFields" class="structured-fields"></div>
+        </section>
+        <section>
+          <span class="dialog-section-label">Inputs</span>
+          <div id="moduleLoadInputsFields" class="structured-fields"></div>
+        </section>
+        <section>
+          <span class="dialog-section-label">Outputs</span>
+          <div id="moduleLoadOutputsFields" class="structured-fields"></div>
+        </section>
+      </div>
+      <div class="dialog-actions">
+        <button id="cancelModuleLoadBtn" type="button">Cancel</button>
+        <button id="confirmModuleLoadBtn" type="button">Load</button>
+      </div>
+    </dialog>
+
+    <script src="/vendor/lightweight-charts/lightweight-charts.standalone.production.js"></script>
+    <script src="/vendor/litegraph/litegraph.js?v=20260604-hitarea1"></script>
+    <script src="/vendor/x6/x6.js"></script>
+    <script src="/module_forms.js?v=20260603-forms"></script>
+    <script src="/alpha_blueprint_litegraph.js?v=20260607-litegraph146"></script>
+    <script src="/chart_core.js?v=20260603-forms"></script>
+    <script src="/app.js?v=20260607-app83"></script>
+  </body>
+</html>

@@ -33,7 +33,7 @@ namespace QuantConnect.Lean.Engine.HistoricalData
         /// <summary>
         /// Resolves map files to correctly handle current and historical ticker symbols.
         /// </summary>
-        private static readonly Lazy<IMapFileProvider> _mapFileProvider = new(Composer.Instance.GetPart<IMapFileProvider>);
+        private static readonly Lazy<IMapFileProvider> _mapFileProvider = new(() => Composer.Instance.GetPart<IMapFileProvider>());
 
         /// <summary>
         /// Gets historical data for a single resolved history request.
