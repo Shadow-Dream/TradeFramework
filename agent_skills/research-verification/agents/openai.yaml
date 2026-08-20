@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Verification"
+  short_description: "Verify point-in-time evidence for testable research"
+  default_prompt: "Use $research-verification to verify this research claim and turn it into one falsifiable experiment."

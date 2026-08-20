@@ -1,0 +1,38 @@
+[Unit]
+Description=Trade Engine user preview with source reload
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/file/share/data_jyz/trade
+Environment=HOME=/home/motion
+Environment=LANG=C.UTF-8
+Environment=LC_ALL=C.UTF-8
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONNOUSERSITE=1
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/file/share/data_jyz/trade/.runtime/preview/agent-web.env
+Environment=WATCHFILES_FORCE_POLLING=true
+Environment=WATCHFILES_POLL_DELAY_MS=500
+ExecStart=/usr/bin/python3 -m watchfiles --filter python --target-type command "/file/share/data_jyz/trade/.runtime/preview/venv/bin/python -B /file/share/data_jyz/trade/engine_service.py --config /file/share/data_jyz/trade/deploy/user/strategy-control-preview.json --host 10.130.130.66 --port 30809 --public-url http://10.130.130.66:30809 --agent-public-url http://10.130.130.66:30810" /file/share/data_jyz/trade/engine_service.py /file/share/data_jyz/trade/dataset_transfer.py /file/share/data_jyz/trade/engine /file/share/data_jyz/trade/mining /file/share/data_jyz/trade/builtin_implementations /file/share/data_jyz/trade/dataset_adapters /file/share/data_jyz/trade/application_protocols /file/share/data_jyz/trade/strategy_devkit /file/share/data_jyz/trade/trade_agent_bridge /file/share/data_jyz/trade/trade_agent_tools
+Restart=on-failure
+RestartSec=2s
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStopSec=90s
+UMask=0077
+
+# Preview has isolated Engine state. Agent communication is via exact HTTP
+# bridge contracts and a short-lived grant token, never a browser credential.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+# bubblewrap uses AF_NETLINK to bring up loopback inside the Python Sampler's
+# private network namespace. The Sampler still receives no host interfaces.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=default.target

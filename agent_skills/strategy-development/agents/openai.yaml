@@ -1,0 +1,4 @@
+interface:
+  display_name: "Strategy Development"
+  short_description: "Build and validate exact Trade Engine strategy drafts"
+  default_prompt: "Use $strategy-development to develop and validate this Trade Engine strategy change as a user-confirmed proposal."

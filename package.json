@@ -1,0 +1,17 @@
+{
+  "name": "trade-engine-web-assets",
+  "private": true,
+  "scripts": {
+    "build:resource-browser": "esbuild web_src/trade_resource_browser.jsx --bundle --format=iife --platform=browser --target=es2020 --outfile=web/vendor/trade-resource-browser.js --minify && node scripts/build_resource_browser_css.js"
+  },
+  "dependencies": {
+    "@cubone/react-file-manager": "1.35.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.6",
+    "postcss": "8.5.19",
+    "postcss-prefix-selector": "2.1.1"
+  }
+}

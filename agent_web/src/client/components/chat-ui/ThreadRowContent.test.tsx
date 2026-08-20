@@ -1,0 +1,215 @@
+import { describe, expect, test } from "bun:test"
+import { renderToStaticMarkup } from "react-dom/server"
+import type { SidebarChatRow } from "../../../shared/types"
+import type { SidebarThread } from "../../lib/thread-sections"
+import { renderChatStatusDot, ThreadRowContent } from "./ThreadRowContent"
+
+const baseChat: SidebarChatRow = {
+  _id: "chat-1",
+  _creationTime: 1,
+  chatId: "chat-1",
+  title: "Refactor the ws router",
+  status: "idle",
+  unread: false,
+  provider: "claude-deepseek",
+  lastMessageAt: 0,
+  hasAutomation: false,
+}
+
+function thread(overrides: Partial<SidebarChatRow> = {}, archived = false): SidebarThread {
+  const row = { ...baseChat, ...overrides }
+  return {
+    chatId: row.chatId,
+    title: row.title,
+    projectId: "project-1",
+    projectTitle: "Project",
+    projectLabel: { name: "Project", branchName: "feature", repoPath: "acme/Project", text: "Project/feature" },
+    archived,
+    lastActivityAt: 1,
+    row,
+  }
+}
+
+function renderDot(chat: SidebarChatRow) {
+  const dot = renderChatStatusDot(chat)
+  return dot === null ? null : renderToStaticMarkup(<>{dot}</>)
+}
+
+function renderRow(props: Parameters<typeof ThreadRowContent>[0]) {
+  return renderToStaticMarkup(<ThreadRowContent {...props} />)
+}
+
+const DIM_CLASS = "text-slate-500 dark:text-slate-400"
+
+describe("renderChatStatusDot", () => {
+  test("renders nothing for an idle chat", () => {
+    expect(renderDot(baseChat)).toBeNull()
+  })
+
+  test("uncommitted work does not claim the status slot", () => {
+    // It's carried by tinting the harness icon instead, so this slot only ever
+    // holds things that want attention.
+    expect(renderDot({ ...baseChat, uncommittedWork: true })).toBeNull()
+  })
+
+  test("unread renders a pinging green dot", () => {
+    const html = renderDot({ ...baseChat, unread: true })
+
+    expect(html).toContain("bg-emerald-400")
+    expect(html).toContain("animate-ping")
+  })
+
+  test("awaiting the user outranks unread", () => {
+    const html = renderDot({ ...baseChat, status: "waiting_for_user", unread: true })
+
+    expect(html).toContain("bg-blue-400")
+    expect(html).not.toContain("bg-emerald-400")
+  })
+
+  test("a running turn outranks both", () => {
+    const html = renderDot({ ...baseChat, status: "running", unread: true })
+
+    expect(html).toContain("animate-spin")
+    expect(html).not.toContain("bg-emerald-400")
+  })
+
+  test("an interrupted turn has a distinct non-spinning status icon", () => {
+    const html = renderDot({ ...baseChat, status: "interrupted", unread: true })
+
+    expect(html).toContain("text-amber-500")
+    expect(html).not.toContain("animate-spin")
+    expect(html).not.toContain("bg-emerald-400")
+  })
+
+  test("renders the compositor-driven shimmer for a running title", () => {
+    const html = renderRow({ thread: thread({ status: "running" }), showStatus: true, detailLabel: null })
+
+    expect(html).toContain("Refactor the ws router")
+    expect(html).toContain("kanna-shiny-track")
+    expect(html).toContain("kanna-shiny-copy")
+    expect(html).not.toContain("animate-pulse")
+  })
+})
+
+describe("ThreadRowContent relevance treatment", () => {
+  test("keeps the title bright for uncommitted work, without tinting the harness icon", () => {
+    // The harness icon says which agent ran the chat — it is never recoloured
+    // by git state (a brand-red icon read as an error badge).
+    const html = renderRow({ thread: thread({ uncommittedWork: true }), showStatus: true, detailLabel: null })
+
+    expect(html).not.toContain(DIM_CLASS)
+    expect(html).not.toContain("text-logo")
+  })
+
+  test("dims an idle chat with nothing to say", () => {
+    const html = renderRow({ thread: thread(), showStatus: true, detailLabel: null })
+
+    expect(html).toContain(DIM_CLASS)
+    expect(html).not.toContain("text-logo")
+  })
+
+  test("never dims the chat you have open", () => {
+    const html = renderRow({ thread: thread(), showStatus: true, isActive: true })
+
+    expect(html).not.toContain(DIM_CLASS)
+  })
+
+  test("never dims a chat that wants attention", () => {
+    for (const overrides of [
+      { unread: true },
+      { status: "waiting_for_user" as const },
+      { status: "failed" as const },
+      { status: "interrupted" as const },
+    ]) {
+      expect(renderRow({ thread: thread(overrides), showStatus: true, detailLabel: null })).not.toContain(DIM_CLASS)
+    }
+  })
+
+  test("archived chats keep the extra-dimmed icon, however dirty the tree", () => {
+    const html = renderRow({ thread: thread({ uncommittedWork: true }, true), showStatus: true, detailLabel: null })
+
+    expect(html).not.toContain("text-logo")
+    expect(html).toContain("text-muted-foreground/50")
+  })
+
+  test("dimIdleTitles=false keeps every title at full contrast", () => {
+    // The command palette: you opened it to pick something, so no row is
+    // background. Applies to the rows that would otherwise dim — idle and read.
+    const html = renderRow({ thread: thread(), showStatus: true, detailLabel: null, dimIdleTitles: false })
+
+    expect(html).not.toContain(DIM_CLASS)
+  })
+
+  test("the harness icon stays muted whatever the git state", () => {
+    for (const overrides of [{ uncommittedWork: true }, { uncommittedWork: false }, {}]) {
+      const html = renderRow({ thread: thread(overrides), showStatus: true, detailLabel: null })
+
+      expect(html).not.toContain("text-logo")
+      expect(html).toContain("text-muted-foreground")
+    }
+  })
+
+  test("falls back to a muted chat bubble when the provider is unknown", () => {
+    const html = renderRow({ thread: thread({ provider: null, uncommittedWork: true }), showStatus: true, detailLabel: null })
+
+    expect(html).toContain("text-muted-foreground")
+    expect(html).not.toContain("text-logo")
+  })
+})
+
+describe("ThreadRowContent draft glyph", () => {
+  test("an unsent draft claims the harness icon's slot", () => {
+    // Which harness a chat runs is the same on every row of a project; "you
+    // left something half-written here" is the rarer, more actionable thing.
+    const html = renderRow({ thread: thread(), hasDraft: true, detailLabel: null })
+
+    expect(html).toContain("lucide-pencil-line")
+  })
+
+  test("wears the brand red — the one glyph on the row that is about you", () => {
+    const html = renderRow({ thread: thread(), hasDraft: true, detailLabel: null })
+
+    expect(html).toContain("text-logo")
+  })
+
+  test("the open chat keeps its pencil — swapping the glyph on click is a flicker", () => {
+    const html = renderRow({ thread: thread(), hasDraft: true, isActive: true, detailLabel: null })
+
+    expect(html).toContain("lucide-pencil-line")
+  })
+
+  test("the status dot still outranks it — that one is about the agent", () => {
+    const html = renderRow({
+      thread: thread({ status: "running" }),
+      showStatus: true,
+      hasDraft: true,
+      detailLabel: null,
+    })
+
+    expect(html).toContain("animate-spin")
+    expect(html).not.toContain("lucide-pencil-line")
+  })
+})
+
+describe("ThreadRowContent detail label", () => {
+  test("renders exactly what it is given", () => {
+    expect(renderRow({ thread: thread(), detailLabel: "4h" })).toContain("4h")
+  })
+
+  test("has no implicit project fallback", () => {
+    // The old prop defaulted to the project title when omitted, which is how
+    // the palette and the sidebar drifted apart. Nothing renders unasked now.
+    const html = renderRow({ thread: thread(), detailLabel: null })
+
+    expect(html).not.toContain("Project")
+    expect(html).not.toContain("feature")
+  })
+
+  test("accepts a node so callers can render chrome there", () => {
+    // The sidebar's number-jump keycap needs more than a string.
+    const html = renderRow({ thread: thread(), detailLabel: <kbd data-testid="keycap">3</kbd> })
+
+    expect(html).toContain("<kbd")
+    expect(html).toContain("3")
+  })
+})

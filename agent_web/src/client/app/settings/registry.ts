@@ -1,0 +1,136 @@
+import { BookText, Command, FlaskConical, Gauge, MessageSquareQuote, Settings2, type LucideIcon } from "lucide-react"
+
+/**
+ * Single source of truth for settings navigation targets.
+ *
+ * Every settings row is declared here and referenced by the section components
+ * (`<SettingsRow def={SETTINGS_ROWS.theme}>`), so the command palette derives
+ * its "Settings" entries automatically: add a def + use it in JSX and the row
+ * is searchable and jumpable (`/settings/:sectionId#rowId`) with no palette
+ * changes.
+ */
+
+export const SETTINGS_SECTIONS = [
+  {
+    id: "general",
+    label: "General",
+    icon: Settings2 as LucideIcon,
+    subtitle: "Manage appearance, editor behavior, and embedded terminal defaults.",
+  },
+  {
+    id: "skills",
+    label: "Skills",
+    icon: BookText as LucideIcon,
+    subtitle: "Manage globally installed agent skills from the active skill lock file.",
+  },
+  {
+    id: "providers",
+    label: "Providers",
+    icon: MessageSquareQuote as LucideIcon,
+    subtitle: "Manage Claude Code + DeepSeek and Codex + GPT defaults.",
+  },
+  {
+    id: "keybindings",
+    label: "Keybindings",
+    icon: Command as LucideIcon,
+    subtitle: "Edit global app shortcuts stored in the active keybindings file.",
+  },
+  {
+    id: "usage",
+    label: "Usage",
+    icon: Gauge as LucideIcon,
+    subtitle: "Subscription rate-limit utilization for each harness, with reset times and when each figure was recorded.",
+  },
+  {
+    id: "labs",
+    label: "Labs",
+    icon: FlaskConical as LucideIcon,
+    subtitle: "Experimental features that are still in progress.",
+  },
+] as const
+
+export type SettingsSection = (typeof SETTINGS_SECTIONS)[number]
+export type SettingsSectionId = SettingsSection["id"]
+
+export interface SettingsRowDef {
+  /** Stable anchor id; the palette navigates to `/settings/:sectionId#id`. */
+  id: string
+  sectionId: SettingsSectionId
+  title: string
+  /** Plain-text description used for palette search + display. Sections may render richer JSX in place of it. */
+  description: string
+  /** Extra search terms that don't appear in the title/description. */
+  keywords?: string[]
+}
+
+function defineRows<TIds extends string>(
+  rows: { [TId in TIds]: Omit<SettingsRowDef, "id"> }
+): { [TId in TIds]: SettingsRowDef } {
+  return Object.fromEntries(
+    Object.entries<Omit<SettingsRowDef, "id">>(rows).map(([id, row]) => [id, { ...row, id }])
+  ) as { [TId in TIds]: SettingsRowDef }
+}
+
+export const SETTINGS_ROWS = defineRows({
+  // General
+  theme: {
+    sectionId: "general",
+    title: "Theme",
+    description: "Choose between light, dark, or system appearance",
+    keywords: ["appearance", "dark mode", "light mode"],
+  },
+  chatSounds: {
+    sectionId: "general",
+    title: "Chat Sounds",
+    description: "Play a pop when a chat starts waiting on you or the unread chat count increases",
+    keywords: ["notifications", "audio", "mute"],
+  },
+  chatSound: {
+    sectionId: "general",
+    title: "Chat Sound",
+    description: "The bundled sound used for chat notification playback and previews",
+    keywords: ["notifications", "audio"],
+  },
+  terminalScrollback: {
+    sectionId: "general",
+    title: "Terminal Scrollback",
+    description: "Lines retained for embedded terminal history",
+  },
+  terminalMinColumnWidth: {
+    sectionId: "general",
+    title: "Terminal Min Column Width",
+    description: "Minimum width for each terminal pane",
+  },
+
+  // Providers
+  defaultProvider: {
+    sectionId: "providers",
+    title: "Default Provider",
+    description: "The default harness used for new chats before a provider is locked by an existing session.",
+    keywords: ["harness", "agent"],
+  },
+  claudeDefaults: {
+    sectionId: "providers",
+    title: "Claude Code Defaults",
+    description: "Saved defaults when using Claude Code.",
+    keywords: ["anthropic", "model"],
+  },
+  codexDefaults: {
+    sectionId: "providers",
+    title: "Codex Defaults",
+    description: "Saved defaults when using Codex.",
+    keywords: ["openai", "model"],
+  },
+
+  // Labs
+  terminalWebglRenderer: {
+    sectionId: "labs",
+    title: "Terminal GPU rendering",
+    description: "Draw the embedded terminal with xterm's WebGL renderer instead of the DOM one. Faster with heavy output; falls back to the DOM renderer if the GPU context is unavailable or lost. Reopens open terminals.",
+    keywords: ["terminal", "webgl", "gpu", "renderer", "performance", "acceleration", "experimental"],
+  },
+})
+
+export function listAllSettingsRowDefs(): SettingsRowDef[] {
+  return Object.values<SettingsRowDef>(SETTINGS_ROWS)
+}

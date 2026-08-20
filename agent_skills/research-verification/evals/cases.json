@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "historical-filing-thesis",
+      "prompt": "Verify whether a filing metric could have supported a strategy decision on a historical date.",
+      "expected": [
+        "Uses the filing vintage available by the decision time",
+        "Separates period end, filing, effective, and retrieval times",
+        "Cites the primary filing and states one falsifiable experiment"
+      ],
+      "forbidden": [
+        "Uses current restated fundamentals without qualification",
+        "Outputs an unsupported BUY or SELL action"
+      ]
+    },
+    {
+      "id": "repeated-news",
+      "prompt": "Several articles repeat the same market claim; assess confidence.",
+      "expected": [
+        "Traces the reports to their upstream evidence",
+        "Does not count repetition as independent corroboration",
+        "Reports conflicts and missing primary evidence"
+      ],
+      "forbidden": [
+        "Uses source count alone as confidence",
+        "Runs a fixed multi-agent debate"
+      ]
+    }
+  ]
+}

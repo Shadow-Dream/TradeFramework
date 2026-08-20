@@ -1,0 +1,118 @@
+import { UserRound, X } from "lucide-react"
+import type { ProcessedToolCall } from "./types"
+import { MetaRow, MetaLabel, ExpandableRow, getToolIcon } from "./shared"
+import { useMemo } from "react"
+import { AnimatedShinyText } from "../ui/animated-shiny-text"
+import { formatBashCommandTitle, toTitleCase } from "../../lib/formatters"
+import { ToolCallExpandedContent } from "./ToolCallExpandedContent"
+import { useToolPayloadPrefetch } from "./tool-payload-context"
+
+interface Props {
+  message: ProcessedToolCall
+  isLoading?: boolean
+}
+
+function displayProjectPath(value: string | undefined) {
+  if (!value) return "file"
+  const normalized = value.replaceAll("\\", "/")
+  if (!normalized.startsWith("/")) return normalized
+  const parts = normalized.split("/").filter(Boolean)
+  return parts.at(-1) ?? "file"
+}
+
+export function ToolCallMessage({ message, isLoading = false }: Props) {
+  // Presence is the *existence* of a result entry, not its payload: a result
+  // may arrive with its body left on the server, to be fetched only if the row
+  // is opened.
+  const hasResult = message.resultEntryId !== undefined
+  const showLoadingState = !hasResult && isLoading
+
+  const name = useMemo(() => {
+    if (message.toolKind === "skill") {
+      return message.input.skill ? `Read Skill – ${message.input.skill}` : "Read Skill"
+    }
+    if (message.toolKind === "glob") {
+      return `Search files ${message.input.pattern === "**/*" ? "in all directories" : `matching ${message.input.pattern}`}`
+    }
+    if (message.toolKind === "grep") {
+      const pattern = message.input.pattern
+      const outputMode = message.input.outputMode
+      if (outputMode === "count") {
+        return `Count \`${pattern}\` occurrences`
+      }
+      if (outputMode === "content") {
+        return `Find \`${pattern}\` in text`
+      }
+      return `Find \`${pattern}\` in files`
+    }
+    if (message.toolKind === "bash") {
+      return message.input.description || (message.input.command ? formatBashCommandTitle(message.input.command) : "Bash")
+    }
+    if (message.toolKind === "web_search") {
+      return message.input.query || "Web Search"
+    }
+    if (message.toolKind === "read_file") {
+      return `Read ${displayProjectPath(message.input.filePath)}`
+    }
+    if (message.toolKind === "write_file") {
+      return `Write ${displayProjectPath(message.input.filePath)}`
+    }
+    if (message.toolKind === "edit_file") {
+      return `Edit ${displayProjectPath(message.input.filePath)}`
+    }
+    if (message.toolKind === "delete_file") {
+      return `Delete ${displayProjectPath(message.input.filePath)}`
+    }
+    if (message.toolKind === "mcp_generic") {
+      return `${toTitleCase(message.input.tool)} from ${toTitleCase(message.input.server)}`
+    }
+    if (message.toolKind === "subagent_task") {
+      return message.input.subagentType || message.toolName
+    }
+    return message.toolName
+  }, [message.input, message.toolName])
+
+  const isAgent = message.toolKind === "subagent_task"
+
+  // Warm the payload on hover so the body is usually already there by the time
+  // the row is clicked. Pointer-only by nature; touch falls through to the
+  // fetch the expanded view issues on mount.
+  const prefetchPayloads = useToolPayloadPrefetch()
+  const prefetchOwnPayloads = () => {
+    if (!message.inputTrimmed && !message.resultTrimmed) return
+    prefetchPayloads([
+      message.inputTrimmed ? message.id : undefined,
+      message.resultTrimmed ? message.resultEntryId : undefined,
+    ])
+  }
+
+  return (
+    <MetaRow className="w-full" onPointerEnter={prefetchOwnPayloads}>
+      {/* Creating the element is free; `ExpandableRow` only mounts it — and so
+          only runs the work inside it — once the row is opened. */}
+      <ExpandableRow expandedContent={<ToolCallExpandedContent message={message} />}>
+        <div className="w-5 h-5 relative flex items-center justify-center">
+          {(() => {
+            if (message.isError) {
+              return <X className="size-4 text-destructive" />
+            }
+            if (isAgent) {
+              return <UserRound className="size-4 text-muted-icon" />
+            }
+            const Icon = getToolIcon(message.toolName)
+
+            return <Icon className="size-4 text-muted-icon" />
+          })()}
+        </div>
+        <MetaLabel className="text-left transition-opacity duration-200 truncate">
+          <AnimatedShinyText
+            animate={showLoadingState}
+            shimmerWidth={Math.max(20, (name?.length ?? 33) * 3)}
+          >
+            {name}
+          </AnimatedShinyText>
+        </MetaLabel>
+      </ExpandableRow>
+    </MetaRow>
+  )
+}

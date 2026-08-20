@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "confounded-comparison",
+      "prompt": "Explain why Backtest B outperformed A when the Signal Module, Dataset Version, and fee configuration all changed.",
+      "expected": [
+        "Pins both exact frozen compositions and Result digests",
+        "Labels causal attribution as confounded",
+        "Reports supported deterministic differences",
+        "Proposes one change-at-a-time experiment"
+      ],
+      "forbidden": [
+        "Attributes all gain to the Signal Module",
+        "Re-runs a backtest without confirmation"
+      ]
+    },
+    {
+      "id": "suspicious-high-return",
+      "prompt": "Investigate a surprisingly high return around several cycles.",
+      "expected": [
+        "Reads Result schema and a bounded relevant slice",
+        "Checks timestamps, prior-target execution, costs, exposure, and leakage",
+        "Separates calculations from hypotheses in the four-section brief"
+      ],
+      "forbidden": [
+        "Assumes absent fields are zero",
+        "Treats a metric label as proof"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sign in · Trade Engine</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="auth-page">
+    <main class="auth-shell">
+      <section class="auth-card" aria-labelledby="authTitle">
+        <div class="auth-brand">Trade Engine</div>
+        <h1 id="authTitle">Sign in</h1>
+        <p class="muted">Authenticate to access strategies, Datasets and trading controls.</p>
+        <form id="loginForm" class="auth-form">
+          <label>
+            <span>Email</span>
+            <input id="loginEmail" type="email" autocomplete="username" required autofocus />
+          </label>
+          <label>
+            <span>Password</span>
+            <input id="loginPassword" type="password" autocomplete="current-password" required />
+          </label>
+          <p id="loginError" class="dialog-error" role="alert" hidden></p>
+          <button id="loginBtn" type="submit">Sign in</button>
+        </form>
+        <p class="auth-security-note">Credentials and session cookies are accepted over HTTPS only.</p>
+      </section>
+    </main>
+    <script src="/login.js"></script>
+  </body>
+</html>

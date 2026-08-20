@@ -1,0 +1,4 @@
+interface:
+  display_name: "Backtest Investigation"
+  short_description: "Diagnose and compare exact Trade Engine backtests"
+  default_prompt: "Use $backtest-investigation to diagnose this backtest or compare these exact results."

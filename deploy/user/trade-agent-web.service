@@ -1,0 +1,29 @@
+[Unit]
+Description=TradeEngine Agent Web user preview
+After=network-online.target trade-engine-preview.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/file/share/data_jyz/trade/agent_web
+Environment=HOME=/home/motion
+Environment=LANG=C.UTF-8
+Environment=LC_ALL=C.UTF-8
+Environment=NODE_ENV=development
+Environment=NO_PROXY=localhost,127.0.0.1,::1,10.130.130.66
+Environment=no_proxy=localhost,127.0.0.1,::1,10.130.130.66
+EnvironmentFile=/file/share/data_jyz/trade/.runtime/preview/agent-web.env
+ExecStart=/home/motion/.local/bin/bun run ./src/server/cli.ts --host 10.130.130.66 --port 30810 --strict-port --no-open
+Restart=on-failure
+RestartSec=2s
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

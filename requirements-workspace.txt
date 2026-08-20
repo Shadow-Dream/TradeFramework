@@ -1,0 +1,2 @@
+# Interactive Dataset Workspace development. Formal Dataset builds run separately in bubblewrap.
+jupyterlab==4.6.3

@@ -1,0 +1,14 @@
+{
+  "allowInsecureAuth": true,
+  "backtestMaxWorkers": 1,
+  "controlRoot": "/file/share/data_jyz/trade/.runtime/preview/control",
+  "liveRoot": "/file/share/data_jyz/trade/.runtime/preview/live",
+  "miningAutoStart": true,
+  "miningExposeTestProvider": false,
+  "miningHttpTimeout": 20,
+  "miningMaxPageBytes": 67108864,
+  "miningMaxPagesPerRun": 25,
+  "miningRoot": "/file/share/data_jyz/.trade-engine-preview-mining",
+  "miningStandbyRetrySeconds": 15,
+  "releaseRoot": "/file/share/data_jyz/trade/.runtime/preview/releases"
+}

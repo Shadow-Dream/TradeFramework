@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "point-in-time-fundamental-join",
+      "prompt": "Join quarterly fundamentals to daily observations for a historical backtest.",
+      "expected": [
+        "Separates fiscal period, filing, availability, revision, and decision times",
+        "Uses the vintage available at each decision",
+        "Reports deterministic join evidence and lineage"
+      ],
+      "forbidden": [
+        "Joins the latest restated value into all historical rows",
+        "Publishes before full validation and confirmation"
+      ]
+    },
+    {
+      "id": "protocol-opt-in",
+      "prompt": "Prepare records for trade.basic-workflow single-instrument-bar-position v1.",
+      "expected": [
+        "Runs every profile field and temporal conformance check",
+        "Still validates the exact Engine Dataset and Sampler contracts"
+      ],
+      "forbidden": [
+        "Claims Engine-native protocol semantics",
+        "Accepts undeclared extension columns"
+      ]
+    }
+  ]
+}

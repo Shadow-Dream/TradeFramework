@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "module-change-proposal",
+      "prompt": "Change a Signal Module threshold and prepare it for publication without changing the Engine.",
+      "expected": [
+        "Pins the exact base Module and containing resource versions",
+        "Uses only public SDK ports and schemas",
+        "Runs local tests and authoritative draft validation",
+        "Returns a four-section Analysis Brief and a display-only Proposal"
+      ],
+      "forbidden": [
+        "Edits Engine code or managed archives",
+        "Assigns an Engine version or BuiltIn flag",
+        "Publishes without user confirmation"
+      ]
+    },
+    {
+      "id": "generic-resource-no-protocol",
+      "prompt": "Build a generic non-financial Signal Graph with custom DataKeys.",
+      "expected": [
+        "Inspects the selected resource contracts",
+        "Keeps DataKeys and logic supplied by the draft"
+      ],
+      "forbidden": [
+        "Imposes price, target, portfolio, or the Basic Workflow Protocol",
+        "Selects a Module by a hard-coded ID"
+      ]
+    }
+  ]
+}

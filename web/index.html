@@ -1,0 +1,796 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trade Engine</title>
+    <link rel="stylesheet" href="/vendor/litegraph/litegraph.css" />
+    <link rel="stylesheet" href="/vendor/x6/x6.css" />
+    <link rel="stylesheet" href="/vendor/trade-resource-browser.css" />
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/mining_kline.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Trade Engine</h1>
+      </div>
+      <div class="toolbar">
+        <div id="accountMenu" class="account-menu">
+          <button id="accountMenuBtn" class="account-menu-trigger" type="button" aria-haspopup="menu" aria-expanded="false">
+            <span id="currentUser" class="current-user"></span>
+            <span class="account-menu-chevron" aria-hidden="true">▾</span>
+          </button>
+          <div id="accountMenuPanel" class="account-menu-panel" role="menu" hidden>
+            <button id="accountBtn" type="button" role="menuitem">Account</button>
+            <button id="logoutBtn" type="button" role="menuitem">Sign out</button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section class="layout">
+        <nav class="side" aria-label="Views">
+          <section class="side-nav-group">
+            <h2 class="side-nav-heading">Overview</h2>
+            <button class="nav-btn active" data-view="overview" type="button">Overview</button>
+          </section>
+          <section class="side-nav-group">
+            <h2 class="side-nav-heading">Pipeline</h2>
+            <button class="nav-btn" data-view="pipeline" type="button">Pipeline</button>
+            <button class="nav-btn" data-view="modules" type="button">Modules</button>
+          </section>
+          <section class="side-nav-group">
+            <h2 class="side-nav-heading">Backtest</h2>
+            <button class="nav-btn" data-view="data" type="button">Dataset</button>
+            <button class="nav-btn" data-view="environment" type="button">Environment</button>
+            <button class="nav-btn" data-view="analysis" type="button">Analysis</button>
+            <button class="nav-btn" data-view="visualizers" type="button">Visualizer</button>
+            <button class="nav-btn" data-view="backtests" type="button">Backtest</button>
+          </section>
+          <section class="side-nav-group">
+            <h2 class="side-nav-heading">Mining</h2>
+            <button class="nav-btn" data-view="mining-kline" type="button">K Line</button>
+          </section>
+          <section class="side-nav-group side-nav-agent">
+            <h2 class="side-nav-heading">Agent</h2>
+            <a id="agentNavLink" class="nav-btn" href="/agent">Agent</a>
+          </section>
+        </nav>
+
+        <section class="content">
+          <div id="overview" class="view active">
+            <div id="overviewRuntimeBar" class="runtime-bar" role="status" aria-live="polite">
+              <span id="serviceStatusIndicator" class="service-status-indicator loading" aria-hidden="true"></span>
+              <div class="runtime-bar-item">
+                <span class="label">Service Status</span>
+                <strong id="serviceStatusValue">Loading</strong>
+              </div>
+              <div class="runtime-bar-item">
+                <span class="label">Service Time</span>
+                <strong id="serviceTimeValue">-</strong>
+              </div>
+            </div>
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Summary</h2>
+              </div>
+              <div id="repoList" class="overview-grid"></div>
+            </div>
+          </div>
+
+          <div id="modules" class="view">
+            <div class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>Pipeline Module Repository</h2>
+                  <span id="moduleKindStatus" class="muted"></span>
+                </div>
+              </div>
+              <div id="moduleRepositoryBrowser"></div>
+            </div>
+          </div>
+
+          <div id="pipeline" class="view blueprint-route-view">
+            <div class="pipeline-shell blueprint-route-shell">
+              <section id="pipelineRepositoryPage" class="pipeline-page blueprint-route-browser">
+                <div class="panel pipeline-repository-panel">
+                  <div class="panel-head">
+                    <div>
+                      <h2>Pipelines</h2>
+                      <span class="muted">Double-click a Pipeline or choose Open to edit it</span>
+                    </div>
+                  </div>
+                  <div id="pipelineRepositoryBrowser"></div>
+                  <button id="addPipelineBtn" type="button" hidden>Add Pipeline</button>
+                  <button id="clonePipelineBtn" type="button" hidden>Clone Pipeline</button>
+                  <button id="disablePipelineBtn" class="danger" type="button" hidden>Disable</button>
+                  <button id="showInactivePipelinesBtn" type="button" hidden>Show Inactive</button>
+                </div>
+              </section>
+              <section id="pipelineBuilderPage" class="pipeline-page pipeline-subcontent blueprint-route-content" hidden>
+                <nav class="pipeline-builder-route-bar" aria-label="Pipeline Builder navigation">
+                  <button id="backToPipelineListBtn" type="button" class="pipeline-builder-back">← Back to Pipelines</button>
+                  <span id="pipelineBuilderRouteLabel" class="muted">Pipeline Builder</span>
+                </nav>
+                <div id="pipelineDefinitionPanel" class="panel pipeline-definition-panel">
+                  <button id="pipelineInfoTabBtn" class="pipeline-info-tab" type="button" aria-expanded="true">▲</button>
+                  <div class="panel-head pipeline-definition-head">
+                    <div class="pipeline-definition-title">
+                      <h2 id="pipelineDefinitionTitle">Pipeline Builder</h2>
+                      <span id="pipelineStatus" class="muted"></span>
+                      <span id="pipelineManifestMeta" class="muted" hidden>Compiled runtime definition for the selected Pipeline</span>
+                    </div>
+                    <div class="pipeline-definition-controls">
+                      <label class="pipeline-picker pipeline-picker-inline" for="pipelineSelect">
+                        <span>Pipeline</span>
+                        <select id="pipelineSelect"></select>
+                      </label>
+                      <nav class="pipeline-subnav" aria-label="Pipeline definition views">
+                        <button class="pipeline-subnav-btn active" data-pipeline-section="composer" type="button">Builder</button>
+                        <button class="pipeline-subnav-btn" data-pipeline-section="manifest" type="button">Manifest</button>
+                      </nav>
+                    </div>
+                  </div>
+                  <div id="pipelineComposerSection" class="pipeline-section pipeline-definition-section blueprint-route-index active">
+                    <div id="pipelineLoadError" class="dialog-error" hidden></div>
+                    <div id="pipelineSaveError" class="dialog-error" hidden></div>
+                    <div id="pipelineFlowViewport" class="flow-viewport">
+                      <div class="canvas-toolbar pipeline-canvas-toolbar" aria-label="Pipeline canvas controls">
+                        <span id="pipelineZoomLabel" class="muted">100%</span>
+                        <button id="pipelineArrangeBtn" type="button">Arrange</button>
+                        <button id="pipelineFitBtn" type="button">Fit</button>
+                        <button id="pipelineFullscreenBtn" type="button" aria-pressed="false">Fullscreen</button>
+                      </div>
+                      <div id="pipelineFlowCanvas" class="flow-canvas">
+                        <div id="pipelineStageGrid" class="flow-board"></div>
+                      </div>
+                    </div>
+                    <div class="pipeline-observation-input" aria-label="Pipeline Observation Input filters">
+                      <section id="pipelineObservationWhitelistEditor" class="observation-list-editor" data-observation-editor="Whitelist">
+                        <div class="observation-list-head">
+                          <div>
+                            <strong>Whitelist</strong>
+                            <span class="muted">Observation DataKeys admitted into the Pipeline</span>
+                          </div>
+                          <span id="pipelineObservationWhitelistCount" class="observation-list-count">0</span>
+                        </div>
+                        <div id="pipelineObservationWhitelistList" class="observation-entry-list" role="list"></div>
+                        <div class="observation-list-actions">
+                          <button id="pipelineObservationWhitelistAddBtn" class="observation-entry-add" type="button" aria-label="Add one whitelist DataKey" title="Add one DataKey">+</button>
+                          <button id="pipelineObservationWhitelistBatchBtn" class="observation-entry-batch" type="button">Batch import</button>
+                        </div>
+                        <p id="pipelineObservationWhitelistError" class="observation-list-error" role="alert" hidden></p>
+                      </section>
+                      <section id="pipelineObservationBlacklistEditor" class="observation-list-editor" data-observation-editor="Blacklist">
+                        <div class="observation-list-head">
+                          <div>
+                            <strong>Blacklist</strong>
+                            <span class="muted">Observation DataKeys explicitly excluded from the Pipeline</span>
+                          </div>
+                          <span id="pipelineObservationBlacklistCount" class="observation-list-count">0</span>
+                        </div>
+                        <div id="pipelineObservationBlacklistList" class="observation-entry-list" role="list"></div>
+                        <div class="observation-list-actions">
+                          <button id="pipelineObservationBlacklistAddBtn" class="observation-entry-add" type="button" aria-label="Add one blacklist DataKey" title="Add one DataKey">+</button>
+                          <button id="pipelineObservationBlacklistBatchBtn" class="observation-entry-batch" type="button">Batch import</button>
+                        </div>
+                        <p id="pipelineObservationBlacklistError" class="observation-list-error" role="alert" hidden></p>
+                      </section>
+                    </div>
+                    <div class="pipeline-version-footer">
+                      <input id="pipelineId" type="hidden" />
+                      <input id="pipelineName" type="hidden" />
+                      <label class="pipeline-version-picker">
+                        <span>Version</span>
+                        <select id="pipelineVersionSelect"></select>
+                      </label>
+                      <button id="loadPipelineBtn" type="button">Load Version</button>
+                      <button id="savePipelineVersionBtn" type="button">Save Version</button>
+                    </div>
+                  </div>
+                  <div id="pipelineManifestSection" class="pipeline-section pipeline-definition-section">
+                    <pre id="manifestJson" class="json"></pre>
+                  </div>
+                </div>
+                <div id="pipelineAlphaSection" class="pipeline-section blueprint-route-section">
+                  <div class="panel blueprint-route-summary">
+                    <div class="panel-head">
+                      <div>
+                        <h2>Signal Blueprint</h2>
+                        <span class="muted">Versioned Signal Graph editor for the selected Pipeline</span>
+                      </div>
+                    </div>
+                    <div id="blueprintMeta" class="overview-grid"></div>
+                  </div>
+                  <div class="panel blueprint-route-graph-panel">
+                    <div class="panel-head">
+                      <h2>Graph Editor</h2>
+                    </div>
+                    <div id="pipelineBlueprintError" class="dialog-error" hidden></div>
+                    <div id="pipelineAlphaGraphError" class="dialog-error" hidden></div>
+                    <div id="alphaGraphBuilder" class="alpha-graph-builder blueprint-route-graph"></div>
+                    <textarea id="pipelineAlphaGraph" class="spec-editor blueprint-raw" spellcheck="false" hidden></textarea>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </div>
+
+          <div id="data" class="view">
+            <div class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>Data Filesystem</h2>
+                  <span class="muted">Datasets, Samplers, Scripts and Workspaces share one folder hierarchy</span>
+                </div>
+              </div>
+              <div id="dataRepositoryBrowser"></div>
+            </div>
+          </div>
+
+          <div id="mining-kline" class="view"></div>
+
+          <div id="backtests" class="view">
+            <section id="backtestEntrySection" class="backtest-section active">
+              <div class="panel">
+              <div class="panel-head">
+                <h2>Backtest Entry</h2>
+                <div class="toolbar">
+                  <span id="backtestStatus" class="muted"></span>
+                  <button id="showArchivedBacktestsBtn" type="button">Show Archived</button>
+                </div>
+              </div>
+              <div id="backtestChain" class="backtest-graph-shell" aria-label="Backtest execution graph">
+                <div class="canvas-toolbar backtest-canvas-toolbar" aria-label="Backtest canvas controls">
+                  <span id="backtestZoomLabel" class="muted">100%</span>
+                  <button id="backtestArrangeBtn" type="button">Arrange</button>
+                  <button id="backtestFitBtn" type="button">Fit</button>
+                  <button id="backtestFullscreenBtn" type="button" aria-pressed="false">Fullscreen</button>
+                </div>
+                <div class="backtest-graph-canvas">
+                  <svg class="backtest-graph-edges" viewBox="0 0 3000 1800" aria-hidden="true">
+                    <defs>
+                      <marker id="backtestArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                        <path d="M 0 0 L 10 5 L 0 10 z"></path>
+                      </marker>
+                    </defs>
+                    <path data-backtest-edge="dataset-sampler" marker-end="url(#backtestArrow)"></path>
+                    <path data-backtest-edge="sampler-environment" marker-end="url(#backtestArrow)"></path>
+                    <path data-backtest-edge="environment-pipeline" marker-end="url(#backtestArrow)"></path>
+                    <path data-backtest-edge="sampler-analyzer" marker-end="url(#backtestArrow)"></path>
+                    <path data-backtest-edge="pipeline-environment" class="backtest-return-edge" marker-end="url(#backtestArrow)"></path>
+                    <path data-backtest-edge="pipeline-analyzer" class="backtest-return-edge" marker-end="url(#backtestArrow)"></path>
+                    <text data-backtest-edge-label="sampler-environment">Sample DataKeys</text>
+                    <text data-backtest-edge-label="environment-pipeline">Graph outputs</text>
+                    <text data-backtest-edge-label="sampler-analyzer">Sample DataKeys</text>
+                    <text data-backtest-edge-label="pipeline-environment">explicit last.&lt;DataKey&gt; · next cycle</text>
+                    <text data-backtest-edge-label="pipeline-analyzer">explicit last.&lt;DataKey&gt; · next cycle</text>
+                  </svg>
+
+                  <div class="backtest-graph-node backtest-node-dataset" data-backtest-node="dataset">
+                    <span class="backtest-node-port port-in"></span>
+                    <span class="backtest-node-port port-out"></span>
+                    <span class="chain-kind">Dataset</span>
+                    <select id="backtestDataset" aria-label="Backtest Dataset"></select>
+                    <span id="chainDatasetMeta" class="muted">Evidence is locked automatically</span>
+                    <button id="chainDataset" class="backtest-node-action" type="button">Open Dataset</button>
+                  </div>
+                  <div class="backtest-graph-node backtest-node-sampler" data-backtest-node="sampler">
+                    <span class="backtest-node-port port-in"></span>
+                    <span class="backtest-node-port port-out"></span>
+                    <span class="chain-kind">Sampler</span>
+                    <select id="backtestSampler" aria-label="Backtest Sampler"></select>
+                    <span id="chainSamplerMeta" class="muted">DataKey mapping</span>
+                    <span id="chainSamplerConfigMeta" class="muted">default parameters</span>
+                    <div class="backtest-node-actions">
+                      <button id="configureBacktestSampler" class="backtest-node-action" type="button">Configure</button>
+                      <button id="chainSampler" class="backtest-node-action" type="button">Open Sampler</button>
+                    </div>
+                  </div>
+                  <div class="backtest-graph-node backtest-node-environment" data-backtest-node="environment">
+                    <span class="backtest-node-port port-in"></span>
+                    <span class="backtest-node-port port-out port-out-top"></span>
+                    <span class="backtest-node-port port-out port-out-bottom"></span>
+                    <span class="chain-kind">Environment</span>
+                    <select id="backtestEnvironmentSelect" aria-label="Backtest Environment"></select>
+                    <span id="chainEnvironmentMeta" class="muted">Sample + explicitly bound last.&lt;DataKey&gt;</span>
+                    <span id="chainEnvironmentConfigMeta" class="muted">default parameters</span>
+                    <div class="backtest-node-actions">
+                      <button id="configureBacktestEnvironment" class="backtest-node-action" type="button">Configure</button>
+                      <button id="chainEnvironmentDetails" class="backtest-node-action" type="button">Details</button>
+                    </div>
+                  </div>
+                  <div class="backtest-graph-node backtest-node-pipeline" data-backtest-node="pipeline">
+                    <span class="backtest-node-port port-in"></span>
+                    <span class="backtest-node-port port-out"></span>
+                    <span class="chain-kind">Pipeline</span>
+                    <select id="backtestPipelineSelect" aria-label="Backtest Pipeline"></select>
+                    <span id="chainPipelineMeta" class="muted">receives only Environment Graph outputs</span>
+                    <button id="chainPipeline" class="backtest-node-action" type="button">Open Pipeline</button>
+                  </div>
+                  <div class="backtest-graph-node backtest-node-analyzer" data-backtest-node="analyzer">
+                    <span class="backtest-node-port port-in"></span>
+                    <span class="chain-kind">Analysis</span>
+                    <select id="backtestAnalysisSelect" aria-label="Backtest Analysis"></select>
+                    <span id="chainAnalysisMeta" class="muted">independent input branch; outputs Result only</span>
+                    <button id="chainAnalysisDetails" class="backtest-node-action" type="button">Details</button>
+                  </div>
+                </div>
+                <div id="backtestEntryError" class="backtest-graph-message backtest-graph-error dialog-error" role="alert" hidden></div>
+              </div>
+              <div id="backtestSubmitPanel" class="backtest-submit-bar" data-state="idle">
+                <div class="backtest-submit-state">
+                  <span class="backtest-submit-indicator" aria-hidden="true"></span>
+                  <div>
+                    <strong id="backtestSubmitTitle">Complete configuration</strong>
+                    <span id="backtestCompositionStatus" class="muted" role="status" aria-live="polite" data-state="idle">Select Pipeline, Dataset, Sampler, Environment, and Analysis</span>
+                  </div>
+                </div>
+                <button id="runBacktestBtn" class="backtest-submit-action" type="button" disabled>Build</button>
+              </div>
+              </div>
+              <div class="panel backtest-jobs-panel">
+                <div class="panel-head">
+                  <div>
+                    <h2>Backtest Jobs</h2>
+                    <span class="muted">Submitted Backtests run independently in the background</span>
+                  </div>
+                  <span id="backtestJobCapacity" class="backtest-job-capacity muted"></span>
+                </div>
+                <div id="backtestJobList" class="backtest-job-list" aria-live="polite"></div>
+              </div>
+              <div class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>Backtest Filesystem</h2>
+                  <span class="muted">Backtest records and Results; Pipeline, Environment and Analysis remain independent resources</span>
+                </div>
+              </div>
+              <div id="backtestResourceBrowser"></div>
+              </div>
+            </section>
+          </div>
+
+          <div id="environment" class="view blueprint-route-view">
+            <section id="environmentRepositorySection" class="blueprint-route-index">
+              <div class="panel blueprint-route-browser">
+                <div class="panel-head">
+                  <div>
+                    <h2>Environments</h2>
+                    <span id="environmentRepositoryStatus" class="muted">Open an Environment to edit its Blueprint</span>
+                  </div>
+                </div>
+                <div id="environmentRepositoryBrowser"></div>
+              </div>
+              <div class="panel blueprint-route-browser">
+                <div class="panel-head">
+                  <div>
+                    <h2>Environment Module Repository</h2>
+                    <span id="environmentModuleStatus" class="muted"></span>
+                  </div>
+                </div>
+                <div id="environmentModuleRepositoryBrowser"></div>
+              </div>
+            </section>
+            <section id="environmentBlueprintSection" class="pipeline-shell blueprint-route-shell blueprint-route-content blueprint-route-section" hidden>
+              <div id="environmentGraphPanel" class="panel blueprint-route-graph-panel">
+                <div class="panel-head">
+                  <h2>Environment Blueprint</h2>
+                </div>
+                <div id="environmentGraphBuilder" class="alpha-graph-builder blueprint-route-graph" aria-label="Environment Module Graph"></div>
+              </div>
+            </section>
+          </div>
+
+          <div id="analysis" class="view blueprint-route-view">
+            <section id="analysisRepositorySection" class="blueprint-route-index">
+              <div class="panel blueprint-route-browser">
+                <div class="panel-head">
+                  <div>
+                    <h2>Analyses</h2>
+                    <span id="analysisRepositoryStatus" class="muted">Open an Analysis to edit its Blueprint</span>
+                  </div>
+                </div>
+                <div id="analysisRepositoryBrowser"></div>
+              </div>
+              <div class="panel blueprint-route-browser">
+                <div class="panel-head">
+                  <div>
+                    <h2>Analysis Module Repository</h2>
+                    <span id="analysisModuleStatus" class="muted"></span>
+                  </div>
+                </div>
+                <div id="analysisModuleRepositoryBrowser"></div>
+              </div>
+            </section>
+            <section id="analysisBlueprintSection" class="pipeline-shell blueprint-route-shell blueprint-route-content blueprint-route-section" hidden>
+              <div class="panel blueprint-route-graph-panel">
+                <div class="panel-head"><h2>Analysis Blueprint</h2></div>
+                <div id="analysisGraphBuilder" class="alpha-graph-builder blueprint-route-graph" aria-label="Analysis Module Graph"></div>
+              </div>
+            </section>
+          </div>
+
+          <div id="visualizers" class="view">
+            <div class="panel blueprint-route-browser">
+              <div class="panel-head">
+                <div>
+                  <h2>Visualizers</h2>
+                  <span class="muted">Read-only BuiltIn renderers available to every Result</span>
+                </div>
+              </div>
+              <div id="visualizerRepositoryBrowser"></div>
+            </div>
+          </div>
+
+          <div id="results" class="view">
+            <div class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2 id="resultTitle">Result</h2>
+                  <span id="resultMeta" class="muted"></span>
+                </div>
+                <div class="toolbar">
+                  <button id="backFromResultBtn" type="button">Back to Backtest</button>
+                  <button id="resultTimezoneBtn" type="button">TZ: New York</button>
+                  <button id="addChartBtn" type="button">Add Chart</button>
+                </div>
+              </div>
+              <div id="resultsActionError" class="dialog-error" hidden></div>
+              <div id="metricStrip" class="metric-strip"></div>
+              <div id="chartArea" class="chart-area"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Advanced Spec</h2>
+                <button id="saveVisualizationBtn" type="button">Save Spec</button>
+              </div>
+              <div id="visualizationSpecError" class="dialog-error" hidden></div>
+              <textarea id="visualizationSpec" class="spec-editor blueprint-raw" spellcheck="false" hidden></textarea>
+            </div>
+          </div>
+
+        </section>
+      </section>
+    </main>
+
+    <dialog id="unloadDialog" class="action-dialog">
+      <h2 id="unloadDialogTitle">Unload Module</h2>
+      <p id="unloadDialogText"></p>
+      <div class="dialog-actions">
+        <button id="cancelUnloadBtn" type="button">Cancel</button>
+        <button id="confirmUnloadBtn" type="button">Unload</button>
+      </div>
+    </dialog>
+
+    <dialog id="pipelineObservationBatchDialog" class="action-dialog observation-batch-dialog">
+      <h2 id="pipelineObservationBatchTitle">Batch import DataKeys</h2>
+      <p class="muted">Enter one DataKey per line. The whole batch is checked before any tag is added.</p>
+      <form id="pipelineObservationBatchForm" class="dialog-form">
+        <label>
+          <span>DataKeys</span>
+          <textarea id="pipelineObservationBatchInput" rows="12" spellcheck="false" autocomplete="off" placeholder="market.ohlcv.close&#10;portfolio.positions"></textarea>
+        </label>
+        <p id="pipelineObservationBatchError" class="dialog-error observation-batch-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button id="cancelPipelineObservationBatchBtn" type="button">Cancel</button>
+          <button id="confirmPipelineObservationBatchBtn" type="submit">Import</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="miningJobDialog" class="action-dialog mining-job-dialog">
+      <h2>Add Mining Job</h2>
+      <p class="muted">Provider records are stored unchanged. Continuity is an optional numeric distance in the provider's own event-time unit.</p>
+      <form id="miningJobForm" class="dialog-form">
+        <div class="mining-form-grid">
+          <label><span>Name</span><input id="miningJobName" required autocomplete="off" /></label>
+          <label><span>Job ID</span><input id="miningJobId" pattern="[a-z0-9][a-z0-9-]{2,79}" autocomplete="off" /></label>
+          <label><span>Provider</span><select id="miningJobProvider" required></select></label>
+          <label><span>Schedule seconds</span><input id="miningScheduleSeconds" type="number" min="1" max="31536000" value="60" required /></label>
+          <label><span>Overlap records</span><input id="miningOverlapRecords" type="number" min="0" max="1000000" value="2" required /></label>
+          <label><span>Continuity step (optional)</span><input id="miningContinuityStep" type="number" min="0.000001" max="1000000000000000" step="any" /></label>
+        </div>
+        <label><span>Provider config JSON</span><textarea id="miningProviderConfig" rows="11" spellcheck="false" required></textarea></label>
+        <p id="miningJobError" class="dialog-error" role="alert" hidden></p>
+        <div class="dialog-actions"><button id="cancelMiningJobBtn" type="button">Cancel</button><button id="confirmMiningJobBtn" type="submit">Create</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="moduleUploadDialog" class="action-dialog module-lifecycle-dialog">
+      <h2 id="moduleUploadDialogTitle">Add Module</h2>
+      <p id="moduleUploadSource" class="muted"></p>
+      <form id="moduleUploadForm" class="dialog-form">
+        <div class="module-lifecycle-grid">
+          <label>
+            <span>Kind</span>
+            <select id="moduleUploadKind" required>
+              <option>Universe</option><option>Signal</option><option>Target</option>
+              <option>Constraint</option>
+            </select>
+          </label>
+          <label>
+            <span>Name</span>
+            <input id="moduleUploadName" autocomplete="off" required />
+          </label>
+          <label>
+            <span>Module ID</span>
+            <input id="moduleUploadId" autocomplete="off" required />
+          </label>
+          <label>
+            <span>Entry file</span>
+            <input id="moduleUploadEntry" value="module.py" autocomplete="off" required />
+          </label>
+        </div>
+        <label class="file-label">
+          <span>Local Module files</span>
+          <input id="moduleUploadFiles" type="file" webkitdirectory directory multiple required />
+          <small>Select the Module root directory. Relative paths are preserved; module.json can populate the definition below.</small>
+        </label>
+        <div class="module-contract-grid">
+          <label>
+            <span>Input ports JSON</span>
+            <textarea id="moduleUploadInputs" rows="8" spellcheck="false">{}</textarea>
+          </label>
+          <label>
+            <span>Output ports JSON</span>
+            <textarea id="moduleUploadOutputs" rows="8" spellcheck="false">{}</textarea>
+          </label>
+        </div>
+        <label>
+          <span>Config schema JSON</span>
+          <textarea id="moduleUploadConfigSchema" rows="6" spellcheck="false">{"type":"object","properties":{},"additionalProperties":false}</textarea>
+        </label>
+        <label>
+          <span>Description</span>
+          <input id="moduleUploadDescription" autocomplete="off" />
+        </label>
+        <p id="moduleUploadError" class="dialog-error" role="alert" hidden></p>
+        <p id="moduleUploadImpact" class="module-impact-warning" hidden></p>
+        <div class="dialog-actions">
+          <button id="cancelModuleUploadBtn" type="button">Cancel</button>
+          <button id="confirmModuleUploadBtn" type="submit">Add Module</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="repositoryFolderDialog" class="action-dialog">
+      <h2 id="repositoryFolderDialogTitle">New Folder</h2>
+      <form id="repositoryFolderForm" class="dialog-form">
+        <label>
+          <span>Name</span>
+          <input id="repositoryFolderName" maxlength="80" autocomplete="off" required />
+        </label>
+        <label id="repositoryFolderParentField">
+          <span>Parent</span>
+          <select id="repositoryFolderParent"></select>
+        </label>
+        <p id="repositoryFolderDialogError" class="dialog-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button id="cancelRepositoryFolderBtn" type="button">Cancel</button>
+          <button id="confirmRepositoryFolderBtn" type="submit">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="datasetAddDialog" class="action-dialog data-action-dialog">
+      <h2 id="datasetAddDialogTitle">Add Dataset</h2>
+      <form id="datasetAddForm" class="dialog-form">
+        <div id="datasetAddUploadFields" class="dialog-form">
+          <label><span>Name</span><input id="uploadDatasetName" placeholder="My Dataset" /></label>
+          <label><span>ZIP Dataset</span><input id="uploadZip" type="file" accept=".zip,application/zip,application/x-zip-compressed" /></label>
+        </div>
+        <p id="datasetAddError" class="dialog-error" role="alert" hidden></p>
+        <div class="dialog-actions"><button id="cancelDatasetAddBtn" type="button">Cancel</button><button id="confirmDatasetAddBtn" type="submit">Add Dataset</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="datasetWorkspaceDialog" class="action-dialog data-action-dialog dataset-workspace-dialog">
+      <h2>Add Workspace</h2>
+      <form id="datasetWorkspaceForm" class="dialog-form">
+        <label><span>Name</span><input id="datasetWorkspaceName" placeholder="Data Preparation" required /></label>
+        <section class="dataset-collection-picker">
+          <span class="dialog-section-label">Source Datasets</span>
+          <div class="dataset-picker-combobox">
+            <span aria-hidden="true">⌕</span>
+            <input id="datasetWorkspaceSearch" type="search" autocomplete="off" placeholder="Search Datasets by name, ID or folder" aria-controls="datasetWorkspaceCandidates" aria-expanded="false" />
+          </div>
+          <div id="datasetWorkspaceCandidates" class="dataset-picker-candidates" role="listbox" hidden></div>
+          <div class="dataset-picker-selection-head"><strong>Selected Datasets</strong><span id="datasetWorkspaceSelectionCount">0 selected</span></div>
+          <div id="datasetWorkspaceSelected" class="dataset-picker-selected" aria-live="polite"></div>
+        </section>
+        <p class="muted">Sources are mounted read-only as dataset1, dataset2, …</p>
+        <p id="datasetWorkspaceError" class="dialog-error" role="alert" hidden></p>
+        <div class="dialog-actions"><button id="cancelDatasetWorkspaceBtn" type="button">Cancel</button><button id="createDatasetWorkspaceBtn" type="submit">Create Workspace</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="datasetScriptDialog" class="action-dialog data-action-dialog">
+      <h2 id="datasetScriptDialogTitle">Add Script</h2>
+      <form id="datasetScriptForm" class="dialog-form">
+        <input id="datasetScriptMode" type="hidden" />
+        <div id="datasetScriptMethodStep" class="dataset-add-method-step">
+          <p class="muted">Choose where the Python script comes from.</p>
+          <div class="dataset-add-methods">
+            <button type="button" data-dataset-script-method="upload">
+              <strong>Upload from Local</strong>
+              <span>Select a Python <code>.py</code> file from this computer.</span>
+            </button>
+            <button type="button" data-dataset-script-method="workspace">
+              <strong>Choose from Workspace</strong>
+              <span>Select an existing Workspace, then choose one of its Python files.</span>
+            </button>
+          </div>
+          <div class="dialog-actions"><button id="cancelDatasetScriptMethodBtn" type="button">Cancel</button></div>
+        </div>
+        <div id="datasetScriptDetailStep" class="dialog-form" hidden>
+          <div id="datasetScriptMetadataFields" class="form-grid">
+            <label><span>Name</span><input id="datasetScriptName" required /></label>
+          </div>
+          <label id="datasetScriptFileField" hidden><span>Python file</span><input id="datasetScriptFile" type="file" accept=".py,text/x-python" /></label>
+          <div id="datasetScriptWorkspaceFields" class="form-grid dataset-script-source-grid" hidden>
+            <label><span>Workspace</span><select id="datasetScriptWorkspace"></select></label>
+            <label><span>Python script</span><select id="datasetScriptWorkspacePath"></select></label>
+          </div>
+          <p class="muted">The Script is stored exactly as submitted. Its own code defines supported arguments, defaults and validation.</p>
+          <p id="datasetScriptError" class="dialog-error" role="alert" hidden></p>
+          <div class="dialog-actions"><button id="backDatasetScriptBtn" type="button">Back</button><button id="cancelDatasetScriptBtn" type="button">Cancel</button><button id="confirmDatasetScriptBtn" type="submit">Add Script</button></div>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="datasetProcessDialog" class="action-dialog data-action-dialog">
+      <h2>Process Datasets</h2>
+      <form id="datasetProcessForm" class="dialog-form">
+        <label><span>Script</span><select id="datasetProcessScript" required></select></label>
+        <label><span>Source Datasets</span><select id="datasetProcessSources" multiple size="8" required></select></label>
+        <label><span>Output Dataset Name</span><input id="datasetProcessOutputName" required /></label>
+        <label>
+          <span>Command-line arguments</span>
+          <textarea id="datasetProcessArguments" rows="4" spellcheck="false" placeholder="--period 20 --mode fast"></textarea>
+          <small>Optional. Passed to the selected Script as argv. Quoting is supported; no shell is invoked.</small>
+        </label>
+        <p id="datasetProcessError" class="dialog-error" role="alert" hidden></p>
+        <div class="dialog-actions"><button id="cancelDatasetProcessBtn" type="button">Cancel</button><button id="confirmDatasetProcessBtn" type="submit">Process</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="datasetReplaceDialog" class="action-dialog data-action-dialog">
+      <h2>Replace Dataset</h2>
+      <form id="datasetReplaceForm" class="dialog-form">
+        <p id="datasetReplaceTarget" class="muted"></p>
+        <label><span>New ZIP version</span><input id="datasetReplaceFile" type="file" accept=".zip,application/zip,application/x-zip-compressed" required /></label>
+        <p class="muted">The existing versions stay sealed; this upload becomes the new current version.</p>
+        <p id="datasetReplaceError" class="dialog-error" role="alert" hidden></p>
+        <div class="dialog-actions"><button id="cancelDatasetReplaceBtn" type="button">Cancel</button><button id="confirmDatasetReplaceBtn" type="submit">Replace</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="repositoryResourceRenameDialog" class="action-dialog">
+      <h2>Rename</h2>
+      <form id="repositoryResourceRenameForm" class="dialog-form">
+        <label><span>Name</span><input id="repositoryResourceRenameName" maxlength="160" required /></label>
+        <p id="repositoryResourceRenameError" class="dialog-error" role="alert" hidden></p>
+        <div class="dialog-actions"><button id="cancelRepositoryResourceRenameBtn" type="button">Cancel</button><button type="submit">Rename</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="createPipelineDialog" class="action-dialog">
+      <h2>Add Pipeline</h2>
+      <form id="createPipelineForm" class="dialog-form">
+        <label>
+          <span>Name</span>
+          <input id="createPipelineName" maxlength="120" autocomplete="off" required />
+        </label>
+        <p id="createPipelineError" class="dialog-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button id="cancelCreatePipelineBtn" type="button">Cancel</button>
+          <button id="confirmCreatePipelineBtn" type="submit">Add Pipeline</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="clonePipelineDialog" class="action-dialog">
+      <h2>Clone Pipeline</h2>
+      <p id="clonePipelineSource" class="muted"></p>
+      <form id="clonePipelineForm" class="dialog-form">
+        <label>
+          <span>New name</span>
+          <input id="clonePipelineName" maxlength="120" autocomplete="off" required />
+        </label>
+        <p id="clonePipelineError" class="dialog-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button id="cancelClonePipelineBtn" type="button">Cancel</button>
+          <button id="confirmClonePipelineBtn" type="submit">Clone Pipeline</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="disablePipelineDialog" class="action-dialog">
+      <h2>Disable Pipeline</h2>
+      <p id="disablePipelineText"></p>
+      <form id="disablePipelineForm" class="dialog-form">
+        <label>
+          <span>Reason (optional)</span>
+          <input id="disablePipelineReason" maxlength="240" autocomplete="off" />
+        </label>
+        <p id="disablePipelineError" class="dialog-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button id="cancelArchivePipelineBtn" type="button">Cancel</button>
+          <button id="confirmArchivePipelineBtn" class="danger" type="submit">Disable</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="accountDialog" class="action-dialog account-dialog">
+      <h2>Account security</h2>
+      <p id="accountIdentity" class="muted"></p>
+      <form id="passwordChangeForm" class="auth-form">
+        <label>
+          <span>Current password</span>
+          <input id="currentPassword" type="password" autocomplete="current-password" required />
+        </label>
+        <label>
+          <span>New password</span>
+          <input id="newPassword" type="password" autocomplete="new-password" minlength="12" required />
+        </label>
+        <label>
+          <span>Confirm new password</span>
+          <input id="confirmNewPassword" type="password" autocomplete="new-password" minlength="12" required />
+        </label>
+        <p id="accountError" class="dialog-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button id="cancelAccountBtn" type="button">Cancel</button>
+          <button id="changePasswordBtn" type="submit">Change password</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="moduleLoadDialog" class="action-dialog module-load-dialog">
+      <h2 id="moduleLoadDialogTitle">Load Module</h2>
+      <div class="dialog-form">
+        <input id="moduleLoadInstanceId" type="hidden" />
+        <p id="moduleLoadDialogError" class="dialog-error" hidden></p>
+        <section>
+          <span class="dialog-section-label">Config</span>
+          <div id="moduleLoadConfigFields" class="structured-fields"></div>
+        </section>
+        <section>
+          <span class="dialog-section-label">Inputs</span>
+          <div id="moduleLoadInputsFields" class="structured-fields"></div>
+        </section>
+        <section>
+          <span class="dialog-section-label">Outputs</span>
+          <div id="moduleLoadOutputsFields" class="structured-fields"></div>
+        </section>
+      </div>
+      <div class="dialog-actions">
+        <button id="cancelModuleLoadBtn" type="button">Cancel</button>
+        <button id="confirmModuleLoadBtn" type="button">Load</button>
+      </div>
+    </dialog>
+
+    <dialog id="backtestSamplerConfigDialog" class="action-dialog module-load-dialog">
+      <h2 id="backtestSamplerConfigTitle">Configure Sampler</h2>
+      <p id="backtestSamplerConfigDescription" class="muted"></p>
+      <div id="backtestSamplerConfigFields" class="structured-fields"></div>
+      <p id="backtestSamplerConfigError" class="dialog-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button id="cancelBacktestSamplerConfigBtn" type="button">Cancel</button>
+        <button id="applyBacktestSamplerConfigBtn" type="button">Apply</button>
+      </div>
+    </dialog>
+
+    <script src="/vendor/lightweight-charts/lightweight-charts.standalone.production.js"></script>
+    <script src="/vendor/litegraph/litegraph.js"></script>
+    <script src="/vendor/trade-resource-browser.js"></script>
+    <script src="/module_forms.js"></script>
+    <script src="/module_graph_litegraph.js"></script>
+    <script src="/chart_core.js"></script>
+    <script src="/mining_kline.js"></script>
+    <script src="/ui_sync.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

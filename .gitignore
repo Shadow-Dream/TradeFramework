@@ -1,0 +1,42 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.log
+*.png
+!/vendor/TradingAgents/assets/**/*.png
+*.tar.gz
+*.zip
+.runtime/
+**/.runtime/
+node_modules/
+.tmp_*.png
+/pipeline-blueprint-*.png
+/benchmarks/*
+!/benchmarks/README.md
+/artifacts/*
+!/artifacts/README.md
+/runner.py
+**/_data/
+**/_backtests/
+**/_dataset_workspaces/
+**/dataset-build-jobs/
+**/engine-data.db*
+
+# Private strategies and their data/results live in independent repositories.
+# TradeEngine contains only Engine-owned source and BuiltIn resources.
+/strategies/
+/data/
+/results/
+
+bin/
+obj/
+TestResults/
+*.trx
+
+# The vendored Kanna fork is a first-class TradeEngine component. Its launcher
+# and image assets must remain tracked even though the repository-wide rules
+# ignore generic build output and screenshots elsewhere.
+!/agent_web/bin/
+!/agent_web/bin/**
+!/agent_web/assets/**/*.png
+!/agent_web/src/**/*.png

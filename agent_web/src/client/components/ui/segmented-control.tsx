@@ -1,0 +1,130 @@
+import { type ReactNode, isValidElement, useLayoutEffect, useRef, useState } from "react"
+import type { LucideIcon } from "lucide-react"
+import { cn } from "../../lib/utils"
+import { Tooltip, TooltipContent, TooltipTrigger } from "./tooltip"
+
+type SegmentedSize = "sm" | "md"
+
+export type SegmentedOption<T extends string> = {
+  value: T
+  label: ReactNode
+  icon?: LucideIcon | ReactNode
+  disabled?: boolean
+  tooltip?: ReactNode
+}
+
+interface SegmentedControlProps<T extends string> {
+  value: T
+  onValueChange: (value: T) => void
+  options: SegmentedOption<T>[]
+  size?: SegmentedSize
+  className?: string
+  optionClassName?: string
+}
+
+const sizeClasses: Record<SegmentedSize, string> = {
+  sm: "text-sm px-2.5 py-1",
+  md: "text-sm px-3 py-1.5",
+}
+
+export function SegmentedControl<T extends string>({
+  value,
+  onValueChange,
+  options,
+  size = "md",
+  className,
+  optionClassName,
+}: SegmentedControlProps<T>) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const buttonRefs = useRef(new Map<T, HTMLButtonElement>())
+  const [indicator, setIndicator] = useState<{ left: number; width: number } | null>(null)
+  // Skip the transition on first paint / when there's no prior position, so the
+  // indicator only animates when moving between segments (not when appearing).
+  const hasIndicator = useRef(false)
+
+  useLayoutEffect(() => {
+    const container = containerRef.current
+    const active = buttonRefs.current.get(value)
+    if (!container || !active) {
+      setIndicator(null)
+      hasIndicator.current = false
+      return
+    }
+    const containerRect = container.getBoundingClientRect()
+    const rect = active.getBoundingClientRect()
+    // `left` on the absolute indicator resolves against the container's padding
+    // box, but these rects are border-box — subtract the left border width so
+    // the indicator doesn't sit one border-width to the right at every position.
+    setIndicator({ left: rect.left - containerRect.left - container.clientLeft, width: rect.width })
+    hasIndicator.current = true
+  }, [value, options, size])
+
+  return (
+    <div
+      ref={containerRef}
+      className={cn(
+        "relative inline-flex items-center rounded-lg border border-border p-[3px] bg-slate-200 dark:bg-transparent",
+        className,
+      )}
+    >
+      {indicator && (
+        <span
+          aria-hidden
+          className={cn(
+            "pointer-events-none absolute top-[3px] bottom-[3px] rounded-[4px] border",
+            "bg-white dark:bg-muted border-slate-300 dark:border-white/10",
+            hasIndicator.current && "transition-[left,width] duration-200 ease-in-out",
+          )}
+          style={{ left: indicator.left, width: indicator.width }}
+        />
+      )}
+      {options.map((option) => {
+        const isActive = option.value === value
+        const icon = option.icon
+        // Support both LucideIcon components (forwardRef objects or functions) and ReactNode
+        const iconElement = icon
+          ? isValidElement(icon)
+            ? icon
+            : (() => { const Icon = icon as LucideIcon; return <Icon className={size === "sm" ? "h-3.5 w-3.5" : "h-4 w-4"} /> })()
+          : null
+        const button = (
+          <button
+            key={option.value}
+            ref={(el) => {
+              if (el) buttonRefs.current.set(option.value, el)
+              else buttonRefs.current.delete(option.value)
+            }}
+            type="button"
+            onClick={() => onValueChange(option.value)}
+            disabled={option.disabled}
+            aria-pressed={isActive}
+            className={cn(
+              "relative z-10 rounded-[4px] border border-transparent transition-colors",
+              icon ? "grid grid-cols-[auto_auto] items-center gap-2" : "inline-flex items-center",
+              sizeClasses[size],
+              isActive
+                ? "text-slate-900 dark:text-slate-200"
+                : "text-slate-800 hover:text-slate-900 dark:text-muted-foreground dark:hover:text-foreground",
+              option.disabled && "opacity-50 pointer-events-none",
+              optionClassName,
+            )}
+          >
+            {iconElement}
+            <span>{option.label}</span>
+          </button>
+        )
+
+        if (!option.tooltip) {
+          return button
+        }
+
+        return (
+          <Tooltip key={option.value}>
+            <TooltipTrigger asChild>{button}</TooltipTrigger>
+            <TooltipContent>{option.tooltip}</TooltipContent>
+          </Tooltip>
+        )
+      })}
+    </div>
+  )
+}

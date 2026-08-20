@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dataset Preparation"
+  short_description: "Prepare causal, reproducible Trade Engine datasets"
+  default_prompt: "Use $dataset-preparation to prepare and validate this dataset for an exact Trade Engine workflow."
