@@ -5,7 +5,12 @@ from __future__ import annotations
 import copy
 
 from engine.contracts.digest import canonical_json_digest
+from engine.contracts.config_override import (
+    normalize_module_config_overrides,
+    normalize_resource_config_override,
+)
 from engine.contracts.module import require_exact_fields
+from engine.contracts.protocol import common_protocol_id
 
 
 BACKTEST_REQUEST_FIELDS = frozenset({
@@ -17,7 +22,7 @@ BACKTEST_REQUEST_FIELDS = frozenset({
     "analysis",
     "limit",
 })
-BACKTEST_EXECUTION_SNAPSHOT_SCHEMA_VERSION = 12
+BACKTEST_EXECUTION_SNAPSHOT_SCHEMA_VERSION = 13
 BACKTEST_EXECUTION_SNAPSHOT_FIELDS = frozenset({
     "schemaVersion",
     "createdAt",
@@ -53,20 +58,33 @@ def normalize_backtest_request(request):
         label="Backtest request",
     ))
     references = (
-        ("pipeline", {"pipelineId", "version"}),
-        ("environment", {"environmentId", "version"}),
-        ("analysis", {"analysisId", "version"}),
+        ("pipeline", "pipelineId", {"configOverride", "moduleConfigOverrides"}),
+        ("environment", "environmentId", {"moduleConfigOverrides"}),
+        ("analysis", "analysisId", {"moduleConfigOverrides"}),
     )
-    for field, fields in references:
+    for field, identity_field, override_fields in references:
+        fields = {identity_field, "version", *override_fields}
         require_exact_fields(
             request[field],
             allowed=fields,
-            required=fields,
+            required={identity_field, "version"},
             label=f"Backtest {field}",
         )
-        for name in fields:
+        for name in (identity_field, "version"):
             if not isinstance(request[field][name], str):
                 raise ValueError(f"Backtest {field}.{name} must be a string.")
+        if field == "pipeline" and "configOverride" in request[field]:
+            request[field]["configOverride"] = normalize_resource_config_override(
+                request[field]["configOverride"],
+                label=f"Backtest {field}.configOverride",
+            )
+        if "moduleConfigOverrides" in request[field]:
+            request[field]["moduleConfigOverrides"] = (
+                normalize_module_config_overrides(
+                    request[field]["moduleConfigOverrides"],
+                    label=f"Backtest {field}.moduleConfigOverrides",
+                )
+            )
     require_exact_fields(
         request["sampler"],
         allowed={"samplerId", "version", "parameters"},
@@ -115,6 +133,24 @@ def backtest_evidence_digest(payload):
     return "sha256:" + canonical_json_digest(payload)
 
 
+def execution_snapshot_protocol_id(snapshot):
+    """Project passive ownership from the exact top-level frozen resources."""
+
+    if not isinstance(snapshot, dict):
+        return None
+    try:
+        resources = (
+            snapshot["datasetVersion"],
+            snapshot["samplerDefinition"],
+            snapshot["pipeline"]["definition"],
+            snapshot["environmentDefinition"],
+            snapshot["analysisDefinition"],
+        )
+    except (KeyError, TypeError):
+        return None
+    return common_protocol_id(resources)
+
+
 __all__ = (
     "BACKTEST_EXECUTION_SNAPSHOT_FIELDS",
     "BACKTEST_EXECUTION_SNAPSHOT_SCHEMA_VERSION",
@@ -122,5 +158,6 @@ __all__ = (
     "BACKTEST_RUNNER",
     "backtest_evidence_digest",
     "backtest_execution_inputs",
+    "execution_snapshot_protocol_id",
     "normalize_backtest_request",
 )

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import math
 import unittest
 
+from application_protocols.basic_workflow.manifest import PROTOCOL_ID
 from application_components.basic_workflow.account import (
     long_only_aggregate_account,
     long_only_mark_to_market_account,
@@ -25,10 +25,6 @@ from application_components.basic_workflow.catalog import (
     COMPONENT_IDS,
     component_catalog,
 )
-from application_components.basic_workflow.performance import (
-    annualized_return,
-    sample_return_statistics,
-)
 
 
 class BasicWorkflowComponentLibraryTests(unittest.TestCase):
@@ -41,7 +37,10 @@ class BasicWorkflowComponentLibraryTests(unittest.TestCase):
                 list(module_ids),
             )
             self.assertTrue(all(item["ports"] for item in catalog[category]))
-        self.assertIn(
+            self.assertTrue(
+                all(item.get("protocolId") == PROTOCOL_ID for item in catalog[category])
+            )
+        self.assertNotIn(
             "performance-metrics-analyzer",
             {item["moduleId"] for item in catalog["analysis"]},
         )
@@ -63,19 +62,6 @@ class BasicWorkflowComponentLibraryTests(unittest.TestCase):
         settlement = immediate_settlement(fill["notional"], fill["filledQuantity"], fee)
         self.assertAlmostEqual(settlement["positionDelta"], 0.5)
         self.assertAlmostEqual(settlement["cashDelta"], -(50.05 + 1.05005))
-
-    def test_performance_kernels_define_annualization_and_sharpe(self):
-        result = sample_return_statistics(2, 0.05, 0.0125, 252.0, 0.0)
-        deviation = math.sqrt(0.01125)
-        self.assertAlmostEqual(
-            result["annualizedVolatility"],
-            deviation * math.sqrt(252.0),
-        )
-        self.assertAlmostEqual(
-            result["sharpeRatio"],
-            0.025 / deviation * math.sqrt(252.0),
-        )
-        self.assertAlmostEqual(annualized_return(0.1, 365.2425 * 86400), 0.1)
 
     def test_account_kernels_cover_instruments_and_independent_positions(self):
         self.assertEqual(

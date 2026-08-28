@@ -194,6 +194,153 @@ class BacktestFreezeIntegrationTests(BacktestIntegrationTestCase):
             0,
         )
 
+    def test_backtest_pipeline_and_module_overrides_are_executed_and_retained(self):
+        module = next(
+            item
+            for item in module_definitions.load_pipeline_definitions(
+                self.config
+            ).values()
+            if item["moduleId"] == "sma-indicator"
+        )
+        pipeline_id = "configured-signal-pipeline"
+        pipeline_service.archive_pipeline_if_changed(self.config, {
+            "pipelineId": pipeline_id,
+            "name": "Configured Signal Pipeline",
+            "config": {
+                "observationInput": {
+                    "whitelist": ["price"],
+                    "blacklist": [],
+                }
+            },
+            "instances": {
+                "sma": {
+                    "instanceId": "sma",
+                    "kind": "Signal",
+                    "moduleId": module["moduleId"],
+                    "version": module["version"],
+                    "config": {"period": 2},
+                    "inputs": {"value": "wire.close"},
+                    "outputs": {"sma": "wire.sma"},
+                },
+            },
+            "stages": {},
+            "signalGraph": {
+                "nodes": ["sma"],
+                "inputs": {"close": {"dataKey": "price.close", "wire": "wire.close"}},
+                "outputs": {"sma-output": {"dataKey": "signal.sma", "wire": "wire.sma"}},
+            },
+        })
+        environment = self.passthrough_environment(
+            "configured-price-close-environment", ["price.close"]
+        )
+        analysis = self.graph_version(
+            "analyses.json", "analysisId", analysis_presets.NEUTRAL_ANALYSIS_ID
+        )
+        request = self.request(
+            pipeline_id,
+            self.row_sampler,
+            environment,
+            analysis,
+        )
+        request["pipeline"]["configOverride"] = {
+            "observationInput": {"whitelist": ["price.close"]}
+        }
+        request["pipeline"]["moduleConfigOverrides"] = {
+            "sma": {"period": 3}
+        }
+
+        frozen = backtest_service.freeze_backtest_request(self.config, request)
+        self.assertEqual(
+            frozen["executionSnapshot"]["pipeline"]["definition"]
+            ["instances"]["sma"]["config"],
+            {"period": 2},
+        )
+        self.assertEqual(
+            frozen["executionSnapshot"]["executionInputs"]
+            ["pipeline"]["configOverride"],
+            {"observationInput": {"whitelist": ["price.close"]}},
+        )
+        self.assertEqual(
+            frozen["executionSnapshot"]["executionInputs"]
+            ["pipeline"]["moduleConfigOverrides"],
+            {"sma": {"period": 3}},
+        )
+        self.assertEqual(
+            frozen["executionSnapshot"]["compositionArtifact"]
+            ["pipelinePlan"]["observationInput"],
+            {"whitelist": ["price.close"], "blacklist": []},
+        )
+        result = backtest_execution_service.run_backtest(self.config, frozen)
+        loaded = self.result_projection(
+            result["backtestId"], ["cycles", "executionChain"]
+        )
+        self.assertAlmostEqual(
+            loaded["cycles"][-1]["data"]["signal"]["sma"],
+            35.0 / 3.0,
+        )
+        self.assertEqual(
+            loaded["executionChain"]["configuration"]["pipeline"],
+            {
+                "configOverride": {
+                    "observationInput": {"whitelist": ["price.close"]}
+                },
+                "moduleConfigOverrides": {"sma": {"period": 3}},
+                "effectiveConfig": {
+                    "observationInput": {
+                        "whitelist": ["price.close"],
+                        "blacklist": [],
+                    }
+                },
+                "effectiveModuleConfigs": {"sma": {"period": 3}},
+            },
+        )
+        self.assertEqual(
+            loaded["executionChain"]["pipeline"]["observationInput"],
+            {"whitelist": ["price.close"], "blacklist": []},
+        )
+
+        invalid = copy.deepcopy(request)
+        invalid["pipeline"]["moduleConfigOverrides"] = {
+            "sma": {"period": 0}
+        }
+        with self.assertRaisesRegex(ValueError, "period"):
+            backtest_service.freeze_backtest_request(self.config, invalid)
+
+        unknown = copy.deepcopy(request)
+        unknown["pipeline"]["moduleConfigOverrides"] = {
+            "missing": {"period": 3}
+        }
+        with self.assertRaisesRegex(ValueError, "unknown instance.*missing"):
+            backtest_service.freeze_backtest_request(self.config, unknown)
+
+        legacy_pipeline_module_map = copy.deepcopy(request)
+        legacy_pipeline_module_map["pipeline"]["configOverride"] = {
+            "sma": {"period": 3}
+        }
+        with self.assertRaisesRegex(ValueError, "unsupported field.*sma"):
+            backtest_service.freeze_backtest_request(
+                self.config,
+                legacy_pipeline_module_map,
+            )
+
+        legacy_graph_config_override = copy.deepcopy(request)
+        legacy_graph_config_override["environment"]["configOverride"] = {}
+        with self.assertRaisesRegex(ValueError, "unsupported field.*configOverride"):
+            backtest_service.freeze_backtest_request(
+                self.config,
+                legacy_graph_config_override,
+            )
+
+        invalid_resource_config = copy.deepcopy(request)
+        invalid_resource_config["pipeline"]["configOverride"] = {
+            "observationInput": {"blacklist": ["missing"]}
+        }
+        with self.assertRaisesRegex(ValueError, "outside the whitelist"):
+            backtest_service.freeze_backtest_request(
+                self.config,
+                invalid_resource_config,
+            )
+
     def test_backtest_request_rejects_strategy_specific_routing_fields(self):
         pipeline = self.empty_pipeline("no-routing-pipeline")
         sampler = self.row_sampler
@@ -313,7 +460,11 @@ class BacktestFreezeIntegrationTests(BacktestIntegrationTestCase):
         old_schema["executionSnapshot"]["snapshotHash"] = (
             "sha256:" + control.json_digest(unsigned)
         )
-        with self.assertRaisesRegex(ValueError, "schemaVersion 12 is required"):
+        with self.assertRaisesRegex(
+            ValueError,
+            f"schemaVersion {backtest_contracts.BACKTEST_EXECUTION_SNAPSHOT_SCHEMA_VERSION} "
+            "is required",
+        ):
             backtest_execution_service.run_backtest(self.config, old_schema)
 
         tampered_edge = copy.deepcopy(frozen)
@@ -503,7 +654,7 @@ class BacktestFreezeIntegrationTests(BacktestIntegrationTestCase):
             "environments.json", "environmentId", environment_presets.NEUTRAL_ENVIRONMENT_ID
         )
         analysis = self.graph_version(
-            "analyses.json", "analysisId", analysis_presets.PERFORMANCE_ANALYSIS_ID
+            "analyses.json", "analysisId", analysis_presets.NEUTRAL_ANALYSIS_ID
         )
         request = self.request(pipeline["pipelineId"], sampler, environment, analysis)
         analysis_draft = {

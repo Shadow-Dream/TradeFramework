@@ -1,5 +1,4 @@
 """Canonical Engine service orchestration API."""
-import math
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,9 +31,6 @@ def load_config(path):
         allowed={
             "liveRoot", "releaseRoot", "controlRoot", "allowInsecureAuth",
             "backtestMaxWorkers", "jupyterHost", "jupyterBaseUrl",
-            "miningRoot", "miningAutoStart", "miningExposeTestProvider",
-            "miningHttpTimeout", "miningMaxPageBytes",
-            "miningMaxPagesPerRun", "miningStandbyRetrySeconds",
         },
         required={"liveRoot", "releaseRoot", "controlRoot"},
         label="Control API config",
@@ -68,43 +64,6 @@ def load_config(path):
             if not isinstance(config[field], str) or not config[field].strip():
                 raise ValueError(f"Control API config {field} must be a non-empty string.")
             loaded[field] = config[field]
-    if "miningRoot" in config:
-        value = config["miningRoot"]
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError("Control API config miningRoot must be a non-empty string.")
-        loaded["miningRoot"] = str(Path(value).expanduser())
-    for field in ("miningAutoStart", "miningExposeTestProvider"):
-        if field in config:
-            if not isinstance(config[field], bool):
-                raise ValueError(f"Control API config {field} must be a boolean.")
-            loaded[field] = config[field]
-    for field in ("miningHttpTimeout", "miningStandbyRetrySeconds"):
-        if field not in config:
-            continue
-        raw_value = config[field]
-        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
-            raise ValueError(f"Control API config {field} must be a finite number.")
-        value = float(raw_value)
-        if not math.isfinite(value) or not 1 <= value <= 300:
-            raise ValueError(
-                f"Control API config {field} must be finite and between 1 and 300."
-            )
-        loaded[field] = value
-    integer_limits = {
-        "miningMaxPageBytes": (1024, 1024 * 1024 * 1024),
-        "miningMaxPagesPerRun": (1, 1000),
-    }
-    for field, (minimum, maximum) in integer_limits.items():
-        if field not in config:
-            continue
-        value = config[field]
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(f"Control API config {field} must be an integer.")
-        if not minimum <= value <= maximum:
-            raise ValueError(
-                f"Control API config {field} must be between {minimum} and {maximum}."
-            )
-        loaded[field] = value
     return loaded
 
 

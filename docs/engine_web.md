@@ -25,7 +25,6 @@ python3 engine_service.py \
 - `/analysis`：独立 Analysis Graph 编辑器。
 - `/modules`：Pipeline、Environment、Analysis 三个独立 Module repository。
 - `/data`：Dataset、Sampler、Dataset Script 与 Workspace。
-- `/mining/k-line`：独立的 Provider 原生分钟数据采集、续断、Gap 回补与健康状态；不会自动发布 Dataset。
 - `/backtests`：组合并冻结各顶级资源 Version，提交 Backtest Job。
 - `/result`：Result 与临时可视化 Module；临时实例不写回 Result 或下一周期状态。
 - `/agent`：验证当前 TradeEngine Session，携带受限的返回路径跳转到独立 Agent Web；
@@ -60,14 +59,6 @@ GET /api/backtests/{backtestId}/meta
 GET /api/backtests/{backtestId}/result
 GET /api/visualizers
 GET /api/history
-GET /api/mining/health
-GET /api/mining/providers
-GET /api/mining/jobs
-GET /api/mining/jobs/{jobId}
-GET /api/mining/jobs/{jobId}/records
-GET /api/mining/jobs/{jobId}/gaps
-GET /api/mining/jobs/{jobId}/manifest
-GET /api/mining/events
 ```
 
 列表和读取 Version 时，后端会验证索引键、完整单调历史、归档记录快照、逐文件摘要、manifest digest 和只读权限。验证失败时请求直接失败，不回退到当前 Draft 或旧协议。
@@ -91,11 +82,6 @@ POST /api/data/process
 POST /api/backtests
 POST /api/backtests/{backtestId}/result
 POST /api/visualizations
-POST /api/mining/jobs
-POST /api/mining/jobs/{jobId}/pause
-POST /api/mining/jobs/{jobId}/resume
-POST /api/mining/jobs/{jobId}/run-now
-POST /api/mining/jobs/{jobId}/gaps/{gapId}/refill
 ```
 
 旧 `/api/agent/threads|runs|events|preferences|backends` 和 Python Agent Gateway 已删除，
@@ -122,11 +108,8 @@ Agent 服务端管理，不使用当前 Unix 用户的 Codex 登录。
 validate 和创建展示用 Proposal；三个 UI 工具只读写当前页面登记的草稿/文本 buffer，
 不接受路径，也不会隐式 Save/Publish/Run/Submit。
 
-Mining 使用与 `controlRoot/releaseRoot/liveRoot/sourceRoot` 不重叠的独立
-`miningRoot`，新部署必须使用 fresh root；已有数据库必须精确匹配当前 schema
-version、结构指纹和实际结构。服务不会补字段或迁移无法识别的数据库，而是在启动
-worker 前 fail-closed。主动 Supervisor 默认关闭；启用后，其子进程和监控线程
-必须被证明已停止，Engine service 才会释放 Owner authority。
+数据采集功能当前下线：Engine 不接受 Mining 配置，不挂载 `/api/mining/*`，也不启动
+Mining worker。离线参考实现不属于当前产品合同。
 
 Backtest 正文没有全量 JSON 读取接口。`/meta` 只返回数据库中的严格索引元数据；
 `/result` 按显式 `path` 流式校验并写出投影，避免把完整 cycles 物化到 Engine
@@ -151,6 +134,50 @@ Graph compiler 对 Signal、Environment、Analysis 统一验证端口、Schema�
 ## Backtest 冻结与周期语义
 
 Backtest 提交固定 Dataset Version、Sampler Version、Pipeline Version、Environment Version、Analysis Version，以及三张 Graph 所引用的所有 Module Version。Job 只接受 Engine 生成且 hash 有效的 frozen snapshot；缺少资产或 verification 失败时不会读取当前资源补齐。
+
+Backtest 可以在不创建新资源 Version 的情况下覆盖资源自身配置和内部 Module 配置。
+Sampler 延续 `parameters` 接口；Pipeline 的 `configOverride` 是 Pipeline 自身
+`definition.config` 的稀疏覆盖，Pipeline、Environment、Analysis 的
+`moduleConfigOverrides` 才是 `instanceId -> partial Module config`，例如：
+
+```json
+{
+  "pipeline": {
+    "pipelineId": "example",
+    "version": "3",
+    "configOverride": {
+      "observationInput": {
+        "whitelist": ["time", "price.day.SPX"],
+        "blacklist": []
+      }
+    },
+    "moduleConfigOverrides": {"atr": {"period": 21}}
+  },
+  "environment": {
+    "environmentId": "paper",
+    "version": "2",
+    "moduleConfigOverrides": {"account": {"initialCash": 200000}}
+  },
+  "analysis": {
+    "analysisId": "example-analysis",
+    "version": "1",
+    "moduleConfigOverrides": {"summary": {"precision": 4}}
+  }
+}
+```
+
+两类 Override 都按对象递归合并、数组和标量整体替换。Pipeline `configOverride`
+只能修改 Pipeline 自身公开的配置字段；`moduleConfigOverrides` 只能修改已选资源中的
+`instances[instanceId].config`。未知资源配置字段、未知 instance、未知 Module 配置字段，
+或不满足所选资源/Module Version 合同的值都会在 Build 阶段失败。Environment 与
+Analysis 不接受冒充资源配置的 `configOverride`。资源 Version 中的默认配置不会被修改。
+
+frozen snapshot 的 `executionInputs` 保存完整 `configOverride` 与
+`moduleConfigOverrides`。Result `executionChain.configuration.pipeline` 分别保存
+`configOverride`、`moduleConfigOverrides`、`effectiveConfig` 和
+`effectiveModuleConfigs`；Environment/Analysis 分别保存 `moduleConfigOverrides` 和
+`effectiveModuleConfigs`，整个 configuration 另有 digest。因此矩阵调参的每个 Backtest
+都能独立复现，Pipeline 实际执行的 `observationInput` 也能与所选 Version 默认值区分。
 
 执行过程中，每个完成周期直接写入当前 Backtest 目录中的临时 Result，全部生命周期成功结束后再以原子替换发布为唯一的 `result.json`。SQLite 只保存 Backtest 请求、状态、指标和 Result 索引，不保存第二份 Result 正文；提交接口返回元数据，需要正文时再从只读 Result 文件显式加载。这样周期数增加时不会在内存、文件和数据库之间同时保留多份完整结果。
 

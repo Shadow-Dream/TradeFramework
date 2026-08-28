@@ -23,18 +23,10 @@ from engine.control import auth
 
 
 PREVIEW_ROOT = (PROJECT / ".runtime" / "preview").resolve()
-PREVIEW_MINING_ROOT = (PROJECT.parent / ".trade-engine-preview-mining").resolve()
 PREVIEW_CONFIG = {
     "controlRoot": str(PREVIEW_ROOT / "control"),
     "releaseRoot": str(PREVIEW_ROOT / "releases"),
     "liveRoot": str(PREVIEW_ROOT / "live"),
-    "miningRoot": str(PREVIEW_MINING_ROOT),
-    "miningAutoStart": True,
-    "miningExposeTestProvider": False,
-    "miningHttpTimeout": 20,
-    "miningMaxPageBytes": 67_108_864,
-    "miningMaxPagesPerRun": 25,
-    "miningStandbyRetrySeconds": 15,
     "allowInsecureAuth": True,
 }
 AGENT_ENV = PREVIEW_ROOT / "agent-web.env"
@@ -197,10 +189,6 @@ def main() -> int:
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         path.chmod(0o700)
     ensure_preview_workspace_runtime()
-    if PROJECT in PREVIEW_MINING_ROOT.parents or PREVIEW_MINING_ROOT == PROJECT:
-        raise RuntimeError("preview Mining root overlaps the source repository")
-    PREVIEW_MINING_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
-    PREVIEW_MINING_ROOT.chmod(0o700)
     prepare_agent_environment()
 
     builtin_count = ensure_builtin_resources()

@@ -11,6 +11,7 @@ from engine.contracts.graph_resource import (
     GRAPH_RESOURCE_ARCHIVE_FIELDS,
     graph_resource_draft_fields,
 )
+from engine.contracts.protocol import normalize_protocol_id
 
 
 ENVIRONMENT_DRAFT_FIELDS = graph_resource_draft_fields("environmentId")
@@ -71,6 +72,11 @@ def normalize_environment(definition, *, archived):
         raise ValueError(
             "Environment contains instance(s) outside its Graph: "
             + ", ".join(orphaned)
+        )
+    if "protocolId" in definition:
+        normalize_protocol_id(
+            definition["protocolId"],
+            label=f"Environment '{definition['environmentId']}' protocolId",
         )
     return {
         **{

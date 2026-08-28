@@ -14,6 +14,7 @@ from engine.contracts.graph_resource import (
     GRAPH_RESOURCE_ARCHIVE_FIELDS,
     graph_resource_draft_fields,
 )
+from engine.contracts.protocol import normalize_protocol_id
 
 
 ANALYSIS_DRAFT_FIELDS = graph_resource_draft_fields("analysisId")
@@ -75,6 +76,11 @@ def normalize_analysis(definition, *, archived):
     if orphaned:
         raise ValueError(
             "Analysis contains instance(s) outside its Graph: " + ", ".join(orphaned)
+        )
+    if "protocolId" in definition:
+        normalize_protocol_id(
+            definition["protocolId"],
+            label=f"Analysis '{definition['analysisId']}' protocolId",
         )
     return {
         **{

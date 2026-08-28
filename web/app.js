@@ -19,6 +19,7 @@ const state = {
   backtestJobMaxConcurrent: 0,
   selectedBacktest: null,
   resultBacktestId: "",
+  resultViewError: null,
   resultCharts: [],
   history: [],
   pipelineDraft: null,
@@ -27,11 +28,9 @@ const state = {
   environmentModules: {},
   visualizers: [],
   resultModules: {},
-  moduleCacheByKind: {},
-  moduleTotalsByKind: {},
   pipelines: {},
   pipelineVersions: [],
-  selectedModuleKind: "Universe",
+  backtestPipelineDefinitions: {},
   selectedModuleRepositoryItem: null,
   selectedModuleRepository: "modules",
   uiRepositorySelections: {},
@@ -65,10 +64,15 @@ const pipelineEditorState = {
 const backtestEntryState = {
   pipelineId: "",
   pipelineVersion: "",
+  pipelineConfigKey: "",
+  pipelineConfigOverride: {},
+  pipelineModuleConfigOverrides: {},
   samplerKey: "",
   samplerParameters: {},
   environmentKey: "",
+  environmentModuleConfigOverrides: {},
   analysisKey: "",
+  analysisModuleConfigOverrides: {},
   compositionValidation: "idle",
   compositionMessage: "Select exact resource versions",
   compositionSequence: 0,
@@ -92,6 +96,7 @@ const analysisEditorState = {
 };
 let pendingRepositoryRename = null;
 let pendingDatasetReplace = null;
+let moduleUploadPresentationAliases = new Map();
 const datasetWorkspaceSelection = new Set();
 
 const $ = (id) => document.getElementById(id);
@@ -106,12 +111,23 @@ let currentBacktestSection = "entry";
 const loadedViews = new Set();
 let visualizationSaveTimer = null;
 let visualizationSaveSeq = 0;
+let visualizationSaveQueue = Promise.resolve();
+let visualizationSaveEpoch = 0;
+const resultDrawingUiByPane = new Map();
 let resultSelectionSeq = 0;
+let resultDiscoveryRequest = null;
+const RESULT_REQUEST_TIMEOUT_MS = 30000;
 let showArchivedBacktests = false;
 let showInactivePipelines = false;
 let uploadZipValidationSeq = 0;
 let uploadZipValidationState = { pending: false, error: "" };
 let pendingModuleLoad = null;
+let activeBacktestConfigResource = "";
+let activeBacktestConfigInstanceId = "";
+let activeBacktestConfigScope = "";
+let activeBacktestConfigDraft = {};
+let activeBacktestConfigJsonDirty = false;
+let activeBacktestConfigPresentationAliases = new Map();
 let backtestJobPollTimer = null;
 let healthState = { ok: false, text: "Checking" };
 let serviceRuntimeState = {
@@ -131,6 +147,33 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+function visibleText(value, fallback = "") {
+  return forms?.userFacingText
+    ? forms.userFacingText(value, fallback)
+    : (String(value ?? "").trim() || String(fallback || ""));
+}
+
+function visibleResourceName(record, fallbackKind = "Resource") {
+  return forms?.resourceDisplayName
+    ? forms.resourceDisplayName(record, fallbackKind)
+    : visibleText(record?.displayName || record?.name || record?.label, fallbackKind);
+}
+
+function visibleProjection(value) {
+  return forms?.presentationJson ? forms.presentationJson(value) : value;
+}
+
+function visibleJsonText(value) {
+  return JSON.stringify(visibleProjection(value), null, 2);
+}
+
+function visibleVersionLabel(value, fallback = "Version unavailable") {
+  const text = String(value ?? "").trim();
+  if (!text) return fallback;
+  if (forms?.opaqueMachineIdentityKind?.(text) || text.includes("@sha256:")) return "Sealed version";
+  return `v${visibleText(text)}`;
+}
+
 const VIEW_PATHS = {
   overview: "/overview",
   agent: "/agent",
@@ -141,7 +184,6 @@ const VIEW_PATHS = {
   modules: "/modules",
   data: "/data",
   backtests: "/backtests",
-  "mining-kline": "/mining/k-line",
   results: "/result",
 };
 
@@ -315,12 +357,6 @@ function currentUiContext() {
     ].filter(Boolean).forEach((reference) => resourceRefs.push(reference));
   } else if (currentView === "results" && state.resultBacktestId) {
     resourceRefs.push(uiResourceRef("result", state.resultBacktestId, "", "", state.selectedBacktest?.name));
-  } else if (currentView === "mining-kline") {
-    const job = miningKLine?.state?.jobs?.find((candidate) => candidate.jobId === miningKLine.state.selectedJobId);
-    if (job) {
-      resourceRefs.push(uiResourceRef("mining-job", job.jobId, "", "", job.name));
-      selection = { kind: "mining-job", id: String(job.jobId), label: String(job.name || job.jobId) };
-    }
   } else {
     const repository = currentView === "modules"
       ? state.selectedModuleRepository
@@ -394,6 +430,10 @@ function uiDraftJson(value) {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
+function optionalProtocolId(value) {
+  return value === "" || typeof value === "undefined" ? {} : { protocolId: value };
+}
+
 function activePipelineUiDocument() {
   if (currentView !== "pipeline" || currentPipelinePage !== "builder"
       || !state.pipelineDraft || currentPipelineSection === "manifest") return null;
@@ -402,13 +442,14 @@ function activePipelineUiDocument() {
   return {
     documentId: `engine:pipeline:${pipelineId}`,
     kind: "pipeline-draft",
-    label: `Pipeline · ${pipelineField("Name")?.value?.trim() || pipelineId}`,
+    label: `Pipeline · ${visibleText(pipelineField("Name")?.value?.trim(), "Draft")}`,
     getContent() {
       $("alphaGraphBuilder")?.__flushPendingEmit?.();
       return uiDraftJson({
         schemaVersion: 1,
         pipelineId: pipelineField("Id")?.value?.trim() || pipelineId,
-        name: pipelineField("Name")?.value?.trim() || pipelineId,
+        name: pipelineField("Name")?.value?.trim() || "Pipeline",
+        ...optionalProtocolId(pipelineField("ProtocolId")?.value),
         stages: structuredClone(state.pipelineDraft?.stages || {}),
         instances: structuredClone(state.pipelineDraft?.instances || {}),
         signalGraph: structuredClone(state.pipelineDraft?.alphaGraph || { nodes: [], inputs: {}, outputs: {} }),
@@ -416,13 +457,18 @@ function activePipelineUiDocument() {
       });
     },
     applyContent(content) {
-      const parsed = exactUiDraft(JSON.parse(content), ["schemaVersion", "pipelineId", "name", "stages", "instances", "signalGraph", "config"]);
+      const parsed = exactUiDraft(
+        JSON.parse(content),
+        ["schemaVersion", "pipelineId", "name", "protocolId", "stages", "instances", "signalGraph", "config"],
+        ["schemaVersion", "pipelineId", "name", "stages", "instances", "signalGraph", "config"],
+      );
       if (parsed.schemaVersion !== 1 || typeof parsed.pipelineId !== "string" || !parsed.pipelineId.trim()
           || typeof parsed.name !== "string" || !parsed.stages || typeof parsed.stages !== "object"
           || Array.isArray(parsed.stages) || !parsed.instances || typeof parsed.instances !== "object"
           || Array.isArray(parsed.instances) || !parsed.signalGraph || typeof parsed.signalGraph !== "object"
           || Array.isArray(parsed.signalGraph) || !parsed.config || typeof parsed.config !== "object"
-          || Array.isArray(parsed.config)) {
+          || Array.isArray(parsed.config) || ("protocolId" in parsed
+            && typeof parsed.protocolId !== "string")) {
         throw uiDraftError("invalid_document", "Pipeline draft fields are invalid");
       }
       state.pipelineDraft = sanitizePipelineDraft({
@@ -430,10 +476,15 @@ function activePipelineUiDocument() {
         instances: structuredClone(parsed.instances),
         alphaGraph: structuredClone(parsed.signalGraph),
         config: structuredClone(parsed.config),
-        meta: { pipelineId: parsed.pipelineId.trim(), name: parsed.name.trim() || parsed.pipelineId.trim() },
+        meta: {
+          pipelineId: parsed.pipelineId.trim(),
+          name: parsed.name.trim() || "Pipeline",
+          protocolId: parsed.protocolId || "",
+        },
       }, pipelineEditorState.definition || {});
       pipelineField("Id").value = state.pipelineDraft.meta.pipelineId;
       pipelineField("Name").value = state.pipelineDraft.meta.name;
+      pipelineField("ProtocolId").value = state.pipelineDraft.meta.protocolId || "";
       const observation = state.pipelineDraft.config?.observationInput || {};
       renderObservationEditor("Whitelist", observation.whitelist || []);
       renderObservationEditor("Blacklist", observation.blacklist || []);
@@ -455,29 +506,36 @@ function activeEnvironmentUiDocument() {
   return {
     documentId: `engine:environment:${key}`,
     kind: "environment-draft",
-    label: `Environment · ${draft.name || environmentId}`,
+    label: `Environment · ${visibleText(draft.name, "Draft")}`,
     getContent() {
       $("environmentGraphBuilder")?.__flushPendingEmit?.();
       return uiDraftJson({
         schemaVersion: 2,
         environmentId: draft.environmentId,
         name: draft.name,
+        ...optionalProtocolId(draft.protocolId),
         description: source.description || "",
         instances: structuredClone(draft.instances),
         graph: structuredClone(draft.graph),
       });
     },
     applyContent(content) {
-      const parsed = exactUiDraft(JSON.parse(content), ["schemaVersion", "environmentId", "name", "description", "instances", "graph"]);
+      const parsed = exactUiDraft(
+        JSON.parse(content),
+        ["schemaVersion", "environmentId", "name", "protocolId", "description", "instances", "graph"],
+        ["schemaVersion", "environmentId", "name", "description", "instances", "graph"],
+      );
       if (parsed.schemaVersion !== 2 || typeof parsed.environmentId !== "string" || !parsed.environmentId.trim()
           || typeof parsed.name !== "string" || !parsed.name.trim() || typeof parsed.description !== "string"
           || !parsed.instances || typeof parsed.instances !== "object" || Array.isArray(parsed.instances)
-          || !parsed.graph || typeof parsed.graph !== "object" || Array.isArray(parsed.graph)) {
+          || !parsed.graph || typeof parsed.graph !== "object" || Array.isArray(parsed.graph)
+          || ("protocolId" in parsed && typeof parsed.protocolId !== "string")) {
         throw uiDraftError("invalid_document", "Environment draft fields are invalid");
       }
       environmentEditorState.draftsByEnvironment[key] = {
         environmentId: parsed.environmentId,
         name: parsed.name,
+        ...optionalProtocolId(parsed.protocolId),
         instances: structuredClone(parsed.instances),
         graph: structuredClone(parsed.graph),
       };
@@ -497,29 +555,36 @@ function activeAnalysisUiDocument() {
   return {
     documentId: `engine:analysis:${key}`,
     kind: "analysis-draft",
-    label: `Analysis · ${draft.name || analysisId}`,
+    label: `Analysis · ${visibleText(draft.name, "Draft")}`,
     getContent() {
       $("analysisGraphBuilder")?.__flushPendingEmit?.();
       return uiDraftJson({
         schemaVersion: 1,
         analysisId: draft.analysisId,
         name: draft.name,
+        ...optionalProtocolId(draft.protocolId),
         description: source.description || "",
         instances: structuredClone(draft.instances),
         graph: structuredClone(draft.graph),
       });
     },
     applyContent(content) {
-      const parsed = exactUiDraft(JSON.parse(content), ["schemaVersion", "analysisId", "name", "description", "instances", "graph"]);
+      const parsed = exactUiDraft(
+        JSON.parse(content),
+        ["schemaVersion", "analysisId", "name", "protocolId", "description", "instances", "graph"],
+        ["schemaVersion", "analysisId", "name", "description", "instances", "graph"],
+      );
       if (parsed.schemaVersion !== 1 || typeof parsed.analysisId !== "string" || !parsed.analysisId.trim()
           || typeof parsed.name !== "string" || !parsed.name.trim() || typeof parsed.description !== "string"
           || !parsed.instances || typeof parsed.instances !== "object" || Array.isArray(parsed.instances)
-          || !parsed.graph || typeof parsed.graph !== "object" || Array.isArray(parsed.graph)) {
+          || !parsed.graph || typeof parsed.graph !== "object" || Array.isArray(parsed.graph)
+          || ("protocolId" in parsed && typeof parsed.protocolId !== "string")) {
         throw uiDraftError("invalid_document", "Analysis draft fields are invalid");
       }
       analysisEditorState.draftsByAnalysis[key] = {
         analysisId: parsed.analysisId,
         name: parsed.name,
+        ...optionalProtocolId(parsed.protocolId),
         instances: structuredClone(parsed.instances),
         graph: structuredClone(parsed.graph),
       };
@@ -537,10 +602,10 @@ function activeBacktestUiDocument() {
     documentId: "engine:backtest:composition",
     kind: "backtest-draft",
     label: "Backtest composition",
-    getContent: () => uiDraftJson({ schemaVersion: 1, ...buildBacktestCompositionRequest() }),
+    getContent: () => uiDraftJson({ schemaVersion: 2, ...buildBacktestCompositionRequest() }),
     applyContent(content) {
       const parsed = exactUiDraft(JSON.parse(content), ["schemaVersion", "pipeline", "datasetId", "datasetVersionId", "sampler", "environment", "analysis"]);
-      if (parsed.schemaVersion !== 1 || typeof parsed.datasetId !== "string"
+      if (parsed.schemaVersion !== 2 || typeof parsed.datasetId !== "string"
           || !parsed.pipeline || typeof parsed.pipeline !== "object"
           || !parsed.sampler || typeof parsed.sampler !== "object"
           || !parsed.environment || typeof parsed.environment !== "object"
@@ -564,10 +629,15 @@ function activeBacktestUiDocument() {
       Object.entries(controls).forEach(([name, control]) => { control.value = values[name]; });
       backtestEntryState.pipelineId = parsed.pipeline.pipelineId;
       backtestEntryState.pipelineVersion = parsed.pipeline.version;
+      backtestEntryState.pipelineConfigKey = values.pipeline;
+      backtestEntryState.pipelineConfigOverride = structuredClone(parsed.pipeline.configOverride || {});
+      backtestEntryState.pipelineModuleConfigOverrides = structuredClone(parsed.pipeline.moduleConfigOverrides || {});
       backtestEntryState.samplerKey = values.sampler;
       backtestEntryState.samplerParameters = structuredClone(parsed.sampler.parameters || {});
       backtestEntryState.environmentKey = values.environment;
+      backtestEntryState.environmentModuleConfigOverrides = structuredClone(parsed.environment.moduleConfigOverrides || {});
       backtestEntryState.analysisKey = values.analysis;
+      backtestEntryState.analysisModuleConfigOverrides = structuredClone(parsed.analysis.moduleConfigOverrides || {});
       invalidateBacktestBuild("Composition changed by Agent · Build again before running");
       renderBacktestChain();
     },
@@ -579,7 +649,7 @@ function activeVisualizationUiDocument() {
   return {
     documentId: `engine:visualization:${state.resultBacktestId}`,
     kind: "visualization-draft",
-    label: `Visualization · ${state.selectedBacktest.name || state.resultBacktestId}`,
+    label: `Visualization · ${visibleResourceName(state.selectedBacktest, "Backtest Result")}`,
     getContent: () => `${$("visualizationSpec")?.value || "{}"}\n`,
     applyContent(content) {
       const spec = JSON.parse(content);
@@ -755,13 +825,6 @@ const BACKTEST_GRAPH_DEFAULT_POSITIONS = {
   analyzer: { left: 1430, top: 955 },
 };
 
-const MODULE_KINDS = [
-  "Universe",
-  "Signal",
-  "Target",
-  "Constraint",
-];
-
 function redirectToLogin() {
   const next = `${location.pathname}${location.search}${location.hash}`;
   location.replace(`/login?next=${encodeURIComponent(next)}`);
@@ -803,7 +866,52 @@ async function getJson(path) {
   return response.json();
 }
 
-async function postJson(path, payload) {
+function renderSubsystemNavigation(payload) {
+  const group = $("subsystemNavGroup");
+  const root = $("subsystemNavLinks");
+  if (!group || !root) return;
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.subsystems)) {
+    throw new Error("Subsystem catalog must contain a subsystems array.");
+  }
+  const ids = new Set();
+  const paths = new Set();
+  const links = payload.subsystems.map((record) => {
+    if (!record || typeof record !== "object" || Array.isArray(record)) {
+      throw new Error("Subsystem catalog entries must be objects.");
+    }
+    const fields = Object.keys(record).sort();
+    if (JSON.stringify(fields) !== JSON.stringify(["label", "pagePath", "protocolId", "subsystemId"])) {
+      throw new Error("Subsystem catalog entry has an invalid shape.");
+    }
+    const { subsystemId, protocolId, label, pagePath } = record;
+    if (![subsystemId, protocolId, label, pagePath].every((value) => (
+      typeof value === "string" && value && value === value.trim()
+    ))) throw new Error("Subsystem catalog entry contains invalid text.");
+    if (!pagePath.startsWith("/") || pagePath.startsWith("//") || pagePath.includes("?") || pagePath.includes("#")) {
+      throw new Error(`Subsystem '${subsystemId}' pagePath is invalid.`);
+    }
+    if (ids.has(subsystemId) || paths.has(pagePath)) {
+      throw new Error("Subsystem catalog contains duplicate identities or page paths.");
+    }
+    ids.add(subsystemId);
+    paths.add(pagePath);
+    const link = document.createElement("a");
+    link.className = "nav-btn";
+    link.href = pagePath;
+    link.textContent = visibleText(label, "Subsystem");
+    link.dataset.subsystemId = subsystemId;
+    link.dataset.protocolId = protocolId;
+    return link;
+  });
+  root.replaceChildren(...links);
+  group.hidden = links.length === 0;
+}
+
+async function loadSubsystemNavigation() {
+  renderSubsystemNavigation(await getJson("/api/subsystems"));
+}
+
+async function postJson(path, payload, options = {}) {
   const response = await authenticatedFetch(path, {
     method: "POST",
     headers: {
@@ -812,13 +920,39 @@ async function postJson(path, payload) {
       "X-CSRF-Token": authState.csrfToken,
     },
     body: JSON.stringify(payload),
+    signal: options.signal,
   });
-  const data = await response.json().catch(() => ({}));
+  let data;
+  try {
+    data = await response.json();
+  } catch (error) {
+    if (response.ok) throw error;
+    data = {};
+  }
   if (!response.ok || data.accepted === false) {
-    throw new Error(data.error || `${path} returned ${response.status}`);
+    const error = new Error(data.error || `${path} returned ${response.status}`);
+    error.status = response.status;
+    error.payload = data;
+    throw error;
   }
   publishUiResourceMutation(path, data);
   return data;
+}
+
+async function postResultJson(path, payload, controller, timeoutMessage) {
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, RESULT_REQUEST_TIMEOUT_MS);
+  try {
+    return await postJson(path, payload, { signal: controller.signal });
+  } catch (error) {
+    if (timedOut) throw new Error(timeoutMessage);
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 const uiResourceMutationFingerprints = new Set();
@@ -848,7 +982,17 @@ function publishUiResourceMutation(path, data) {
     id = data.dataset?.datasetId || data.datasetId || data.job?.datasetId || "";
   }
   if (!kind || !id) return;
-  const fingerprint = `${path}:${kind}:${id}:${data.version || data.definition?.version || data.visualization?.contentDigest || ""}`;
+  const visualizationRevision = kind === "visualization"
+    && Number.isSafeInteger(data.visualization?.revision)
+    && data.visualization.revision > 0
+    ? String(data.visualization.revision)
+    : "";
+  const resourceVersion = visualizationRevision
+    || String(data.version || data.definition?.version || "");
+  const resourceDigest = String(
+    data.contentDigest || data.definition?.contentDigest || ""
+  );
+  const fingerprint = `${path}:${kind}:${id}:${resourceVersion}:${resourceDigest}`;
   if (uiResourceMutationFingerprints.has(fingerprint)) return;
   uiResourceMutationFingerprints.add(fingerprint);
   if (uiResourceMutationFingerprints.size > 256) uiResourceMutationFingerprints.delete(uiResourceMutationFingerprints.values().next().value);
@@ -857,9 +1001,9 @@ function publishUiResourceMutation(path, data) {
     kind,
     id: String(id),
     change,
-    ...(data.version || data.definition?.version ? { version: String(data.version || data.definition.version) } : {}),
-    ...(data.contentDigest || data.definition?.contentDigest || data.visualization?.contentDigest
-      ? { digest: String(data.contentDigest || data.definition?.contentDigest || data.visualization.contentDigest) }
+    ...(resourceVersion ? { version: resourceVersion } : {}),
+    ...(resourceDigest
+      ? { digest: resourceDigest }
       : {}),
     occurredAt: new Date().toISOString(),
   }).catch(() => undefined);
@@ -896,19 +1040,9 @@ function publishBacktestOperations(jobs = []) {
   });
 }
 
-const miningKLine = window.TradeMiningKLine?.create({
-  $,
-  escapeHtml,
-  getJson,
-  postJson,
-  publishOperation: publishUiOperation,
-  isActive: () => currentView === "mining-kline",
-  onError: (error) => console.error(error?.message || String(error)),
-});
-
 function setAccountError(message = "") {
   const node = $("accountError");
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
 }
 
@@ -930,7 +1064,7 @@ function setAccountMenuOpen(open) {
 function formatTime(value) {
   if (!value) return "-";
   const date = typeof value === "number" ? new Date(value * 1000) : new Date(value);
-  if (Number.isNaN(date.getTime())) return String(value);
+  if (Number.isNaN(date.getTime())) return visibleText(value, "-");
   return date.toLocaleString();
 }
 
@@ -938,10 +1072,10 @@ function setHealth(ok, text) {
   const node = $("health");
   healthState = {
     ok: !!ok,
-    text: String(text || ""),
+    text: visibleText(text),
   };
   if (node) {
-    node.textContent = text;
+    node.textContent = visibleText(text);
     node.classList.toggle("ok", ok);
   } else if (!ok && text && text !== "Loading") {
     console.error(text);
@@ -977,7 +1111,6 @@ function beginViewLoading(viewId) {
     visualizers: "Visualizer",
     backtests: "Backtest",
     results: "Result",
-    "mining-kline": "K Line Mining",
     agent: "Agent",
   };
   indicator.querySelector("[data-loading-label]").textContent = `Loading ${names[viewId] || "view"}…`;
@@ -1026,60 +1159,60 @@ function localUiError(message, code = "LOCAL_UI_ERROR") {
 function setVisualizationSpecError(message = "") {
   const node = $("visualizationSpecError");
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
 }
 
 function setResultsActionError(message = "") {
   const node = $("resultsActionError");
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
 }
 
 function setPipelineAlphaGraphError(message = "") {
   const node = $("pipelineAlphaGraphError");
   if (node) {
-    node.textContent = message;
+    node.textContent = visibleText(message);
     node.hidden = true;
   }
   if (message) {
-    document.querySelector("#alphaGraphBuilder")?.__setBlueprintStatus?.(message, true);
+    document.querySelector("#alphaGraphBuilder")?.__setBlueprintStatus?.(visibleText(message), true);
   }
 }
 
 function setPipelineSaveError(message = "") {
   const node = $("pipelineSaveError");
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
 }
 
 function setPipelineLoadError(message = "") {
   const node = $("pipelineLoadError");
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
 }
 
 function setCreatePipelineError(message = "") {
   const node = $("createPipelineError");
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
 }
 
 function setClonePipelineError(message = "") {
   const node = $("clonePipelineError");
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
 }
 
 function setArchivePipelineError(message = "") {
   const node = $("disablePipelineError");
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
 }
 
@@ -1106,8 +1239,37 @@ function populateModuleKindSelect(id, selected = "") {
 function setModuleLifecycleError(id, message = "") {
   const node = $(id);
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
+}
+
+function moduleUploadPresentationAlias(value) {
+  const exact = String(value ?? "");
+  for (const [alias, canonical] of moduleUploadPresentationAliases.entries()) {
+    if (canonical === exact) return alias;
+  }
+  const kind = forms.opaqueMachineIdentityKind?.(exact) || "Technical reference";
+  const alias = `${kind} (${moduleUploadPresentationAliases.size + 1})`;
+  moduleUploadPresentationAliases.set(alias, exact);
+  return alias;
+}
+
+function moduleUploadPresentationValue(value, restore = false) {
+  const visit = (current) => {
+    if (Array.isArray(current)) return current.map(visit);
+    if (!current || typeof current !== "object") {
+      if (typeof current !== "string") return current;
+      if (restore) return moduleUploadPresentationAliases.get(current) || current;
+      return visibleText(current) === current ? current : moduleUploadPresentationAlias(current);
+    }
+    return Object.fromEntries(Object.entries(current).map(([key, child]) => [
+      restore
+        ? (moduleUploadPresentationAliases.get(key) || key)
+        : (forms.opaqueMachineIdentityKind?.(key) ? moduleUploadPresentationAlias(key) : key),
+      visit(child),
+    ]));
+  };
+  return visit(value);
 }
 
 function selectedModuleRepositoryItem() {
@@ -1117,7 +1279,7 @@ function selectedModuleRepositoryItem() {
 function parseModuleJsonField(id, label) {
   let value;
   try {
-    value = JSON.parse($(id).value || "{}");
+    value = moduleUploadPresentationValue(JSON.parse($(id).value || "{}"), true);
   } catch (error) {
     throw localUiError(`${label} is invalid JSON: ${error.message}`, "MODULE_DEFINITION_JSON");
   }
@@ -1128,20 +1290,22 @@ function parseModuleJsonField(id, label) {
 }
 
 function setModuleUploadDefinition(definition = {}) {
+  moduleUploadPresentationAliases = new Map();
   $("moduleUploadKind").value = definition.kind || "Signal";
-  $("moduleUploadName").value = definition.name || definition.moduleId || "";
+  $("moduleUploadName").value = visibleText(definition.name, "");
   $("moduleUploadId").value = definition.moduleId || "";
+  $("moduleUploadProtocolId").value = definition.protocolId || "";
   const argumentsValue = definition.parameters?.arguments || "";
   const entryMatch = String(argumentsValue).match(/\{\{moduleRoot\}\}\/([^\s]+)/);
   $("moduleUploadEntry").value = definition.activationMode === "ProcessRunner"
     ? (entryMatch?.[1] || definition.entryFile || "runner.py")
     : "module.py";
-  $("moduleUploadInputs").value = JSON.stringify(definition.ports?.inputs || {}, null, 2);
-  $("moduleUploadOutputs").value = JSON.stringify(definition.ports?.outputs || {}, null, 2);
+  $("moduleUploadInputs").value = JSON.stringify(moduleUploadPresentationValue(definition.ports?.inputs || {}), null, 2);
+  $("moduleUploadOutputs").value = JSON.stringify(moduleUploadPresentationValue(definition.ports?.outputs || {}), null, 2);
   $("moduleUploadConfigSchema").value = JSON.stringify(
-    definition.configSchema || { type: "object", properties: {}, additionalProperties: false }, null, 2
+    moduleUploadPresentationValue(definition.configSchema || { type: "object", properties: {}, additionalProperties: false }), null, 2
   );
-  $("moduleUploadDescription").value = definition.description || "";
+  $("moduleUploadDescription").value = moduleUploadPresentationValue(definition.description || "");
 }
 
 function openModuleUploadDialog() {
@@ -1285,10 +1449,10 @@ function pipelineModuleLifecycleReport() {
       && candidate.moduleId === instance.moduleId
       && String(candidate.version) === String(instance.version)
     ));
-    const key = `${instance.kind}/${instance.moduleId}/${instance.version}`;
-    if (!definition) errors.push(`${instance.instanceId || key} references missing Module ${key}`);
+    const moduleLabel = `${forms.humanizeName(instance.kind || "")} Module`.trim();
+    if (!definition) errors.push(`${moduleLabel} references a missing Module version`);
     else if (definition.status !== "archived") {
-      errors.push(`${instance.instanceId || key} references an unavailable Module archive ${key}`);
+      errors.push(`${moduleLabel} references an unavailable Module archive`);
     }
   });
   return { errors, warnings };
@@ -1297,7 +1461,7 @@ function pipelineModuleLifecycleReport() {
 function setPipelineBlueprintError(message = "") {
   const node = $("pipelineBlueprintError");
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   // Save/load state belongs on the disabled control and its tooltip.
   // This diagnostic node stays hidden so it cannot shift the graph.
   node.hidden = true;
@@ -1377,15 +1541,15 @@ function syncPipelineComposerEditorState() {
   const busyMessage = pipelineBlueprintBusyMessage();
   grid.querySelectorAll("select[data-load-stage]").forEach((select) => {
     select.disabled = Boolean(busyMessage);
-    select.title = busyMessage || "";
+    select.title = visibleText(busyMessage);
   });
   grid.querySelectorAll(
-    "[data-load-stage-button], [data-unload-stage]",
+    "[data-load-stage-button], [data-configure-stage-module], [data-unload-stage], [data-remove-stage-reference]",
   ).forEach((button) => {
     const fallbackDisabled = button.dataset.defaultDisabled === "1";
     const fallbackTitle = button.dataset.defaultTitle || "";
     button.disabled = Boolean(busyMessage) || fallbackDisabled;
-    button.title = busyMessage || fallbackTitle;
+    button.title = visibleText(busyMessage || fallbackTitle);
   });
 }
 
@@ -1394,41 +1558,46 @@ function syncPipelineDialogActionState() {
   const unloadConfirm = $("confirmUnloadBtn");
   if (unloadConfirm) {
     unloadConfirm.disabled = Boolean(busyMessage);
-    unloadConfirm.title = busyMessage || "";
+    unloadConfirm.title = visibleText(busyMessage);
   }
   const moduleConfirm = $("confirmModuleLoadBtn");
+  const moduleRemove = $("removeConfiguredModuleBtn");
   const moduleDialog = $("moduleLoadDialog");
   if (moduleConfirm) {
     if (busyMessage) {
       moduleConfirm.disabled = true;
-      moduleConfirm.title = busyMessage;
+      moduleConfirm.title = visibleText(busyMessage);
       if (moduleDialog?.open) setModuleLoadDialogError(busyMessage);
     } else {
       syncModuleLoadDialogActionState();
     }
   }
+  if (moduleRemove && !moduleRemove.hidden) {
+    moduleRemove.disabled = Boolean(busyMessage);
+    moduleRemove.title = visibleText(busyMessage || "Remove this Module instance");
+  }
 }
 
 function syncPipelineDraftFieldState() {
   const busyMessage = pipelineBlueprintBusyMessage();
-  ["Id", "Name", "AlphaGraph"].forEach((fieldId) => {
+  ["Id", "Name", "ProtocolId", "AlphaGraph"].forEach((fieldId) => {
     const field = pipelineField(fieldId);
     if (!field) return;
     field.disabled = Boolean(busyMessage);
-    field.title = busyMessage || "";
+    field.title = visibleText(busyMessage);
   });
   ["Whitelist", "Blacklist"].forEach((fieldId) => {
     const editor = $(`pipelineObservation${fieldId}Editor`);
     if (!editor) return;
     editor.querySelectorAll("button, input").forEach((control) => {
       control.disabled = Boolean(busyMessage);
-      control.title = busyMessage || control.dataset.defaultTitle || "";
+      control.title = visibleText(busyMessage || control.dataset.defaultTitle);
     });
   });
   const batchDialog = $("pipelineObservationBatchDialog");
   batchDialog?.querySelectorAll("button, textarea").forEach((control) => {
     control.disabled = Boolean(busyMessage);
-    control.title = busyMessage || "";
+    control.title = visibleText(busyMessage);
   });
 }
 
@@ -1436,7 +1605,7 @@ function syncGlobalNavActionState() {
   const busyMessage = pipelineBlueprintBusyMessage();
   document.querySelectorAll(".nav-btn").forEach((button) => {
     button.disabled = Boolean(busyMessage);
-    button.title = busyMessage || "";
+    button.title = visibleText(busyMessage);
   });
 }
 
@@ -1444,7 +1613,7 @@ function syncPipelineSubnavActionState() {
   const busyMessage = pipelineBlueprintBusyMessage();
   document.querySelectorAll(".pipeline-subnav-btn").forEach((button) => {
     button.disabled = Boolean(busyMessage);
-    button.title = busyMessage || "";
+    button.title = visibleText(busyMessage);
   });
 }
 
@@ -1461,13 +1630,13 @@ function syncActiveViewBusyState() {
       const activeView = element.closest(".view.active");
       if (activeView) {
         element.disabled = true;
-        element.title = busyMessage;
+        element.title = visibleText(busyMessage);
       }
       return;
     }
     if (!element.dataset.activeViewBusyCaptured) return;
     element.disabled = element.dataset.activeViewBusyDisabled === "1";
-    element.title = element.dataset.activeViewBusyTitle || "";
+    element.title = visibleText(element.dataset.activeViewBusyTitle);
     delete element.dataset.activeViewBusyCaptured;
     delete element.dataset.activeViewBusyDisabled;
     delete element.dataset.activeViewBusyTitle;
@@ -1480,11 +1649,11 @@ function syncPipelineEditorSelectorState() {
   const busyMessage = pipelineBlueprintBusyMessage();
   const hasPipelines = sortedPipelines().length > 0;
   select.disabled = Boolean(busyMessage) || !hasPipelines;
-  select.title = busyMessage || (hasPipelines ? "" : "No Pipeline available");
+  select.title = visibleText(busyMessage || (hasPipelines ? "" : "No Pipeline available"));
   const addButton = $("addPipelineBtn");
   if (addButton) {
     addButton.disabled = Boolean(busyMessage);
-    addButton.title = busyMessage || "";
+    addButton.title = visibleText(busyMessage);
   }
   syncPipelineLifecycleActionState();
 }
@@ -1495,13 +1664,13 @@ function syncPipelineLifecycleActionState() {
   const cloneButton = $("clonePipelineBtn");
   if (cloneButton) {
     cloneButton.disabled = Boolean(busyMessage) || !pipeline;
-    cloneButton.title = busyMessage || (pipeline ? "" : "Select a Pipeline");
+    cloneButton.title = visibleText(busyMessage || (pipeline ? "" : "Select a Pipeline"));
   }
   const disableButton = $("disablePipelineBtn");
   if (disableButton) {
     const inactive = pipeline?.status === "inactive";
     disableButton.disabled = Boolean(busyMessage) || !pipeline || inactive;
-    disableButton.title = busyMessage || (!pipeline ? "Select a Pipeline" : (inactive ? "Pipeline is already inactive" : ""));
+    disableButton.title = visibleText(busyMessage || (!pipeline ? "Select a Pipeline" : (inactive ? "Pipeline is already inactive" : "")));
   }
 }
 
@@ -1513,11 +1682,11 @@ function syncPipelineLoadActionState() {
   const disabled = Boolean(busyMessage) || !hasVersion;
   const title = busyMessage || (hasVersion ? "" : "No saved Pipeline version available");
   button.disabled = disabled;
-  button.title = title;
+  button.title = visibleText(title);
   const versionSelect = $("pipelineVersionSelect");
   if (versionSelect) {
     versionSelect.disabled = Boolean(busyMessage) || !(pipelineEditorState.versions || []).length;
-    versionSelect.title = busyMessage || "";
+    versionSelect.title = visibleText(busyMessage);
   }
 }
 
@@ -1550,7 +1719,7 @@ function syncPipelineSaveActionState() {
     }
   }
   button.disabled = disabled;
-  button.title = title || lifecycle.warnings.join(" | ");
+  button.title = visibleText(title || lifecycle.warnings.join(" | "));
   syncPipelineBlueprintErrorState();
   document.querySelector("#alphaGraphBuilder")?.__syncSaveState?.();
 }
@@ -1570,14 +1739,14 @@ window.__syncPipelineComposerActionState = function syncPipelineComposerActionSt
 function setDataUploadError(message = "") {
   const node = $("dataUploadError");
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
 }
 
 function setDatasetManagementError(id, message = "") {
   const node = $(id);
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
 }
 
@@ -1646,7 +1815,8 @@ function downloadDatasetArchive(datasetIds) {
   ids.forEach((datasetId) => query.append("datasetId", datasetId));
   const anchor = document.createElement("a");
   anchor.href = `/api/data/datasets/download?${query.toString()}`;
-  anchor.download = ids.length === 1 ? `${ids[0]}.zip` : "trade-datasets.zip";
+  const selectedDataset = ids.length === 1 ? state.datasets.find((dataset) => dataset.datasetId === ids[0]) : null;
+  anchor.download = ids.length === 1 ? `${visibleResourceName(selectedDataset, "dataset")}.zip` : "trade-datasets.zip";
   anchor.hidden = true;
   document.body.appendChild(anchor);
   anchor.click();
@@ -1658,13 +1828,13 @@ function syncDataUploadActionState() {
   if (!button) return;
   const { disabled, title } = dataUploadActionState();
   button.disabled = disabled;
-  button.title = title;
+  button.title = visibleText(title);
 }
 
 function setBacktestEntryError(message = "") {
   const node = $("backtestEntryError");
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
 }
 
@@ -1688,7 +1858,7 @@ function syncRouteChrome() {
   if ($("pipelineBuilderRouteLabel")) {
     const pipeline = selectedPipelineRecord();
     $("pipelineBuilderRouteLabel").textContent = pipelineBuilderOpen
-      ? `${pipeline?.name || pipelineEditorState.pipelineId || "Pipeline"} · Pipeline Builder`
+      ? `${visibleResourceName(pipeline, "Pipeline")} · Pipeline Builder`
       : "Pipeline Builder";
   }
   const routeBar = $("blueprintRouteBar");
@@ -1813,7 +1983,6 @@ function switchView(viewId, { push = true } = {}) {
     clearTimeout(backtestJobPollTimer);
     backtestJobPollTimer = null;
   }
-  if (viewId !== "mining-kline") miningKLine?.deactivate();
   const loadingToken = beginViewLoading(viewId);
   const loading = ensureViewData(viewId);
   loading.then(
@@ -1822,7 +1991,7 @@ function switchView(viewId, { push = true } = {}) {
   );
   loading.catch((error) => {
     if (viewId === "pipeline") setPipelineLoadError(error.message);
-    if (!["agent", "mining-kline"].includes(viewId)) {
+    if (viewId !== "agent") {
       setHealth(false, error.message);
     }
   });
@@ -1873,7 +2042,7 @@ function switchPipelineSection(sectionId) {
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         ensureAlphaGraphBuilderMounted();
-        document.querySelector(".alpha-blueprint-shell")?.__refreshLayout?.();
+        alphaGraphBuilderRoot()?.__refreshLayout?.();
         window.__syncPipelineComposerActionState?.();
       });
     });
@@ -1884,14 +2053,18 @@ function switchPipelineSection(sectionId) {
   }
 }
 
-function pipelineSignalDetailsSummary() {
-  const graph = alphaGraphObject();
-  const nodeCount = alphaGraphNodeIds(graph).length;
+function pipelineSignalDetailsSummary(inventory = null) {
+  const graph = state.pipelineDraft?.alphaGraph || alphaGraphObject();
+  const resolved = inventory || pipelineStageInventory("signal", "Signal", state.pipelineDraft || {});
+  const inputCount = Object.keys(graph?.inputs || {}).length;
   const outputCount = Object.keys(graph?.outputs || {}).length;
-  if (!nodeCount) return "No Signal Graph modules";
-  const nodeLabel = nodeCount === 1 ? "module" : "modules";
-  const outputLabel = outputCount === 1 ? "output" : "outputs";
-  return `Signal Graph: ${nodeCount} ${nodeLabel}, ${outputCount} exposed ${outputLabel}`;
+  const issueCount = resolved.issueCount;
+  return [
+    `${resolved.loadedCount} Module${resolved.loadedCount === 1 ? "" : "s"}`,
+    `${inputCount} Graph input${inputCount === 1 ? "" : "s"}`,
+    `${outputCount} Graph output${outputCount === 1 ? "" : "s"}`,
+    issueCount ? `${issueCount} issue${issueCount === 1 ? "" : "s"}` : "",
+  ].filter(Boolean).join(" · ");
 }
 
 function renderSummary() {
@@ -1957,17 +2130,25 @@ function repositoryPlacement(repository, itemId) {
   const sourceItemId = String(itemId);
   const item = repositoryCatalog(repository)?.items?.find((candidate) => (
     candidate.itemId === sourceItemId
+    || String(candidate.versionKey || "") === sourceItemId
     || (candidate.sourceRepository === repository && String(candidate.sourceItemId) === sourceItemId)
   ));
   return item ? { folderId: item.folderId || "", folderPath: item.folderPath || "/" } : { folderId: "", folderPath: "/" };
 }
 
-function appendRepositoryOptions(select, rows, value, label, repository) {
+function applyHierarchyOptionMetadata(option, row, metadata) {
+  if (typeof metadata !== "function") return;
+  const item = metadata(row) || {};
+  if (item.subtitle) option.dataset.hierarchySubtitle = visibleText(item.subtitle);
+}
+
+function appendRepositoryOptions(select, rows, value, label, repository, metadata = null) {
   if (!repository || !repositoryCatalog(repository)) {
     rows.forEach((row) => {
       const option = document.createElement("option");
       option.value = value(row);
-      option.textContent = label(row);
+      option.textContent = visibleText(label(row), "Resource");
+      applyHierarchyOptionMetadata(option, row, metadata);
       select.appendChild(option);
     });
     return;
@@ -1983,11 +2164,12 @@ function appendRepositoryOptions(select, rows, value, label, repository) {
     .sort(([left], [right]) => left.localeCompare(right))
     .forEach(([path, groupRows]) => {
       const group = document.createElement("optgroup");
-      group.label = path;
+      group.label = visibleText(path, "/");
       groupRows.forEach((row) => {
         const option = document.createElement("option");
         option.value = value(row);
-        option.textContent = label(row);
+        option.textContent = visibleText(label(row), "Resource");
+        applyHierarchyOptionMetadata(option, row, metadata);
         group.appendChild(option);
       });
       select.appendChild(group);
@@ -2018,8 +2200,10 @@ function hierarchicalOptionRows(select) {
   return [...select.options].map((option) => ({
     value: option.value,
     label: option.textContent || option.value,
+    subtitle: option.dataset.hierarchySubtitle || "",
     path: option.parentElement?.tagName === "OPTGROUP" ? (option.parentElement.label || "/") : "/",
     disabled: option.disabled,
+    placeholder: option.dataset.hierarchyPlaceholder === "true",
   }));
 }
 
@@ -2043,20 +2227,23 @@ function enhanceHierarchicalRepositorySelect(select) {
   select.__hierarchicalMenu?.remove();
   const menu = document.createElement("div");
   menu.className = "hierarchical-select-menu";
+  menu.dataset.hierarchyVariant = select.dataset.hierarchyVariant || "";
   menu.hidden = true;
   menu.setAttribute("role", "tree");
   document.body.appendChild(menu);
   menu.__sourceSelect = select;
   select.__hierarchicalMenu = menu;
   const rows = hierarchicalOptionRows(select);
-  const selected = rows.find((row) => row.value === select.value) || rows[0];
+  const choices = rows.filter((row) => !row.placeholder);
+  const selected = choices.find((row) => row.value === select.value) || null;
   const trigger = host.querySelector(".hierarchical-select-trigger");
   trigger.innerHTML = selected
-    ? `<span>${escapeHtml(selected.label)}</span><small>${escapeHtml(selected.path)}</small><b aria-hidden="true">▾</b>`
-    : '<span>No items</span><b aria-hidden="true">▾</b>';
-  trigger.disabled = select.disabled || !rows.length;
+    ? `<span>${escapeHtml(visibleText(selected.label, "Resource"))}</span><small>${escapeHtml(visibleText(selected.subtitle || selected.path))}</small><b aria-hidden="true">▾</b>`
+    : '<span></span><small></small><b aria-hidden="true">▾</b>';
+  trigger.setAttribute("aria-label", visibleText(selected?.label || select.getAttribute("aria-label"), "Select item"));
+  trigger.disabled = select.disabled || !choices.length;
   const root = { name: "/", path: "/", children: new Map(), items: [] };
-  rows.forEach((row) => {
+  choices.forEach((row) => {
     const segments = row.path.split("/").filter(Boolean);
     let node = root;
     let currentPath = "";
@@ -2074,7 +2261,7 @@ function enhanceHierarchicalRepositorySelect(select) {
     details.className = "hierarchical-folder";
     details.open = Boolean(selected?.path === node.path || selected?.path?.startsWith(`${node.path}/`));
     const summary = document.createElement("summary");
-    summary.textContent = node.name;
+    summary.textContent = visibleText(node.name, "Folder");
     summary.style.setProperty("--hierarchy-depth", depth);
     details.appendChild(summary);
     node.items.forEach((row) => {
@@ -2084,7 +2271,7 @@ function enhanceHierarchicalRepositorySelect(select) {
       button.classList.toggle("active", row.value === select.value);
       button.disabled = row.disabled;
       button.style.setProperty("--hierarchy-depth", depth + 1);
-      button.innerHTML = `<span>${escapeHtml(row.label)}</span><small>${escapeHtml(row.path)}</small>`;
+      button.innerHTML = `<span>${escapeHtml(visibleText(row.label, "Resource"))}</span><small>${escapeHtml(visibleText(row.subtitle || row.path))}</small>`;
       button.addEventListener("click", () => {
         select.value = row.value;
         menu.hidden = true;
@@ -2105,7 +2292,7 @@ function enhanceHierarchicalRepositorySelect(select) {
     button.className = "hierarchical-item";
     button.classList.toggle("active", row.value === select.value);
     button.disabled = row.disabled;
-    button.innerHTML = `<span>${escapeHtml(row.label)}</span><small>/</small>`;
+    button.innerHTML = `<span>${escapeHtml(visibleText(row.label, "Resource"))}</span><small>${escapeHtml(visibleText(row.subtitle || "/"))}</small>`;
     button.addEventListener("click", () => {
       select.value = row.value;
       menu.hidden = true;
@@ -2127,9 +2314,12 @@ function enhanceHierarchicalRepositorySelect(select) {
     trigger.setAttribute("aria-expanded", String(!menu.hidden));
     if (!menu.hidden) {
       const rect = trigger.getBoundingClientRect();
-      menu.style.left = `${Math.min(rect.left, window.innerWidth - Math.max(320, rect.width) - 12)}px`;
+      const requestedWidth = Number(select.dataset.hierarchyMenuMinWidth || 320);
+      const minimumWidth = Number.isFinite(requestedWidth) ? Math.max(320, requestedWidth) : 320;
+      const menuWidth = Math.min(window.innerWidth - 24, Math.max(minimumWidth, rect.width));
+      menu.style.left = `${Math.max(12, Math.min(rect.left, window.innerWidth - menuWidth - 12))}px`;
       menu.style.top = `${Math.min(rect.bottom + 4, window.innerHeight - Math.min(460, menu.scrollHeight) - 12)}px`;
-      menu.style.width = `${Math.max(320, rect.width)}px`;
+      menu.style.width = `${menuWidth}px`;
     }
   };
 }
@@ -2173,7 +2363,7 @@ function enhanceHierarchicalMultiSelect(select) {
     const label = document.createElement("label");
     label.className = "hierarchical-multi-item";
     label.style.setProperty("--hierarchy-depth", depth);
-    label.innerHTML = `<input type="checkbox" ${option?.selected ? "checked" : ""} ${row.disabled ? "disabled" : ""}/><span>${escapeHtml(row.label)}</span><small>${escapeHtml(row.path)}</small>`;
+    label.innerHTML = `<input type="checkbox" ${option?.selected ? "checked" : ""} ${row.disabled ? "disabled" : ""}/><span>${escapeHtml(visibleText(row.label, "Resource"))}</span><small>${escapeHtml(visibleText(row.path))}</small>`;
     label.querySelector("input").addEventListener("change", (event) => {
       if (option) option.selected = event.target.checked;
       select.dispatchEvent(new Event("change", { bubbles: true }));
@@ -2186,7 +2376,7 @@ function enhanceHierarchicalMultiSelect(select) {
     details.className = "hierarchical-folder";
     details.open = true;
     const summary = document.createElement("summary");
-    summary.textContent = node.name;
+    summary.textContent = visibleText(node.name, "Folder");
     summary.style.setProperty("--hierarchy-depth", depth);
     details.appendChild(summary);
     node.items.forEach((row) => appendItem(row, details, depth + 1));
@@ -2234,8 +2424,9 @@ async function loadRepositoryCatalog(repository, force = false) {
   if (!force && repositoryCatalog(scope)) return repositoryCatalog(scope);
   if (!repositoryCatalog(scope)) renderEmbeddedRepositoryLoading(scope);
   const response = await getJson(`/api/repositories?repository=${encodeURIComponent(scope)}`);
-  state.repositoryCatalogs[scope] = response;
-  return response;
+  const catalog = window.TradeVersionSelection.projectCurrentCatalog(response);
+  state.repositoryCatalogs[scope] = catalog;
+  return catalog;
 }
 
 function repositoryFolderById(repository, folderId) {
@@ -2258,7 +2449,7 @@ function repositoryFolderOptions(repository, item = null) {
 function setRepositoryError(message = "") {
   const node = $("repositoryError");
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
 }
 
@@ -2269,19 +2460,19 @@ function repositoryItemSummary(repository, item) {
       "analysis-modules": "Analysis",
       "environment-modules": "Environment",
     }[repository];
-    return [item.kind, item.version && `v${item.version}`, `${repositoryLabel} Module`]
+    return [visibleText(item.kind), item.version && visibleVersionLabel(item.version), `${repositoryLabel} Module`]
       .filter(Boolean).join(" · ");
   }
   if (repository === "datasets") {
-    return [item.status || "active", item.source?.type].filter(Boolean).join(" · ");
+    return [visibleText(item.status || "active"), visibleText(item.source?.type)].filter(Boolean).join(" · ");
   }
-  if (repository === "samplers") return `${item.type || "Sampler"} · v${item.version || "-"}`;
-  if (repository === "pipelines") return `${item.status || "active"} · current v${item.currentVersion || "-"}`;
+  if (repository === "samplers") return `${visibleText(item.type || "Sampler", "Sampler")} · ${visibleVersionLabel(item.version)}`;
+  if (repository === "pipelines") return `${visibleText(item.status || "active", "Active")} · current ${visibleVersionLabel(item.currentVersion)}`;
   if (repository === "environments" || repository === "analyses") {
     const nodeCount = Array.isArray(item.graph?.nodes) ? item.graph.nodes.length : 0;
-    return `v${item.version || "-"} · ${nodeCount} Graph Module(s)`;
+    return `${visibleVersionLabel(item.version)} · ${nodeCount} Graph Module(s)`;
   }
-  return `${item.status || "completed"} · ${item.metrics?.cycleCount ?? "-"} cycle(s)`;
+  return `${visibleText(item.status || "completed", "Completed")} · ${item.metrics?.cycleCount ?? "-"} cycle(s)`;
 }
 
 function repositoryFolderContains(selectedFolder, itemPath) {
@@ -2305,7 +2496,7 @@ function renderRepositoryFolderTree() {
     button.classList.toggle("active", state.selectedRepositoryFolderId === folderId);
     button.style.setProperty("--folder-depth", depth);
     button.dataset.repositoryFolder = folderId;
-    button.innerHTML = `<span class="repository-folder-icon" aria-hidden="true">${folderId === "*" ? "▦" : "▸"}</span><span>${escapeHtml(label)}</span>${fixed ? '<span class="repository-fixed-badge">fixed</span>' : ""}<strong>${count}</strong>`;
+    button.innerHTML = `<span class="repository-folder-icon" aria-hidden="true">${folderId === "*" ? "▦" : "▸"}</span><span>${escapeHtml(visibleText(label, "Folder"))}</span>${fixed ? '<span class="repository-fixed-badge">fixed</span>' : ""}<strong>${count}</strong>`;
     tree.appendChild(button);
   };
   const countFor = (folder) => (catalog.items || []).filter((item) => (
@@ -2360,18 +2551,22 @@ function renderRepositoryCards() {
   items.forEach((item) => {
     const card = document.createElement("article");
     card.className = "repository-card";
+    const resourceName = visibleResourceName(item, forms.humanizeName(repository.slice(0, -1) || repository));
     const options = repositoryFolderOptions(repository, item).map((folder) => (
-      `<option value="${escapeHtml(folder.folderId)}" ${folder.folderId === item.folderId ? "selected" : ""}>${escapeHtml(folder.path)}</option>`
+      `<option value="${escapeHtml(folder.folderId)}" ${folder.folderId === item.folderId ? "selected" : ""}>${escapeHtml(visibleText(folder.path, "/"))}</option>`
     )).join("");
     card.innerHTML = `
       <div class="repository-card-head">
-        <div><h3>${escapeHtml(item.label || item.itemId)}</h3><span>${escapeHtml(item.folderPath || "/")}</span></div>
+        <div><h3>${escapeHtml(resourceName)}</h3><span>${escapeHtml(visibleText(item.folderPath, "/"))}</span></div>
         <span class="pill">${escapeHtml(repository.slice(0, -1) || repository)}</span>
       </div>
-      <p>${escapeHtml(repositoryItemSummary(repository, item))}</p>
-      <code title="${escapeHtml(item.itemId)}">${escapeHtml(item.itemId)}</code>
+      <p>${escapeHtml(visibleText(repositoryItemSummary(repository, item)))}</p>
+      <span class="muted">${escapeHtml([
+        item.status && forms.humanizeName(visibleText(item.status, "Available")),
+        item.version && visibleVersionLabel(item.version),
+      ].filter(Boolean).join(" · ") || "Available")}</span>
       <div class="repository-card-actions">
-        <select data-repository-move-select="${escapeHtml(item.itemId)}" aria-label="Move ${escapeHtml(item.label || item.itemId)}">${options}</select>
+        <select data-repository-move-select="${escapeHtml(item.itemId)}" aria-label="Move ${escapeHtml(resourceName)}">${options}</select>
         <button type="button" data-repository-move="${escapeHtml(item.itemId)}">Move</button>
         <button type="button" data-repository-open="${escapeHtml(item.itemId)}">Open</button>
       </div>`;
@@ -2412,7 +2607,7 @@ function renderRepositoryManager() {
   }
   $("repositoryTypeSelect").value = state.selectedRepository;
   const folder = repositoryFolderById(state.selectedRepository, state.selectedRepositoryFolderId);
-  $("repositoryCurrentPath").textContent = state.selectedRepositoryFolderId === "*" ? "All items" : (folder?.path || "/");
+  $("repositoryCurrentPath").textContent = state.selectedRepositoryFolderId === "*" ? "All items" : visibleText(folder?.path, "/");
   const mutableFolder = Boolean(folder && !folder.fixed);
   $("renameRepositoryFolderBtn").disabled = !mutableFolder;
   $("deleteRepositoryFolderBtn").disabled = !mutableFolder;
@@ -2496,6 +2691,7 @@ function openBacktestResult(backtestId) {
   if (!backtestId) throw localUiError("Result requires a Backtest ID.", "RESULT_BACKTEST_REQUIRED");
   state.resultBacktestId = backtestId;
   state.selectedBacktest = null;
+  state.resultViewError = null;
   return switchView("results");
 }
 
@@ -2518,7 +2714,7 @@ async function openWorkspaceJupyter(workspaceId) {
 function setDialogError(id, message = "") {
   const node = $(id);
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
 }
 
@@ -2595,11 +2791,18 @@ function renderDatasetWorkspacePicker(showCandidates = !$("datasetWorkspaceCandi
   }
   const selected = [...datasetWorkspaceSelection].map((datasetId) => rowsById.get(datasetId)).filter(Boolean);
   selectedHost.innerHTML = selected.length
-    ? selected.map((dataset, index) => `
-      <button type="button" class="dataset-picker-chip" data-workspace-dataset-remove="${forms.escapeHtml(dataset.datasetId)}" title="Remove ${forms.escapeHtml(dataset.name || dataset.datasetId)}">
-        <span>${index + 1}</span><strong>${forms.escapeHtml(dataset.name || dataset.datasetId)}</strong><small>${forms.escapeHtml(dataset.datasetId)}</small><em aria-hidden="true">×</em>
-      </button>
-    `).join("")
+    ? selected.map((dataset, index) => {
+      const name = visibleResourceName(dataset, "Dataset");
+      const summary = [
+        dataset.status && forms.humanizeName(visibleText(dataset.status, "Available")),
+        dataset.source?.type && forms.humanizeName(visibleText(dataset.source.type, "Dataset")),
+      ].filter(Boolean).join(" · ") || "Dataset";
+      return `
+        <button type="button" class="dataset-picker-chip" data-workspace-dataset-remove="${forms.escapeHtml(dataset.datasetId)}" title="Remove ${forms.escapeHtml(name)}">
+          <span>${index + 1}</span><strong>${forms.escapeHtml(name)}</strong><small>${forms.escapeHtml(summary)}</small><em aria-hidden="true">×</em>
+        </button>
+      `;
+    }).join("")
     : '<div class="dataset-picker-empty">Search above and click a Dataset to add it.</div>';
   $("datasetWorkspaceSelectionCount").textContent = `${selected.length} selected`;
   selectedHost.querySelectorAll("[data-workspace-dataset-remove]").forEach((button) => {
@@ -2615,7 +2818,7 @@ function renderDatasetWorkspacePicker(showCandidates = !$("datasetWorkspaceCandi
   candidatesHost.innerHTML = matches.length
     ? matches.map(({ dataset }) => `
       <button type="button" role="option" aria-selected="${datasetWorkspaceSelection.has(dataset.datasetId)}" data-workspace-dataset-add="${forms.escapeHtml(dataset.datasetId)}">
-        <span><strong>${forms.escapeHtml(dataset.name || dataset.datasetId)}</strong><small>${forms.escapeHtml(dataset.datasetId)} · ${forms.escapeHtml(dataset.folderPath || "/")}</small></span>
+        <span><strong>${forms.escapeHtml(visibleResourceName(dataset, "Dataset"))}</strong><small>${forms.escapeHtml(visibleText(dataset.folderPath, "/"))} · ${forms.escapeHtml(forms.humanizeName(visibleText(dataset.status || "available", "Available")))}</small></span>
         <em>${datasetWorkspaceSelection.has(dataset.datasetId) ? "Selected" : "Add"}</em>
       </button>
     `).join("")
@@ -2641,7 +2844,7 @@ function openDatasetWorkspaceDialog(items = [], parentFolderId = "") {
   const ids = selectedIds(items, "datasets");
   $("datasetWorkspaceDialog").dataset.parentFolderId = parentFolderId;
   const source = ids.length === 1 ? state.datasets.find((row) => row.datasetId === ids[0]) : null;
-  $("datasetWorkspaceName").value = source ? `${source.name || source.datasetId} Workspace` : "";
+  $("datasetWorkspaceName").value = source ? `${visibleResourceName(source, "Dataset")} Workspace` : "";
   datasetWorkspaceSelection.clear();
   ids.forEach((datasetId) => datasetWorkspaceSelection.add(datasetId));
   $("datasetWorkspaceSearch").value = "";
@@ -2661,7 +2864,7 @@ function openDatasetScriptDialog(parentFolderId = "", workspaceId = "") {
       const workspace = state.datasetWorkspaces.find((row) => row.workspaceId === workspaceId);
       const option = document.createElement("option");
       option.value = workspaceId;
-      option.textContent = workspace?.name || workspaceId;
+      option.textContent = visibleResourceName(workspace, "Dataset Workspace");
       workspaceSelect.appendChild(option);
     }
     workspaceSelect.value = workspaceId;
@@ -2707,7 +2910,13 @@ function openDatasetProcessDialog(items = [], parentFolderId = "") {
   const datasetIds = selectedIds(items, "datasets");
   const script = (items || []).find((item) => item.sourceRepository === "scripts");
   $("datasetProcessDialog").dataset.parentFolderId = parentFolderId;
-  if (script) $("datasetProcessScript").value = `${script.recipeId}::${script.version}`;
+  if (script) {
+    const current = window.TradeVersionSelection.currentRows(
+      state.datasetRecipes,
+      ["recipeId"],
+    ).find((recipe) => recipe.recipeId === script.recipeId);
+    $("datasetProcessScript").value = current ? `${current.recipeId}::${current.version}` : "";
+  }
   selectMultipleValues($("datasetProcessSources"), datasetIds);
   $("datasetProcessOutputName").value = "";
   $("datasetProcessArguments").value = "";
@@ -2717,7 +2926,7 @@ function openDatasetProcessDialog(items = [], parentFolderId = "") {
 
 function openDatasetReplaceDialog(item) {
   pendingDatasetReplace = item;
-  $("datasetReplaceTarget").textContent = `${item.name || item.datasetId} · ${item.datasetId}`;
+  $("datasetReplaceTarget").textContent = visibleResourceName(item, "Dataset");
   $("datasetReplaceFile").value = "";
   setDialogError("datasetReplaceError", "");
   showModal("datasetReplaceDialog");
@@ -2765,6 +2974,16 @@ async function runRepositoryResourceAction(repository, action, item) {
     openRepositoryResourceRenameDialog(repository, item);
     return;
   }
+  if (repository === "environments" && action === "rename") {
+    await openEnvironmentBlueprint(`${item.environmentId || item.itemId}::${item.version}`);
+    requestAnimationFrame(() => $("environmentGraphBuilder")?.querySelector("[data-graph-rename]")?.click());
+    return;
+  }
+  if (repository === "analyses" && action === "rename") {
+    await openAnalysisBlueprint(`${item.analysisId || item.itemId}::${item.version}`);
+    requestAnimationFrame(() => $("analysisGraphBuilder")?.querySelector("[data-graph-rename]")?.click());
+    return;
+  }
   if (repository === "pipelines" && action === "toggle-inactive") {
     $("showInactivePipelinesBtn")?.click();
     return;
@@ -2781,12 +3000,28 @@ async function runRepositoryResourceAction(repository, action, item) {
     await loadData(true);
     return;
   }
-  if (["backtests", "results"].includes(sourceRepository) && action === "archive") {
-    await postJson(`/api/backtests/${encodeURIComponent(item.backtestId)}/archive`, {
-      reason: "Archived from Backtest Results browser",
-    });
+  if (repository === "backtest" && action === "archive") {
+    const candidates = Array.isArray(item?.items) ? item.items : [item];
+    const backtests = candidates.filter((entry) => (
+      ["backtests", "results"].includes(entry?.sourceRepository || repository)
+      && entry?.backtestId
+      && entry.status !== "archived"
+    ));
+    if (!backtests.length) throw new Error("Select at least one active Backtest.");
+    if (backtests.length > 1 && !window.confirm(`Archive ${backtests.length} selected Backtests?`)) return;
+    const failures = [];
+    for (const backtest of backtests) {
+      try {
+        await postJson(`/api/backtests/${encodeURIComponent(backtest.backtestId)}/archive`, {
+          reason: "Archived from Backtest Results browser",
+        });
+      } catch (error) {
+        failures.push(`${visibleResourceName(backtest, "Backtest")}: ${visibleText(error.message)}`);
+      }
+    }
     loadedViews.delete("backtests");
     await loadBacktests(true);
+    if (failures.length) throw new Error(`Some Backtests could not be archived: ${failures.join("; ")}`);
     return;
   }
   if (sourceRepository === "workspaces" && action === "jupyter") {
@@ -2942,7 +3177,7 @@ function bindEmbeddedRepositoryActions(repository, root) {
       refreshHierarchicalRepositorySelects();
     } catch (error) {
       const node = root.querySelector("[data-embedded-error]");
-      node.textContent = error.message;
+      node.textContent = visibleText(error.message);
       node.hidden = false;
     }
   });
@@ -2960,7 +3195,7 @@ function bindEmbeddedRepositoryActions(repository, root) {
         refreshHierarchicalRepositorySelects();
       } catch (error) {
         const node = root.querySelector("[data-embedded-error]");
-        node.textContent = error.message;
+        node.textContent = visibleText(error.message);
         node.hidden = false;
         button.disabled = false;
       }
@@ -3081,7 +3316,7 @@ function renderPipelineEditorSelector() {
       select,
       pipelines,
       (pipeline) => pipeline.pipelineId,
-      (pipeline) => `${pipeline.name || pipeline.pipelineId}${pipeline.status === "inactive" ? " · Inactive" : ""}`,
+      (pipeline) => `${visibleResourceName(pipeline, "Pipeline")}${pipeline.status === "inactive" ? " · Inactive" : ""}`,
       "pipelines",
     );
     select.value = selectedPipelineId;
@@ -3116,8 +3351,8 @@ function renderPipelineVersionSelector() {
   versions.slice().reverse().forEach((versionSummary) => {
     const option = document.createElement("option");
     option.value = versionSummary.version;
-    option.textContent = `${versionSummary.current ? "Current · " : ""}v${versionSummary.version} · ${formatTime(versionSummary.createdAt)}`;
-    option.title = versionSummary.contentDigest;
+    option.textContent = `${versionSummary.current ? "Current · " : ""}${visibleVersionLabel(versionSummary.version)} · ${formatTime(versionSummary.createdAt)}`;
+    option.title = "Immutable Pipeline Version";
     option.selected = versionSummary.version === selected;
     select.appendChild(option);
   });
@@ -3127,7 +3362,9 @@ function renderPipelineVersionSelector() {
 function renderBacktestPipelineSelector() {
   const pipelines = sortedPipelines().filter((pipeline) => pipeline.status === "active");
   const activeIds = new Set(pipelines.map((pipeline) => pipeline.pipelineId));
-  const versions = (state.pipelineVersions || []).filter((version) => activeIds.has(version.pipelineId));
+  const versions = (state.pipelineVersions || []).filter((version) => (
+    activeIds.has(version.pipelineId) && version.current === true
+  ));
   const select = $("backtestPipelineSelect");
   if (!select) return;
   const selectedKey = `${backtestEntryState.pipelineId}::${backtestEntryState.pipelineVersion}`;
@@ -3140,7 +3377,7 @@ function renderBacktestPipelineSelector() {
   if (!versions.length) {
     const option = document.createElement("option");
     option.value = "";
-    option.textContent = "No archived Pipeline Version available";
+    option.textContent = "No current Pipeline available";
     select.appendChild(option);
     select.disabled = true;
     return;
@@ -3148,13 +3385,13 @@ function renderBacktestPipelineSelector() {
   select.disabled = false;
   const placeholder = document.createElement("option");
   placeholder.value = "";
-  placeholder.textContent = "Select an archived Pipeline Version";
+  placeholder.textContent = "Select a Pipeline";
   select.appendChild(placeholder);
   versions.slice().reverse().forEach((version) => {
     const pipeline = state.pipelines[version.pipelineId] || {};
     const option = document.createElement("option");
     option.value = `${version.pipelineId}::${version.version}`;
-    option.textContent = `${pipeline.name || version.pipelineId} · v${version.version}${version.current ? " · Current" : ""}`;
+    option.textContent = `${visibleResourceName(pipeline, "Pipeline")} · ${visibleVersionLabel(version.version)}`;
     select.appendChild(option);
   });
   select.value = effectiveKey;
@@ -3184,7 +3421,7 @@ function datasetEvidenceSummary(evidence) {
 }
 
 function datasetCatalogLabel(dataset) {
-  return [dataset.name || "Untitled Dataset", dataset.source?.type]
+  return [visibleResourceName(dataset, "Dataset"), visibleText(dataset.source?.type)]
     .filter(Boolean).join(" · ");
 }
 
@@ -3201,7 +3438,7 @@ function renderTable(container, rows, columns) {
   rows.forEach((row) => {
     const item = document.createElement("div");
     item.className = "table-row";
-    item.innerHTML = columns.map((column) => `<div><div class="label">${column.label}</div><div class="value">${column.value(row)}</div></div>`).join("");
+    item.innerHTML = columns.map((column) => `<div><div class="label">${escapeHtml(visibleText(column.label))}</div><div class="value">${escapeHtml(visibleText(column.value(row)))}</div></div>`).join("");
     node.appendChild(item);
   });
 }
@@ -3209,27 +3446,6 @@ function renderTable(container, rows, columns) {
 function renderModules() {
   $("moduleKindStatus").textContent = `${repositoryCatalog("modules")?.total || 0} module(s) · fixed top-level type folders`;
   renderEmbeddedRepositoryBrowser("modules");
-}
-
-function renderModuleKindMenu() {
-  const menu = $("moduleKindMenu");
-  if (!menu) return;
-  const counts = state.summary?.repositories?.moduleDefinitionsByKind || {};
-  menu.innerHTML = "";
-  MODULE_KINDS.forEach((kind) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "kind-btn";
-    button.classList.toggle("active", kind === state.selectedModuleKind);
-    button.dataset.kind = kind;
-    button.innerHTML = `<span>${kind}</span><strong>${counts[kind] || 0}</strong>`;
-    button.addEventListener("click", () => {
-      if (state.selectedModuleKind === kind) return;
-      state.selectedModuleKind = kind;
-      loadModules(true).catch((error) => setHealth(false, error.message));
-    });
-    menu.appendChild(button);
-  });
 }
 
 function instancesByKind(kind) {
@@ -3267,7 +3483,7 @@ function observationEditorEntries(fieldId) {
 function setObservationEditorError(fieldId, message = "") {
   const error = $(`pipelineObservation${fieldId}Error`);
   if (!error) return;
-  error.textContent = message;
+  error.textContent = visibleText(message);
   error.hidden = !message;
 }
 
@@ -3368,7 +3584,7 @@ function commitObservationEditorCandidate(fieldId, values) {
 
 function showObservationEntryValidation(input, errorNode, message = "") {
   input.setAttribute("aria-invalid", message ? "true" : "false");
-  errorNode.textContent = message;
+  errorNode.textContent = visibleText(message);
   errorNode.hidden = !message;
 }
 
@@ -3564,19 +3780,40 @@ function pipelineObservationInputFromFields() {
   };
 }
 
-function moduleDefinitionsByKind(kind) {
+function allModuleDefinitionsByKind(kind) {
   return Object.entries(state.pipelineModules || {})
     .map(([key, value]) => ({ key, ...value, folderPath: repositoryPlacement("modules", key).folderPath }))
     .filter((row) => row.kind === kind && row.status === "archived");
 }
 
-function schemaDefaults(schema = {}) {
-  return forms.schemaDefaults(schema);
+function moduleDefinitionsByKind(kind) {
+  return window.TradeVersionSelection.currentRows(
+    allModuleDefinitionsByKind(kind),
+    ["kind", "moduleId"],
+  );
 }
 
-function defaultWireName(portName) {
-  const suffix = Date.now().toString(36).slice(-5);
-  return `${portName}_${suffix}`;
+function moduleChoiceLabel(module) {
+  return visibleResourceName(module, `${forms.humanizeName(module?.kind || "")} Module`.trim());
+}
+
+function moduleChoiceMetadata(module) {
+  return {
+    subtitle: `${forms.humanizeName(visibleText(module?.kind || "Module", "Module"))} · ${visibleVersionLabel(module?.version)}`,
+  };
+}
+
+function pipelineModuleDefinition(instance) {
+  if (!instance) return null;
+  return Object.values(state.pipelineModules || {}).find((definition) => (
+    definition.kind === instance.kind
+    && definition.moduleId === instance.moduleId
+    && String(definition.version) === String(instance.version)
+  )) || null;
+}
+
+function schemaDefaults(schema = {}) {
+  return forms.schemaDefaults(schema);
 }
 
 function defaultInputWire(portName) {
@@ -3725,14 +3962,102 @@ function addSignalInstanceToAlphaGraph(instanceId, options = {}) {
   return state.pipelineDraft.alphaGraph.nodes.length !== before;
 }
 
-function alphaGraphNodeEntries(instancesMap = draftInstances(), graph = alphaGraphObject()) {
-  return alphaGraphNodeIds(graph)
-    .map((instanceId) => {
-      const instance = (instancesMap || {})[instanceId];
-      if (!instance) return null;
-      return { instanceId, instance };
-    })
-    .filter(Boolean);
+function pipelineStageReferenceIds(stage, draft = state.pipelineDraft || {}) {
+  if (stage === "signal") return alphaGraphNodeIds(draft?.alphaGraph || { nodes: [] });
+  const references = draft?.stages?.[stage];
+  return Array.isArray(references) ? references.filter(Boolean) : [];
+}
+
+function pipelineInstanceOwnershipIndex(draft = state.pipelineDraft || {}) {
+  const ownership = new Map();
+  PIPELINE_STAGES.forEach(({ stage, kind }) => {
+    pipelineStageReferenceIds(stage, draft).forEach((rawInstanceId, index) => {
+      const instanceId = String(rawInstanceId);
+      const owners = ownership.get(instanceId) || [];
+      owners.push({ stage, kind, index });
+      ownership.set(instanceId, owners);
+    });
+  });
+  return ownership;
+}
+
+function pipelineStageInventory(stage, kind, draft = state.pipelineDraft || {}) {
+  const instances = draft?.instances || {};
+  const references = pipelineStageReferenceIds(stage, draft).map(String);
+  const distinctReferenceCount = new Set(references).size;
+  const ownership = pipelineInstanceOwnershipIndex(draft);
+  const referenceIssues = [];
+  const modules = [];
+  [...new Set(references)].forEach((instanceId) => {
+    const occurrenceCount = references.filter((value) => value === instanceId).length;
+    const instance = instances[instanceId];
+    if (!instance) {
+      referenceIssues.push({
+        instanceId,
+        status: "missing-instance",
+        action: "clear-reference",
+        message: occurrenceCount > 1
+          ? `Missing instance · ${occurrenceCount} duplicate references`
+          : "Missing instance",
+      });
+      return;
+    }
+    if (instance.kind !== kind) {
+      referenceIssues.push({
+        instanceId,
+        status: "kind-mismatch",
+        action: "clear-reference",
+        message: `Expected ${kind} · found ${instance.kind || "unknown kind"}`,
+      });
+      return;
+    }
+    const owners = ownership.get(instanceId) || [];
+    const definition = pipelineModuleDefinition(instance);
+    const problems = [];
+    if (occurrenceCount !== 1 || owners.length !== 1) problems.push("Multiple stage references");
+    if (stage !== "signal" && !MULTI_STAGE.has(stage) && distinctReferenceCount > 1) {
+      problems.push("Single stage contains multiple Modules");
+    }
+    if (!definition || definition.status !== "archived") problems.push("Exact Module version unavailable");
+    if (instance.instanceId && String(instance.instanceId) !== instanceId) {
+      problems.push("Module instance identity mismatch");
+    }
+    modules.push({
+      instanceId,
+      instance,
+      definition,
+      owners,
+      owned: occurrenceCount === 1 && owners.length === 1,
+      problems,
+      status: problems.length ? "invalid" : "loaded",
+    });
+  });
+
+  Object.entries(instances)
+    .filter(([, instance]) => instance?.kind === kind)
+    .filter(([instanceId]) => !(ownership.get(instanceId) || []).some((owner) => owner.stage === stage))
+    .forEach(([instanceId]) => {
+      const owners = ownership.get(instanceId) || [];
+      referenceIssues.push({
+        instanceId,
+        status: "unreferenced-instance",
+        action: "remove-instance",
+        message: owners.length
+          ? `Referenced by wrong stage: ${owners.map((owner) => owner.stage).join(", ")}`
+          : "Unreferenced instance",
+      });
+    });
+
+  const moduleIssueCount = modules.filter((module) => module.problems.length).length;
+  return {
+    references,
+    modules,
+    referenceIssues,
+    instanceCount: modules.length,
+    ownedCount: modules.filter((module) => module.owned).length,
+    loadedCount: modules.filter((module) => module.status === "loaded").length,
+    issueCount: moduleIssueCount + referenceIssues.length,
+  };
 }
 
 function parsePipelineAlphaGraphValue({ reportError = true } = {}) {
@@ -3762,6 +4087,7 @@ function clonePipelineDraft(definition = {}) {
     meta: {
       pipelineId: definition.pipelineId || pipelineEditorState.pipelineId,
       name: definition.name || "",
+      protocolId: definition.protocolId || "",
     },
   });
 }
@@ -3811,12 +4137,14 @@ function loadPipelineFormFromDefinition(options = {}) {
   if (sourceDefinition) {
     state.pipelineDraft.meta = {
       pipelineId: sourceDefinition.pipelineId || definition.pipelineId || pipelineEditorState.pipelineId,
-      name: sourceDefinition.name || sourceDefinition.pipelineId || "",
+      name: sourceDefinition.name || "Pipeline",
+      protocolId: sourceDefinition.protocolId || "",
     };
   }
   const meta = state.pipelineDraft.meta || {};
   pipelineField("Id").value = meta.pipelineId || definition.pipelineId || pipelineEditorState.pipelineId;
   pipelineField("Name").value = meta.name || definition.name || "";
+  pipelineField("ProtocolId").value = meta.protocolId || "";
   const observationInput = state.pipelineDraft.config?.observationInput || { whitelist: [], blacklist: [] };
   renderObservationEditor("Whitelist", observationInput.whitelist || []);
   renderObservationEditor("Blacklist", observationInput.blacklist || []);
@@ -3839,27 +4167,6 @@ function loadPipelineFormFromDefinition(options = {}) {
   switchPipelineSection(currentPipelineSection);
 }
 
-function selectedAlphaModule() {
-  const select = $("alphaGraphModuleSelect");
-  if (!select) return null;
-  return moduleDefinitionsByKind("Signal").find((row) => row.moduleId === select.value);
-}
-
-function fillAlphaGraphNodeDraft() {
-  const module = selectedAlphaModule();
-  if (!module) return;
-  const instanceId = uniqueDraftInstanceId();
-  $("alphaGraphInstanceId").value = instanceId;
-  forms.renderSchemaFields($("alphaGraphConfigFields"), module.configSchema, schemaDefaults(module.configSchema));
-  forms.renderPortFields($("alphaGraphInputsFields"), module.ports?.inputs || {}, {});
-  forms.renderPortFields(
-    $("alphaGraphOutputsFields"),
-    module.ports?.outputs || {},
-    {},
-    Object.fromEntries(Object.keys(module.ports?.outputs || {}).map((name) => [name, defaultWireName(name)])),
-  );
-}
-
 function draftInstances() {
   state.pipelineDraft ||= clonePipelineDraft(pipelineEditorState.definition || {});
   state.pipelineDraft.instances ||= {};
@@ -3876,10 +4183,11 @@ function renderAlphaGraphBuilder(options = {}) {
     root.__flushPendingEmit?.();
   }
   root.__moduleGraphCleanup?.({ flushPending: flushBeforeCleanup });
-  const modules = moduleDefinitionsByKind("Signal")
+  const definitions = allModuleDefinitionsByKind("Signal")
     .filter((row) => Object.keys(row.ports?.inputs || {}).length || Object.keys(row.ports?.outputs || {}).length)
     .sort((a, b) => (a.moduleId || "").localeCompare(b.moduleId || ""));
-  if (!modules.length) {
+  const modules = window.TradeVersionSelection.currentRows(definitions, ["kind", "moduleId"]);
+  if (!definitions.length) {
     root.innerHTML = '<div class="muted">No Signal graph modules available</div>';
     return;
   }
@@ -3888,7 +4196,8 @@ function renderAlphaGraphBuilder(options = {}) {
   const blueprintImpl = window.ModuleGraphLiteGraph;
   blueprintImpl?.mount({
     root,
-    modules,
+    modules: definitions,
+    moduleChoices: modules,
     instances: draftInstances(),
     alphaGraph: graph,
     versions: pipelineEditorState.versions || [],
@@ -3923,6 +4232,7 @@ function renderAlphaGraphBuilder(options = {}) {
       setPipelineAlphaGraphError("");
       syncPipelineSaveActionState();
       renderBlueprintMeta();
+      renderPipelineBuilder();
     },
     moduleKind: "Signal",
     graphLabel: "Signal Graph",
@@ -3984,26 +4294,34 @@ function renderAnalysisDetails() {
   syncAnalysisBlueprintRoute();
   const key = analysisEditorState.analysisKey;
   const draft = analysisEditorState.draftsByAnalysis[key] ||= {
-    analysisId: analysis.builtin ? "" : (analysis.analysisId || ""),
-    name: analysis.builtin ? `${analysis.name || "Analysis"} Copy` : (analysis.name || analysis.analysisId || ""),
+    analysisId: analysis.builtin
+      ? opaqueClientId("analysis")
+      : (analysis.analysisId || ""),
+    name: visibleText(analysis.name, "Analysis"),
+    protocolId: analysis.protocolId || "",
     instances: structuredClone(analysis.instances || {}),
     graph: structuredClone(analysis.graph || { nodes: [], inputs: {}, outputs: {} }),
   };
   const root = $("analysisGraphBuilder");
   root.__flushPendingEmit?.();
   root.__moduleGraphCleanup?.();
-  const modules = Object.entries(state.analysisModules || {})
+  const moduleDefinitions = Object.entries(state.analysisModules || {})
     .filter(([, definition]) => definition.status === "archived")
     .map(([moduleKey, definition]) => ({
       key: moduleKey,
       ...definition,
       folderPath: repositoryPlacement("analysis-modules", moduleKey).folderPath,
     }));
+  const modules = window.TradeVersionSelection.currentRows(
+    moduleDefinitions,
+    ["kind", "moduleId"],
+  );
   const analysisVersions = state.analyses.filter((row) => row.analysisId === analysis.analysisId);
   const returnsToBacktests = analysisEditorState.returnView === "backtests";
   window.ModuleGraphLiteGraph?.mount({
     root,
-    modules,
+    modules: moduleDefinitions,
+    moduleChoices: modules,
     moduleKind: "Analyzer",
     graphLabel: "Analysis Graph",
     contextLabel: "Analysis",
@@ -4017,18 +4335,11 @@ function renderAnalysisDetails() {
     loadedVersion: analysis.version,
     instances: draft.instances,
     alphaGraph: draft.graph,
-    meta: { contextId: key, name: analysis.name || analysis.analysisId || "Analysis" },
+    meta: { contextId: key, name: visibleText(analysis.name, "Analysis") },
     resourceEditor: {
       title: "Analysis Details",
-      description: "Identity and name for the next saved Version",
+      description: "Human-readable name and optional protocol for the next saved Version",
       fields: [
-        {
-          key: "analysisId",
-          label: "Analysis ID",
-          value: draft.analysisId,
-          placeholder: "analysis-id",
-          required: true,
-        },
         {
           key: "name",
           label: "Name",
@@ -4036,11 +4347,17 @@ function renderAnalysisDetails() {
           placeholder: "Analysis name",
           required: true,
         },
+        {
+          key: "protocolId",
+          label: "Protocol ID",
+          value: draft.protocolId,
+          placeholder: "Optional",
+        },
       ],
       contextName: (values) => values.name,
       onChange: (values) => {
-        draft.analysisId = values.analysisId;
         draft.name = values.name;
+        draft.protocolId = values.protocolId;
       },
     },
     actions: {
@@ -4055,6 +4372,7 @@ function renderAnalysisDetails() {
           schemaVersion: 1,
           analysisId: draft.analysisId.trim(),
           name: draft.name.trim(),
+          ...optionalProtocolId(draft.protocolId),
           description: analysis.description || "",
           instances: draft.instances,
           graph: draft.graph,
@@ -4069,6 +4387,7 @@ function renderAnalysisDetails() {
           schemaVersion: 1,
           analysisId: nextId,
           name,
+          ...optionalProtocolId(draft.protocolId),
           description: analysis.description || "",
           instances: draft.instances,
           graph: draft.graph,
@@ -4097,24 +4416,28 @@ function renderBlueprintMeta() {
   if (!node) return;
   const definition = pipelineEditorState.definition || {};
   const pipelineId = pipelineField("Id")?.value?.trim() || definition.pipelineId || pipelineEditorState.pipelineId;
-  const pipelineName = pipelineField("Name")?.value?.trim() || definition.name || pipelineId;
+  const pipelineName = visibleText(pipelineField("Name")?.value?.trim() || definition.name, "Pipeline");
   const graph = alphaGraphObject();
-  const graphNodeIds = new Set(graph.nodes || []);
-  const signalInstances = Object.entries(draftInstances() || {})
-    .filter(([instanceId]) => graphNodeIds.has(instanceId))
-    .map(([, instance]) => instance);
+  const signalInventory = pipelineStageInventory("signal", "Signal", state.pipelineDraft || {});
+  const inputGroups = Object.keys(graph.inputs || {});
   const outputGroups = Object.keys(graph.outputs || {});
-  const signalCount = signalInstances.length;
-  const outputCount = outputGroups.length;
   node.innerHTML = "";
   [
-    { label: "Pipeline", value: pipelineName, meta: pipelineId },
-    { label: "Graph Nodes", value: signalCount, meta: "draft instances" },
-    { label: "Graph Outputs", value: outputCount, meta: outputGroups.join(", ") || "none" },
+    { label: "Pipeline", value: pipelineName, meta: pipelineEditorState.loadedVersion ? `v${pipelineEditorState.loadedVersion}` : "Draft" },
+    {
+      label: "Signal Modules",
+      value: signalInventory.loadedCount,
+      meta: signalInventory.issueCount ? `${signalInventory.issueCount} draft issue(s)` : "exact owned instances",
+    },
+    {
+      label: "Graph Boundaries",
+      value: inputGroups.length + outputGroups.length,
+      meta: `${inputGroups.length} input(s) · ${outputGroups.length} output(s)`,
+    },
   ].forEach((item) => {
     const card = document.createElement("div");
     card.className = "overview-card";
-    card.innerHTML = `<div class="label">${item.label}</div><div class="overview-value">${item.value}</div><div class="muted">${item.meta}</div>`;
+    card.innerHTML = `<div class="label">${escapeHtml(visibleText(item.label))}</div><div class="overview-value">${escapeHtml(visibleText(item.value))}</div><div class="muted">${escapeHtml(visibleText(item.meta))}</div>`;
     node.appendChild(card);
   });
 }
@@ -4129,8 +4452,55 @@ function loadStageModuleTemplate(stage, kind, moduleKey) {
 function setModuleLoadDialogError(message = "") {
   const node = $("moduleLoadDialogError");
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
+}
+
+function moduleDialogInputDefinitions(module) {
+  return Object.entries(module?.ports?.inputs || {}).map(([name, spec]) => ({
+    name,
+    label: forms.humanizeName(name),
+    type: "dataKey",
+    description: `${forms.schemaTypeLabel(spec?.schema)} · ${spec?.required === false ? "Optional" : "Required"}`,
+  }));
+}
+
+function moduleDialogDataKeyOptions(instance = null) {
+  const options = new Map(pipelineDataKeyOptions().map((option) => [option.value, option]));
+  const add = (value, dataType) => {
+    const normalized = String(value || "").trim();
+    if (!normalized || options.has(normalized)) return;
+    options.set(normalized, { value: normalized, label: normalized, dataType });
+  };
+  Object.values(state.pipelineDraft?.alphaGraph?.inputs || {})
+    .forEach((boundary) => add(boundary?.wire, "Graph input"));
+  Object.values(instance?.inputs || {})
+    .forEach((value) => add(value, "Current binding"));
+  return [...options.values()].sort((left, right) => left.value.localeCompare(right.value));
+}
+
+function moduleEditValidation(pending = pendingModuleLoad) {
+  if (pending?.mode !== "edit") return "";
+  const { target, originalIdentity } = pending;
+  const instanceId = String(target?.instanceId || "");
+  const current = state.pipelineDraft?.instances?.[instanceId];
+  if (!current) return "This Module instance is no longer loaded";
+  const currentIdentity = [instanceId, current.kind, current.moduleId, String(current.version)];
+  const expectedIdentity = [
+    originalIdentity.instanceId,
+    originalIdentity.kind,
+    originalIdentity.moduleId,
+    String(originalIdentity.version),
+  ];
+  if (JSON.stringify(currentIdentity) !== JSON.stringify(expectedIdentity)) {
+    return "This Module instance changed while Configure was open";
+  }
+  const specification = PIPELINE_STAGES.find(({ stage }) => stage === target.stage);
+  const editable = specification
+    ? pipelineStageInventory(target.stage, specification.kind, state.pipelineDraft)
+      .modules.some((entry) => entry.instanceId === instanceId && entry.status === "loaded")
+    : false;
+  return editable ? "" : "This Module instance no longer has one valid Stage owner";
 }
 
 function moduleLoadDialogActionState() {
@@ -4139,8 +4509,16 @@ function moduleLoadDialogActionState() {
   if (!instanceId) {
     return { disabled: true, title: "Instance is required" };
   }
-  if (draftInstanceIdSet().has(instanceId)) {
-    return { disabled: true, title: `Instance ${instanceId} already exists` };
+  const editing = pendingModuleLoad?.mode === "edit";
+  if (!editing && draftInstanceIdSet().has(instanceId)) {
+    return { disabled: true, title: "This Module instance already exists" };
+  }
+  if (editing) {
+    const editError = moduleEditValidation();
+    if (editError) return { disabled: true, title: editError };
+    if (instanceId !== pendingModuleLoad.target.instanceId) {
+      return { disabled: true, title: "Instance identity cannot be changed" };
+    }
   }
   if (pendingModuleLoad?.module) {
     try {
@@ -4158,38 +4536,87 @@ function syncModuleLoadDialogActionState() {
   if (!confirm) return;
   const { disabled, title } = moduleLoadDialogActionState();
   confirm.disabled = disabled;
-  confirm.title = title;
+  confirm.title = visibleText(title);
   if (dialog?.open) {
     setModuleLoadDialogError(disabled ? title : "");
   }
 }
 
-function openModuleLoadDialog(target, kind, module) {
+function openModuleLoadDialog(target, kind, module, options = {}) {
   if (pipelineBlueprintBusyMessage()) return;
-  pendingModuleLoad = { target, kind, module };
-  const instanceId = uniqueDraftInstanceId();
+  const instance = options.instance || null;
+  const mode = options.mode === "edit" && instance ? "edit" : "load";
+  const instanceId = mode === "edit" ? String(target.instanceId) : uniqueDraftInstanceId();
+  pendingModuleLoad = {
+    mode,
+    target,
+    kind,
+    module,
+    originalIdentity: mode === "edit" ? {
+      instanceId,
+      kind: instance.kind,
+      moduleId: instance.moduleId,
+      version: instance.version,
+    } : null,
+  };
   const dialog = $("moduleLoadDialog");
   const instanceInput = $("moduleLoadInstanceId");
-  $("moduleLoadDialogTitle").textContent = `Load ${kind}: ${module.name || "Untitled Module"}`;
+  const editing = mode === "edit";
+  const moduleName = visibleResourceName(module, `${forms.humanizeName(kind || "")} Module`.trim());
+  dialog.dataset.mode = mode;
+  if (editing) {
+    $("moduleLoadDialogTitle").textContent = `Configure ${moduleName}`;
+    $("confirmModuleLoadBtn").textContent = "Apply";
+  } else {
+    $("moduleLoadDialogTitle").textContent = `Load ${kind}: ${moduleName}`;
+    $("confirmModuleLoadBtn").textContent = "Load";
+  }
+  $("moduleLoadDialogMeta").textContent = editing
+    ? `${forms.humanizeName(visibleText(kind, "Module"))} Module · ${visibleVersionLabel(module.version)} · Configured instance`
+    : `${forms.humanizeName(visibleText(kind, "Module"))} Module · ${visibleVersionLabel(module.version)}`;
+  $("removeConfiguredModuleBtn").hidden = !editing;
+  $("moduleLoadOutputsHint").hidden = !editing;
   instanceInput.value = instanceId;
   setModuleLoadDialogError("");
-  forms.renderSchemaFields($("moduleLoadConfigFields"), module.configSchema, schemaDefaults(module.configSchema));
-  const inputDefinitions = Object.entries(module.ports?.inputs || {}).map(([name, spec]) => ({
-    name,
-    label: forms.humanizeName(name),
-    type: "dataKey",
-    description: `${JSON.stringify(spec?.schema)} / ${spec?.required === false ? "optional" : "required"}`,
-  }));
+  forms.renderSchemaFields(
+    $("moduleLoadConfigFields"),
+    module.configSchema,
+    editing ? structuredClone(instance.config || {}) : schemaDefaults(module.configSchema),
+  );
+  const inputDefinitions = moduleDialogInputDefinitions(module);
+  const inputValues = editing ? structuredClone(instance.inputs || {}) : defaultPortInputs(module);
+  const inputOptions = moduleDialogDataKeyOptions(instance);
   forms.renderParamFields(
     $("moduleLoadInputsFields"),
     inputDefinitions,
-    defaultPortInputs(module),
+    inputValues,
     Object.fromEntries(Object.keys(module.ports?.inputs || {}).map((name) => [
       name,
-      pipelineDataKeyOptions(),
+      inputOptions,
     ])),
+    { autoSelectSingle: !editing },
   );
-  forms.renderPortFields($("moduleLoadOutputsFields"), module.ports?.outputs || {}, {}, defaultPortOutputs(module));
+  if (editing) {
+    Object.keys(module.ports?.inputs || {}).forEach((name) => {
+      if (Object.prototype.hasOwnProperty.call(instance.inputs || {}, name)) return;
+      const input = $("moduleLoadInputsFields")
+        .querySelector(`[data-param-field="${CSS.escape(name)}"]`);
+      if (!input) return;
+      input.value = "";
+      input.dataset.selectedValue = "";
+    });
+  }
+  forms.renderPortFields(
+    $("moduleLoadOutputsFields"),
+    module.ports?.outputs || {},
+    editing ? structuredClone(instance.outputs || {}) : {},
+    editing ? {} : defaultPortOutputs(module),
+    { compactHints: true },
+  );
+  $("moduleLoadOutputsFields").querySelectorAll("[data-port-field]").forEach((input) => {
+    input.readOnly = editing;
+    input.dataset.editLocked = editing ? "true" : "false";
+  });
   dialog.oninput = (event) => {
     if (!event.target.closest(".dialog-form")) return;
     setModuleLoadDialogError("");
@@ -4204,20 +4631,45 @@ function openModuleLoadDialog(target, kind, module) {
   if (typeof dialog.showModal === "function") dialog.showModal();
 }
 
+function openModuleConfigureDialog(stage, instanceId) {
+  if (pipelineBlueprintBusyMessage()) return false;
+  const specification = PIPELINE_STAGES.find((entry) => entry.stage === stage);
+  if (!specification) return false;
+  const entry = pipelineStageInventory(stage, specification.kind, state.pipelineDraft || {})
+    .modules.find((candidate) => candidate.instanceId === instanceId && candidate.status === "loaded");
+  if (!entry?.instance || !entry.definition) return false;
+  openModuleLoadDialog(
+    { type: "instance", stage, instanceId },
+    specification.kind,
+    entry.definition,
+    { mode: "edit", instance: entry.instance },
+  );
+  return true;
+}
+
 function confirmModuleLoad() {
   if (pipelineBlueprintBusyMessage()) return false;
   if (!pendingModuleLoad) return;
-  const { target, kind, module } = pendingModuleLoad;
+  const pending = pendingModuleLoad;
+  const { mode = "load", target, kind, module } = pending;
+  const editing = mode === "edit";
   const instanceId = $("moduleLoadInstanceId").value.trim();
   if (!instanceId) {
     setModuleLoadDialogError("Instance is required");
     $("moduleLoadInstanceId").focus();
     return false;
   }
-  if (draftInstanceIdSet().has(instanceId)) {
-    setModuleLoadDialogError(`Instance ${instanceId} already exists`);
+  if (!editing && draftInstanceIdSet().has(instanceId)) {
+    setModuleLoadDialogError("This Module instance already exists");
     $("moduleLoadInstanceId").focus();
     return false;
+  }
+  if (editing) {
+    const editError = moduleEditValidation(pending);
+    if (editError) {
+      setModuleLoadDialogError(editError);
+      return false;
+    }
   }
   let config;
   let inputs;
@@ -4228,10 +4680,34 @@ function confirmModuleLoad() {
       $("moduleLoadInputsFields"),
       Object.keys(module.ports?.inputs || {}).map((name) => ({ name, type: "dataKey" })),
     );
-    outputs = forms.readPortFields($("moduleLoadOutputsFields"), module.ports?.outputs || {});
+    outputs = editing
+      ? structuredClone(state.pipelineDraft.instances[instanceId].outputs || {})
+      : forms.readPortFields($("moduleLoadOutputsFields"), module.ports?.outputs || {});
   } catch (error) {
     setModuleLoadDialogError(error?.message || "Invalid module fields");
     return false;
+  }
+  if (editing) {
+    const current = state.pipelineDraft.instances[instanceId];
+    const previousValues = JSON.stringify({
+      config: current.config || {},
+      inputs: current.inputs || {},
+      outputs: current.outputs || {},
+    });
+    const nextValues = { config, inputs, outputs };
+    if (JSON.stringify(nextValues) !== previousValues) {
+      state.pipelineDraft.instances = {
+        ...state.pipelineDraft.instances,
+        [instanceId]: { ...current, ...nextValues },
+      };
+      invalidateBacktestBuild("Pipeline Module configuration changed · Build again before running");
+    }
+    setModuleLoadDialogError("");
+    $("moduleLoadDialog").close();
+    pendingModuleLoad = null;
+    renderBlueprintMeta();
+    renderPipelineBuilder();
+    return true;
   }
   const payload = {
     instanceId,
@@ -4279,37 +4755,71 @@ function loadStageInstance(stage, instanceId) {
     return;
   } else {
     const current = state.pipelineDraft.stages[stage] || [];
-    state.pipelineDraft.stages[stage] = MULTI_STAGE.has(stage)
-      ? [...new Set([...current, instanceId])]
-      : [instanceId];
+    if (MULTI_STAGE.has(stage)) {
+      state.pipelineDraft.stages[stage] = [...new Set([...current, instanceId])];
+    } else {
+      const expectedKind = PIPELINE_STAGES.find((item) => item.stage === stage)?.kind;
+      let graphChanged = false;
+      Object.entries(state.pipelineDraft.instances || {})
+        .filter(([candidateId, instance]) => candidateId !== instanceId && instance?.kind === expectedKind)
+        .forEach(([candidateId]) => { graphChanged = detachPipelineInstanceFromDraft(candidateId) || graphChanged; });
+      state.pipelineDraft.stages[stage] = [instanceId];
+      if (graphChanged) {
+        syncPipelineAlphaGraphFieldFromDraft();
+        syncAlphaGraphBuilderFromDraft({ recordHistory: true });
+      }
+    }
   }
   invalidateBacktestBuild("Pipeline modules changed · Build again before running");
   renderBlueprintMeta();
   renderPipelineBuilder();
 }
 
+function detachPipelineInstanceFromDraft(instanceId) {
+  const draft = state.pipelineDraft;
+  if (!draft || !instanceId) return false;
+  const instance = draft.instances?.[instanceId];
+  const removedWires = new Set(Object.values(instance?.outputs || {}).filter(Boolean));
+  PIPELINE_MODULE_STAGES.forEach(({ stage }) => {
+    draft.stages[stage] = (draft.stages?.[stage] || []).filter((value) => value !== instanceId);
+  });
+  draft.alphaGraph ||= { nodes: [], inputs: {}, outputs: {} };
+  const previousNodes = alphaGraphNodeIds(draft.alphaGraph);
+  draft.alphaGraph.nodes = previousNodes.filter((value) => value !== instanceId);
+  draft.alphaGraph.outputs = Object.fromEntries(
+    Object.entries(draft.alphaGraph.outputs || {})
+      .filter(([, boundary]) => !removedWires.has(boundary?.wire)),
+  );
+  if (draft.instances?.[instanceId]) delete draft.instances[instanceId];
+  return draft.alphaGraph.nodes.length !== previousNodes.length;
+}
+
 function unloadStageInstance(stage, instanceId) {
   state.pipelineDraft ||= clonePipelineDraft(pipelineEditorState.definition || {});
-  if (stage === "signal") {
-    const instances = state.pipelineDraft.instances || {};
-    const removedInstance = instances[instanceId];
-    const removedWires = new Set(Object.values(removedInstance?.outputs || {}).filter(Boolean));
-    state.pipelineDraft.alphaGraph ||= { nodes: [], inputs: {}, outputs: {} };
-    state.pipelineDraft.alphaGraph.nodes = (state.pipelineDraft.alphaGraph.nodes || []).filter((value) => value !== instanceId);
-    state.pipelineDraft.alphaGraph.outputs = Object.fromEntries(
-      Object.entries(state.pipelineDraft.alphaGraph.outputs || {})
-        .filter(([, boundary]) => !removedWires.has(boundary?.wire)),
-    );
-    syncSignalStageWithAlphaGraph(state.pipelineDraft);
-  } else {
-    state.pipelineDraft.stages[stage] = (state.pipelineDraft.stages[stage] || []).filter((value) => value !== instanceId);
-  }
-  if (state.pipelineDraft.instances?.[instanceId]) delete state.pipelineDraft.instances[instanceId];
-  if (stage === "signal") {
+  const graphChanged = detachPipelineInstanceFromDraft(instanceId);
+  syncSignalStageWithAlphaGraph(state.pipelineDraft);
+  if (graphChanged || stage === "signal") {
     syncPipelineAlphaGraphFieldFromDraft();
     syncAlphaGraphBuilderFromDraft({ recordHistory: true });
   }
   invalidateBacktestBuild("Pipeline modules changed · Build again before running");
+  renderBlueprintMeta();
+  renderPipelineBuilder();
+}
+
+function removePipelineStageReference(stage, instanceId) {
+  state.pipelineDraft ||= clonePipelineDraft(pipelineEditorState.definition || {});
+  if (stage === "signal") {
+    state.pipelineDraft.alphaGraph ||= { nodes: [], inputs: {}, outputs: {} };
+    state.pipelineDraft.alphaGraph.nodes = alphaGraphNodeIds(state.pipelineDraft.alphaGraph)
+      .filter((value) => value !== instanceId);
+    syncPipelineAlphaGraphFieldFromDraft();
+    syncAlphaGraphBuilderFromDraft({ recordHistory: true });
+  } else {
+    state.pipelineDraft.stages[stage] = (state.pipelineDraft.stages?.[stage] || [])
+      .filter((value) => value !== instanceId);
+  }
+  invalidateBacktestBuild("Pipeline stage reference changed · Build again before running");
   renderBlueprintMeta();
   renderPipelineBuilder();
 }
@@ -4606,11 +5116,13 @@ function enableGraphDrag(board, node) {
     const startY = event.clientY;
     const left = parseFloat(node.style.left || "0");
     const top = parseFloat(node.style.top || "0");
+    const nodeWidth = node.offsetWidth || GRAPH_NODE_SIZE.width;
+    const nodeHeight = node.offsetHeight || GRAPH_NODE_SIZE.height;
     const onMove = (moveEvent) => {
       const scale = state.pipelineViewport?.scale || 1;
       const next = {
-        x: Math.min(PIPELINE_CANVAS_SIZE.width - GRAPH_NODE_SIZE.width, Math.max(12, left + (moveEvent.clientX - startX) / scale)),
-        y: Math.min(PIPELINE_CANVAS_SIZE.height - GRAPH_NODE_SIZE.height, Math.max(12, top + (moveEvent.clientY - startY) / scale)),
+        x: Math.min(PIPELINE_CANVAS_SIZE.width - nodeWidth, Math.max(12, left + (moveEvent.clientX - startX) / scale)),
+        y: Math.min(PIPELINE_CANVAS_SIZE.height - nodeHeight, Math.max(12, top + (moveEvent.clientY - startY) / scale)),
       };
       node.style.left = `${next.x}px`;
       node.style.top = `${next.y}px`;
@@ -4641,16 +5153,150 @@ function placeGraphNode(board, node, nodeId) {
   enableGraphDrag(board, node);
 }
 
+function pipelineStageModuleTagsMarkup(stage, inventory) {
+  const moduleTags = inventory.modules
+    .filter(({ status }) => status === "loaded")
+    .map(({ instanceId, instance, definition, problems, status }) => {
+    const name = visibleResourceName(definition || instance, `${forms.humanizeName(instance?.kind || "")} Module`.trim());
+    const diagnostic = problems.length ? ` · ${visibleText(problems.join(" · "))}` : "";
+    const title = `Configure ${name} · ${visibleVersionLabel(instance?.version)}${diagnostic}`;
+    return `<button class="loaded-tag${status === "loaded" ? "" : " has-issue"}"
+                    data-configure-stage-module="${escapeHtml(stage)}"
+                    data-instance="${escapeHtml(instanceId)}"
+                    data-stage-module-status="${escapeHtml(status)}"
+                    data-default-title="${escapeHtml(title)}"
+                    type="button"
+                    aria-label="${escapeHtml(`${name} · ${title}`)}"
+                    title="${escapeHtml(title)}">${escapeHtml(name)}</button>`;
+  }).join("");
+  const issueTags = [
+    ...inventory.modules
+      .filter(({ status }) => status !== "loaded")
+      .map(({ instanceId, instance, definition, problems, status }) => {
+      const name = visibleResourceName(definition || instance, `${forms.humanizeName(instance?.kind || "")} Module`.trim());
+      const title = `Remove invalid ${name} · ${visibleVersionLabel(instance?.version)} · ${visibleText(problems.join(" · "))}`;
+      return `<button class="loaded-tag has-issue"
+                      data-unload-stage="${escapeHtml(stage)}"
+                      data-instance="${escapeHtml(instanceId)}"
+                      data-stage-module-status="${escapeHtml(status)}"
+                      data-default-title="${escapeHtml(title)}"
+                      type="button"
+                      aria-label="${escapeHtml(`${name} · ${title}`)}"
+                      title="${escapeHtml(title)}">${escapeHtml(name)}</button>`;
+      }),
+    ...inventory.referenceIssues.map((issue) => {
+    const removeInstance = issue.action === "remove-instance";
+    const actionLabel = removeInstance ? "Remove invalid instance" : "Clear invalid reference";
+    const actionAttribute = removeInstance
+      ? `data-unload-stage="${escapeHtml(stage)}"`
+      : `data-remove-stage-reference="${escapeHtml(stage)}"`;
+    const title = `${visibleText(issue.message)} · ${actionLabel}`;
+    return `<button class="loaded-tag has-issue"
+                    ${actionAttribute}
+                    data-instance="${escapeHtml(issue.instanceId)}"
+                    data-stage-reference-issue="${escapeHtml(issue.status)}"
+                    data-default-title="${escapeHtml(title)}"
+                    type="button"
+                    title="${escapeHtml(title)}">Draft issue</button>`;
+    }),
+  ].join("");
+  return moduleTags || issueTags
+    ? `${moduleTags}${issueTags}`
+    : `<span class="muted">${stage === "signal" ? "No Signal Modules in Graph" : "No loaded Module"}</span>`;
+}
+
+function pipelineStageIssueRowsMarkup(stage, inventory, { includeModuleIssues = true } = {}) {
+  const moduleIssues = (includeModuleIssues ? inventory.modules : [])
+    .filter(({ problems }) => problems.length)
+    .map(({ instanceId, instance, definition, problems }) => {
+      const name = visibleResourceName(definition || instance, `${forms.humanizeName(instance?.kind || "")} Module`.trim());
+      const title = `${visibleText(problems.join(" · "))} · Remove invalid instance`;
+      return `<button class="pipeline-stage-issue"
+                      data-unload-stage="${escapeHtml(stage)}"
+                      data-instance="${escapeHtml(instanceId)}"
+                      data-stage-module-status="invalid"
+                      data-default-title="${escapeHtml(title)}"
+                      type="button"
+                      title="${escapeHtml(title)}">
+                <strong>${escapeHtml(name)}</strong>
+                <span>${escapeHtml(visibleText(problems.join(" · ")))}</span>
+              </button>`;
+    });
+  const referenceIssues = inventory.referenceIssues.map((issue) => {
+    const removeInstance = issue.action === "remove-instance";
+    const actionLabel = removeInstance ? "Remove invalid instance" : "Clear invalid reference";
+    const actionAttribute = removeInstance
+      ? `data-unload-stage="${escapeHtml(stage)}"`
+      : `data-remove-stage-reference="${escapeHtml(stage)}"`;
+    const title = `${visibleText(issue.message)} · ${actionLabel}`;
+    return `<button class="pipeline-stage-issue"
+                    ${actionAttribute}
+                    data-instance="${escapeHtml(issue.instanceId)}"
+                    data-stage-reference-issue="${escapeHtml(issue.status)}"
+                    data-default-title="${escapeHtml(title)}"
+                    type="button"
+                    title="${escapeHtml(title)}">
+              <strong>Draft issue</strong>
+              <span>${escapeHtml(visibleText(issue.message))}</span>
+            </button>`;
+  });
+  return [...moduleIssues, ...referenceIssues].join("");
+}
+
+function pipelineStageStatusSummary(inventory) {
+  return [
+    `${inventory.loadedCount} loaded`,
+    inventory.instanceCount !== inventory.loadedCount ? `${inventory.instanceCount} instance${inventory.instanceCount === 1 ? "" : "s"}` : "",
+    inventory.issueCount ? `${inventory.issueCount} issue${inventory.issueCount === 1 ? "" : "s"}` : "",
+  ].filter(Boolean).join(" · ");
+}
+
+function pipelineSingleStageModuleMarkup(stage, kind, module, inventory) {
+  const { instanceId, instance, definition, problems, status } = module;
+  const name = visibleResourceName(definition || instance, `${forms.humanizeName(kind || "")} Module`.trim());
+  const moduleId = instance?.moduleId || "unknown";
+  const version = instance?.version || "";
+  const presentationIdentity = `${forms.humanizeName(visibleText(kind || "Module", "Module"))} Module · ${visibleVersionLabel(version)}`;
+  const referenceIssues = pipelineStageIssueRowsMarkup(stage, inventory, { includeModuleIssues: false });
+  const moduleProblems = problems.length
+    ? `<div class="pipeline-single-module-warning">${escapeHtml(visibleText(problems.join(" · ")))}</div>`
+    : "";
+  return `
+    <div class="component-head pipeline-single-module-head">
+      <div class="pipeline-single-module-copy">
+        <span class="pipeline-single-module-kind">${escapeHtml(kind)} Module</span>
+        <h3 class="pipeline-single-module-name" title="${escapeHtml(name)}">${escapeHtml(name)}</h3>
+      </div>
+      <button class="pipeline-single-module-configure"
+              data-configure-stage-module="${escapeHtml(stage)}"
+              data-instance="${escapeHtml(instanceId)}"
+              data-stage-module-status="${escapeHtml(status)}"
+              data-default-title="${escapeHtml(`Configure ${name} · ${visibleVersionLabel(version)}`)}"
+              type="button"
+              aria-label="${escapeHtml(`Configure ${name}`)}"
+              title="${escapeHtml(`Configure ${name} · ${visibleVersionLabel(version)}`)}">Configure</button>
+    </div>
+    <div class="pipeline-single-module-identity"
+         data-single-module-meta
+         data-instance-id="${escapeHtml(instanceId)}"
+         data-module-id="${escapeHtml(moduleId)}"
+         data-version="${escapeHtml(version)}"
+         title="${escapeHtml(presentationIdentity)}">${escapeHtml(presentationIdentity)}</div>
+    ${moduleProblems}
+    ${referenceIssues ? `<div class="pipeline-stage-issues">${referenceIssues}</div>` : ""}
+  `;
+}
+
 function renderPipelineBuilder() {
   if (!$("pipelineStageGrid")) return;
   const definition = pipelineEditorState.definition || {};
   syncPipelineLoadActionState();
   syncPipelineBlueprintErrorState();
   if (!state.pipelineDraft) state.pipelineDraft = clonePipelineDraft(definition);
-  const stages = state.pipelineDraft.stages || {};
   if (!pipelineField("Id").value) {
     pipelineField("Id").value = definition.pipelineId || pipelineEditorState.pipelineId;
     pipelineField("Name").value = definition.name || "";
+    pipelineField("ProtocolId").value = definition.protocolId || "";
     pipelineField("AlphaGraph").value = JSON.stringify(definition.signalGraph || { nodes: [], inputs: {}, outputs: {} }, null, 2);
   }
   const grid = $("pipelineStageGrid");
@@ -4659,90 +5305,132 @@ function renderPipelineBuilder() {
   svg.classList.add("graph-edges");
   grid.appendChild(svg);
   PIPELINE_STAGES.forEach(({ stage, kind, title }) => {
-    const signalEntries = stage === "signal" ? alphaGraphNodeEntries(draftInstances(), state.pipelineDraft?.alphaGraph || alphaGraphObject()) : [];
-    const selected = stage === "signal" ? signalEntries.map(({ instanceId }) => instanceId) : (stages[stage] || []);
+    const inventory = pipelineStageInventory(stage, kind, state.pipelineDraft);
     const available = moduleDefinitionsByKind(kind);
-    const helperText = available.length ? `${available.length} archived version(s)` : "No archived Module version";
     const group = document.createElement("section");
-    group.className = "component-group flow-node";
     group.dataset.stage = stage;
-    const tags = selected.length
-      ? selected.map((instanceId) => {
-        const signalEntry = stage === "signal" ? signalEntries.find((entry) => entry.instanceId === instanceId) : null;
-        const label = stage === "signal"
-          ? forms.humanizeName(signalEntry?.instance?.moduleId || instanceId)
-          : instanceId;
-        return `<button class="loaded-tag" data-unload-stage="${stage}" data-instance="${instanceId}" type="button" title="${instanceId}">${label}</button>`;
-      }).join("")
-      : `<span class="muted">${stage === "signal" ? "No Signal Modules in Graph" : "No loaded Module"}</span>`;
-    const detailsButton = stage === "signal"
-      ? '<button class="details-btn" data-open-alpha-details="signal" type="button">Details</button>'
-      : "";
-    const loadRow = stage === "signal" ? "" : `
-      <div class="load-row">
-        <select data-load-stage="${stage}" data-stage-kind="${kind}"><option value="">Select module</option></select>
-        <button data-load-stage-button="${stage}" type="button">Load</button>
-      </div>`;
-    const helperRow = `<div class="muted" data-load-helper-stage="${stage}">${stage === "signal" ? pipelineSignalDetailsSummary() : helperText}</div>`;
-    group.innerHTML = `
-      <div class="component-head">
-        <h3>${title}</h3>
-        <div class="component-head-actions">
-          <span>${stage === "signal" ? "Graph" : `${MULTI_STAGE.has(stage) ? "multi" : "single"} ${kind}`}</span>
-          ${detailsButton}
+    group.dataset.stageLoadedCount = String(inventory.loadedCount);
+    group.dataset.stageInstanceCount = String(inventory.instanceCount);
+    group.dataset.stageIssueCount = String(inventory.issueCount);
+    const containerStage = stage === "signal" || MULTI_STAGE.has(stage);
+    const singleModule = !containerStage
+      && inventory.loadedCount === 1
+      && inventory.instanceCount === 1
+      && inventory.issueCount === 0
+      ? inventory.modules.find(({ status }) => status === "loaded") || null
+      : null;
+    if (containerStage) {
+      const tags = pipelineStageModuleTagsMarkup(stage, inventory);
+      const detailsButton = stage === "signal"
+        ? '<button class="details-btn" data-open-alpha-details="signal" type="button">Details</button>'
+        : "";
+      const loadRow = stage === "signal" ? "" : `
+        <div class="load-row">
+          <select data-load-stage="${stage}" data-stage-kind="${kind}" aria-label="${title} Module template"><option value="" data-hierarchy-placeholder="true"></option></select>
+          <button data-load-stage-button="${stage}" type="button">Load</button>
+        </div>`;
+      group.className = "component-group flow-node pipeline-stage-container";
+      group.dataset.stageCardMode = "container";
+      group.innerHTML = `
+        <div class="component-head">
+          <h3>${title}</h3>
+          <div class="component-head-actions">
+            <span>${stage === "signal" ? "Graph" : "Container"}</span>
+            ${detailsButton}
+          </div>
         </div>
-      </div>
-      <div class="loaded-tags${stage === "signal" ? " loaded-tags-scroll" : ""}">${tags}</div>
-      ${loadRow}
-      ${helperRow}
-    `;
-    if (stage !== "signal") appendRepositoryOptions(
-        group.querySelector(`[data-load-stage="${CSS.escape(stage)}"]`),
+        <div class="loaded-tags loaded-tags-scroll pipeline-stage-tag-list"
+             data-stage-module-count="${inventory.loadedCount}"
+             data-stage-instance-count="${inventory.instanceCount}"
+             data-stage-issue-count="${inventory.issueCount}">${tags}</div>
+        ${loadRow}
+        <div class="muted" data-stage-summary="${stage}">${stage === "signal" ? pipelineSignalDetailsSummary(inventory) : pipelineStageStatusSummary(inventory)}</div>
+      `;
+    } else if (singleModule) {
+      group.className = `component-group flow-node pipeline-single-module-card${inventory.issueCount ? " has-issue" : ""}`;
+      group.dataset.stageCardMode = "single-module";
+      group.dataset.singleStageModule = singleModule.instanceId;
+      group.innerHTML = pipelineSingleStageModuleMarkup(stage, kind, singleModule, inventory);
+    } else {
+      const issues = pipelineStageIssueRowsMarkup(stage, inventory);
+      group.className = `component-group flow-node pipeline-single-stage-slot${issues ? " has-issue" : ""}`;
+      group.dataset.stageCardMode = "single-slot";
+      group.innerHTML = `
+        <div class="component-head">
+          <h3>${title}</h3>
+          <div class="component-head-actions"><span>${issues ? "Needs repair" : "Empty"}</span></div>
+        </div>
+        ${issues
+          ? `<div class="pipeline-stage-issues">${issues}</div>`
+          : '<div class="pipeline-single-stage-empty">No Module loaded</div>'}
+        <div class="load-row">
+          <select data-load-stage="${stage}" data-stage-kind="${kind}" aria-label="${title} Module template"><option value="" data-hierarchy-placeholder="true"></option></select>
+          <button data-load-stage-button="${stage}" type="button">Load</button>
+        </div>
+        ${issues ? `<div class="muted" data-stage-summary="${stage}">${pipelineStageStatusSummary(inventory)}</div>` : ""}
+      `;
+    }
+    const stageSelect = group.querySelector(`[data-load-stage="${CSS.escape(stage)}"]`);
+    if (stageSelect) appendRepositoryOptions(
+        stageSelect,
         available,
         (row) => row.key,
-        (row) => `${row.moduleId} / ${row.version}`,
+        (row) => moduleChoiceLabel(row),
         "modules",
+        (row) => moduleChoiceMetadata(row),
       );
-    const stageSelect = group.querySelector(`[data-load-stage="${CSS.escape(stage)}"]`);
     if (stageSelect) {
       stageSelect.dataset.repositoryHierarchy = "modules";
+      stageSelect.dataset.hierarchyVariant = "pipeline-module";
+      stageSelect.dataset.hierarchyMenuMinWidth = "420";
       enhanceHierarchicalRepositorySelect(stageSelect);
     }
     placeGraphNode(grid, group, `stage:${stage}`);
   });
 
-  const syncLoadButtonState = (select, button, emptyTitle, helperNode, defaultText) => {
+  const syncLoadButtonState = (select, button, emptyTitle) => {
     if (!select || !button) return;
-    const hasTemplates = select.options.length > 1;
+    const hasTemplates = [...select.options].some((option) => !option.dataset.hierarchyPlaceholder);
     const hasSelection = !!select.value;
     button.dataset.defaultDisabled = hasSelection ? "0" : "1";
-    button.dataset.defaultTitle = hasSelection ? "" : (hasTemplates ? "Select module first" : emptyTitle);
+    button.dataset.defaultTitle = hasSelection ? "" : (hasTemplates ? "Choose a Module" : emptyTitle);
     button.disabled = button.dataset.defaultDisabled === "1";
     button.title = button.dataset.defaultTitle || "";
-    if (helperNode) {
-      helperNode.textContent = hasSelection ? defaultText : (hasTemplates ? "Select module first" : emptyTitle);
-    }
   };
   grid.querySelectorAll("[data-load-stage-button]").forEach((button) => {
     const stage = button.dataset.loadStageButton;
     const select = grid.querySelector(`select[data-load-stage="${stage}"]`);
-    const helperNode = grid.querySelector(`[data-load-helper-stage="${stage}"]`);
-    const defaultText = helperNode?.textContent || "";
-    syncLoadButtonState(select, button, "No module template available", helperNode, defaultText);
-    select?.addEventListener("change", () => syncLoadButtonState(select, button, "No module template available", helperNode, defaultText));
+    syncLoadButtonState(select, button, "No Module template available");
+    select?.addEventListener("change", () => syncLoadButtonState(select, button, "No Module template available"));
     button.addEventListener("click", () => {
       if (pipelineBlueprintBusyMessage()) return;
       loadStageModuleTemplate(stage, select.dataset.stageKind, select.value);
     });
   });
+  grid.querySelectorAll("[data-configure-stage-module]").forEach((button) => {
+    button.dataset.defaultDisabled = "0";
+    button.dataset.defaultTitle ||= button.title || "Configure Module";
+    button.addEventListener("click", () => {
+      if (pipelineBlueprintBusyMessage()) return;
+      openModuleConfigureDialog(button.dataset.configureStageModule, button.dataset.instance);
+    });
+  });
   grid.querySelectorAll("[data-unload-stage]").forEach((button) => {
     button.dataset.defaultDisabled = "0";
-    button.dataset.defaultTitle = "";
+    button.dataset.defaultTitle ||= button.title || "Remove Module";
     button.addEventListener("click", () => {
       if (pipelineBlueprintBusyMessage()) return;
       openUnloadDialog(button.dataset.unloadStage, button.dataset.instance, () => {
         unloadStageInstance(button.dataset.unloadStage, button.dataset.instance);
       });
+    });
+  });
+  grid.querySelectorAll("[data-remove-stage-reference]").forEach((button) => {
+    button.dataset.defaultDisabled = "0";
+    button.dataset.defaultTitle ||= button.title || "Clear invalid reference";
+    button.addEventListener("click", () => {
+      if (pipelineBlueprintBusyMessage()) return;
+      removePipelineStageReference(button.dataset.removeStageReference, button.dataset.instance);
     });
   });
   grid.querySelectorAll("[data-open-alpha-details]").forEach((button) => {
@@ -4783,7 +5471,8 @@ function buildPipelinePayload() {
   setPipelineSaveError("");
   return {
     pipelineId,
-    name: pipelineField("Name").value.trim() || pipelineId,
+    name: pipelineField("Name").value.trim() || "Pipeline",
+    ...optionalProtocolId(pipelineField("ProtocolId").value),
     stages,
     instances: { ...(state.pipelineDraft?.instances || {}) },
     signalGraph: parsePipelineAlphaGraphValue(),
@@ -4814,7 +5503,7 @@ async function saveCurrentPipelineVersion({ redirect = false } = {}) {
     switchView("overview");
   } else {
     await loadPipeline(true);
-    $("pipelineStatus").textContent = `Saved v${response.version}`;
+    $("pipelineStatus").textContent = `Saved ${visibleVersionLabel(response.version)}`;
     switchPipelineSection(currentPipelineSection);
   }
   return response;
@@ -4841,8 +5530,8 @@ async function loadSelectedPipelineVersion(version) {
       sourceDefinition,
     });
     $("pipelineStatus").textContent = versionSummary.current
-      ? `Loaded Current · v${versionSummary.version}`
-      : `Loaded v${versionSummary.version} as draft`;
+      ? `Loaded Current · ${visibleVersionLabel(versionSummary.version)}`
+      : `Loaded ${visibleVersionLabel(versionSummary.version)} as draft`;
   } finally {
     setPipelineBlueprintBusyState({ reloadInFlight: false });
   }
@@ -4859,7 +5548,7 @@ window.__tradePipelineActions = {
   },
 };
 
-["Id", "Name"].forEach((fieldId) => {
+["Id", "Name", "ProtocolId"].forEach((fieldId) => {
   pipelineField(fieldId)?.addEventListener("input", () => {
     if (pipelineField(fieldId)?.disabled) return;
     state.pipelineDraft ||= clonePipelineDraft(pipelineEditorState.definition || {});
@@ -4868,6 +5557,7 @@ window.__tradePipelineActions = {
       pipelineId: pipelineField("Id").value.trim() || pipelineEditorState.definition?.pipelineId || pipelineEditorState.pipelineId,
       name: pipelineField("Name").value.trim(),
     };
+    state.pipelineDraft.meta.protocolId = pipelineField("ProtocolId").value;
     setPipelineSaveError("");
     syncPipelineSaveActionState();
     renderBlueprintMeta();
@@ -4897,7 +5587,7 @@ function renderData() {
       picker,
       activeDatasets,
       (dataset) => dataset.datasetId,
-      (dataset) => `${dataset.name || dataset.datasetId} · ${dataset.datasetId}`,
+      (dataset) => datasetCatalogLabel(dataset),
       "datasets",
     );
     [...picker.options].forEach((option) => { option.selected = selected.has(option.value); });
@@ -4907,16 +5597,16 @@ function renderData() {
     "datasetScriptWorkspace",
     state.datasetWorkspaces,
     (row) => row.workspaceId,
-    (row) => row.name || row.workspaceId,
+    (row) => visibleResourceName(row, "Dataset Workspace"),
     "workspaces",
   );
   const processScript = $("datasetProcessScript");
   const previousScript = processScript.value;
   processScript.innerHTML = "";
-  state.datasetRecipes.forEach((recipe) => {
+  window.TradeVersionSelection.currentRows(state.datasetRecipes, ["recipeId"]).forEach((recipe) => {
     const option = document.createElement("option");
     option.value = `${recipe.recipeId}::${recipe.version}`;
-    option.textContent = `${recipe.name || recipe.recipeId} @ ${recipe.version}`;
+    option.textContent = `${visibleResourceName(recipe, "Dataset Script")} · ${visibleVersionLabel(recipe.version)}`;
     option.selected = option.value === previousScript;
     processScript.appendChild(option);
   });
@@ -4937,7 +5627,7 @@ async function refreshDatasetScriptWorkspacePaths() {
   (result.scripts || []).forEach((script) => {
     const option = document.createElement("option");
     option.value = script.path;
-    option.textContent = script.path;
+    option.textContent = visibleText(script.path, "Script");
     select.appendChild(option);
   });
   if (!(result.scripts || []).length) {
@@ -4960,34 +5650,36 @@ function renderBacktests() {
   );
   renderSelectOptions(
     "backtestSampler",
-    state.samplers,
+    window.TradeVersionSelection.currentRows(state.samplers, ["samplerId"]),
     (row) => `${row.samplerId}::${row.version}`,
-    (row) => `${row.name || row.samplerId} @ ${row.version}`,
+    (row) => `${visibleResourceName(row, "Sampler")} · ${visibleVersionLabel(row.version)}`,
     "samplers",
-    "Select a Sampler Version",
+    "Select a Sampler",
   );
   renderSelectOptions(
     "backtestEnvironmentSelect",
-    state.environments,
+    window.TradeVersionSelection.currentRows(state.environments, ["environmentId"]),
     (row) => `${row.environmentId}::${row.version}`,
-    (row) => `${row.name || row.environmentId} @ ${row.version}`,
+    (row) => `${visibleResourceName(row, "Environment")} · ${visibleVersionLabel(row.version)}`,
     "environments",
-    "Select an Environment Version",
+    "Select an Environment",
   );
   renderSelectOptions(
     "backtestAnalysisSelect",
-    state.analyses,
+    window.TradeVersionSelection.currentRows(state.analyses, ["analysisId"]),
     (row) => `${row.analysisId}::${row.version}`,
-    (row) => `${row.name || row.analysisId} @ ${row.version}`,
+    (row) => `${visibleResourceName(row, "Analysis")} · ${visibleVersionLabel(row.version)}`,
     "analyses",
-    "Select an Analysis Version",
+    "Select an Analysis",
   );
   renderEmbeddedRepositoryBrowser("backtest");
   $("showArchivedBacktestsBtn").textContent = showArchivedBacktests ? "Hide Archived" : "Show Archived";
   restoreBacktestControlsFromBuildCache();
   renderBacktestChain();
   renderBacktestSamplerParameters();
+  renderBacktestPipelineParameters();
   renderBacktestEnvironmentParameters();
+  renderBacktestAnalysisParameters();
   renderBacktestJobs();
   syncBacktestRunState();
 }
@@ -4995,7 +5687,7 @@ function renderBacktests() {
 function backtestJobTitle(job) {
   const pipeline = state.pipelines?.[job.pipelineId];
   const dataset = (state.datasets || []).find((row) => row.datasetId === job.datasetId);
-  return `${pipeline?.name || job.pipelineId || "Pipeline"} × ${dataset?.name || job.datasetId || "Dataset"}`;
+  return `${visibleResourceName(pipeline, "Pipeline")} × ${visibleResourceName(dataset, "Dataset")}`;
 }
 
 function renderBacktestJobs() {
@@ -5019,9 +5711,9 @@ function renderBacktestJobs() {
     const progressValue = job.status === "completed" || total > 0
       ? ` value="${percent.toFixed(2)}"`
       : "";
-    const phase = job.status === "queued" && job.queuePosition
+    const phase = visibleText(job.status === "queued" && job.queuePosition
       ? `Queued · position ${job.queuePosition}`
-      : job.phase || job.status;
+      : job.phase || job.status, "Backtest");
     const detail = total > 0
       ? `${completed.toLocaleString()} / ${total.toLocaleString()} cycles`
       : (job.status === "queued"
@@ -5034,14 +5726,14 @@ function renderBacktestJobs() {
     return `<article class="backtest-job" data-backtest-job="${escapeHtml(job.jobId)}">
       <div class="backtest-job-identity">
         <strong title="${escapeHtml(backtestJobTitle(job))}">${escapeHtml(backtestJobTitle(job))}</strong>
-        <span class="muted" title="${escapeHtml(job.jobId)}">${escapeHtml(job.jobId)} · ${escapeHtml(formatTime(job.submittedAt))}</span>
+        <span class="muted" title="Backtest submission time">Submitted ${escapeHtml(formatTime(job.submittedAt))}</span>
       </div>
       <div class="backtest-job-progress-wrap">
         <progress class="backtest-job-progress" max="100"${progressValue} aria-label="${escapeHtml(detail)}"></progress>
         <span class="muted">${escapeHtml(detail)}</span>
       </div>
       <span class="backtest-job-status ${escapeHtml(job.status)}" title="${escapeHtml(phase)}">${escapeHtml(phase)}</span>
-      ${job.error ? `<p class="backtest-job-error">${escapeHtml(job.error)}</p>` : ""}
+      ${job.error ? `<p class="backtest-job-error">${escapeHtml(visibleText(job.error))}</p>` : ""}
     </article>`;
   }).join("");
 }
@@ -5100,6 +5792,31 @@ function selectedBacktestAnalysis() {
   return (state.analyses || []).find((row) => (
     row.analysisId === analysisId && String(row.version) === String(version)
   ));
+}
+
+function pipelineBacktestConfigSchema() {
+  const dataKeyList = {
+    type: "array",
+    items: { type: "string", minLength: 1 },
+    uniqueItems: true,
+    description: "One Observation DataKey path per line.",
+  };
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["observationInput"],
+    properties: {
+      observationInput: {
+        type: "object",
+        additionalProperties: false,
+        required: ["whitelist", "blacklist"],
+        properties: {
+          whitelist: structuredClone(dataKeyList),
+          blacklist: structuredClone(dataKeyList),
+        },
+      },
+    },
+  };
 }
 
 function inferSamplerParameterSchema(config = {}) {
@@ -5415,25 +6132,554 @@ function renderBacktestSamplerParameters({ reset = false } = {}) {
     : `${settingCount} parameter${settingCount === 1 ? "" : "s"} configured`;
 }
 
-function setBacktestSamplerConfigError(message = "") {
+function setBacktestConfigError(message = "") {
   const error = $("backtestSamplerConfigError");
-  error.textContent = message;
+  error.textContent = visibleText(message);
   error.hidden = !message;
 }
 
-function openBacktestSamplerConfig() {
-  const sampler = selectedBacktestSampler();
-  if (!sampler) return;
-  renderBacktestSamplerParameters();
-  $("backtestSamplerConfigTitle").textContent = `Configure ${sampler.name || sampler.samplerId}`;
-  $("backtestSamplerConfigDescription").textContent = `${sampler.samplerId} @ ${sampler.version} · parameters apply to this Backtest Entry only`;
-  forms.renderSchemaFields(
-    $("backtestSamplerConfigFields"),
-    selectedSamplerParameterSchema(sampler),
-    structuredClone(backtestEntryState.samplerParameters),
+function isBacktestConfigObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function backtestConfigEqual(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function mergeBacktestConfig(base, override) {
+  if (!isBacktestConfigObject(base) || !isBacktestConfigObject(override)) {
+    return structuredClone(override);
+  }
+  const result = structuredClone(base);
+  Object.entries(override).forEach(([name, value]) => {
+    result[name] = isBacktestConfigObject(result[name]) && isBacktestConfigObject(value)
+      ? mergeBacktestConfig(result[name], value)
+      : structuredClone(value);
+  });
+  return result;
+}
+
+function sparseBacktestConfig(base, effective) {
+  if (backtestConfigEqual(base, effective)) return undefined;
+  if (!isBacktestConfigObject(base) || !isBacktestConfigObject(effective)) {
+    return structuredClone(effective);
+  }
+  const result = {};
+  Object.entries(effective).forEach(([name, value]) => {
+    const child = Object.prototype.hasOwnProperty.call(base, name)
+      ? sparseBacktestConfig(base[name], value)
+      : structuredClone(value);
+    if (child !== undefined) result[name] = child;
+  });
+  return Object.keys(result).length ? result : undefined;
+}
+
+function backtestConfigValue(resource) {
+  if (resource === "sampler") return backtestEntryState.samplerParameters || {};
+  if (resource === "pipeline") {
+    return {
+      configOverride: structuredClone(backtestEntryState.pipelineConfigOverride || {}),
+      moduleConfigOverrides: structuredClone(backtestEntryState.pipelineModuleConfigOverrides || {}),
+    };
+  }
+  return {
+    moduleConfigOverrides: structuredClone(
+      backtestEntryState[`${resource}ModuleConfigOverrides`] || {},
+    ),
+  };
+}
+
+function setBacktestConfigValue(resource, value) {
+  if (resource === "sampler") {
+    backtestEntryState.samplerParameters = structuredClone(value);
+    return;
+  }
+  if (resource === "pipeline") {
+    backtestEntryState.pipelineConfigOverride = structuredClone(value.configOverride || {});
+    backtestEntryState.pipelineModuleConfigOverrides = structuredClone(value.moduleConfigOverrides || {});
+    return;
+  }
+  backtestEntryState[`${resource}ModuleConfigOverrides`] = structuredClone(
+    value.moduleConfigOverrides || {},
   );
-  setBacktestSamplerConfigError("");
-  $("backtestSamplerConfigDialog").showModal();
+}
+
+function backtestConfigSelection(resource) {
+  if (resource === "sampler") {
+    const item = selectedBacktestSampler();
+    return item && { id: item.samplerId, version: item.version, name: item.name };
+  }
+  if (resource === "environment") {
+    const item = selectedBacktestEnvironment();
+    return item && { id: item.environmentId, version: item.version, name: item.name };
+  }
+  if (resource === "analysis") {
+    const item = selectedBacktestAnalysis();
+    return item && { id: item.analysisId, version: item.version, name: item.name };
+  }
+  if (resource === "pipeline" && backtestEntryState.pipelineId) {
+    const item = state.pipelines?.[backtestEntryState.pipelineId] || {};
+    return {
+      id: backtestEntryState.pipelineId,
+      version: backtestEntryState.pipelineVersion,
+      name: item.name,
+    };
+  }
+  return null;
+}
+
+function backtestConfigDefinition(resource) {
+  if (resource === "sampler") return selectedBacktestSampler();
+  if (resource === "environment") return selectedBacktestEnvironment();
+  if (resource === "analysis") return selectedBacktestAnalysis();
+  if (resource !== "pipeline" || !backtestEntryState.pipelineId) return null;
+  const key = `${backtestEntryState.pipelineId}::${backtestEntryState.pipelineVersion}`;
+  return state.backtestPipelineDefinitions?.[key] || null;
+}
+
+function backtestConfigModuleRepository(resource) {
+  if (resource === "pipeline") return state.pipelineModules || {};
+  if (resource === "environment") return state.environmentModules || {};
+  if (resource === "analysis") return state.analysisModules || {};
+  return {};
+}
+
+function backtestConfigModuleDefinition(resource, instance) {
+  return Object.values(backtestConfigModuleRepository(resource)).find((definition) => (
+    definition.moduleId === instance.moduleId
+      && String(definition.version) === String(instance.version)
+      && definition.status === "archived"
+  )) || null;
+}
+
+async function ensureBacktestConfigModuleContracts(resource) {
+  const specifications = {
+    pipeline: ["pipelineModules", "/api/modules?limit=500"],
+    environment: ["environmentModules", "/api/environment-modules?limit=500"],
+    analysis: ["analysisModules", "/api/analysis-modules?limit=500"],
+  };
+  const specification = specifications[resource];
+  if (!specification) return;
+  if (resource === "pipeline") {
+    const pipelineId = backtestEntryState.pipelineId;
+    const version = backtestEntryState.pipelineVersion;
+    const key = `${pipelineId}::${version}`;
+    if (!state.backtestPipelineDefinitions[key]) {
+      const response = await getJson(
+        `/api/pipelines/${encodeURIComponent(pipelineId)}/versions/${encodeURIComponent(version)}`,
+      );
+      if (response.pipelineId !== pipelineId
+          || String(response.definition?.version || "") !== String(version)) {
+        throw new Error("Pipeline Definition response does not match the selected exact Version");
+      }
+      state.backtestPipelineDefinitions[key] = response.definition;
+    }
+  }
+  const [stateKey, endpoint] = specification;
+  if (Object.keys(state[stateKey] || {}).length) return;
+  const response = await getJson(endpoint);
+  state[stateKey] = response.modules || {};
+}
+
+function backtestConfigDescriptors(resource = activeBacktestConfigResource) {
+  const definition = backtestConfigDefinition(resource);
+  if (!definition) return [];
+  if (resource === "sampler") {
+    return [{
+      scope: "sampler",
+      instanceId: "sampler.parameters",
+      name: "Parameters",
+      moduleId: definition.samplerId,
+      version: definition.version,
+      config: structuredClone(definition.config || {}),
+      configSchema: definition.parameterSchema || inferSamplerParameterSchema(definition.config || {}),
+    }];
+  }
+  const descriptors = [];
+  if (resource === "pipeline") {
+    descriptors.push({
+      scope: "resource",
+      instanceId: "resource.config",
+      name: "Pipeline Config",
+      moduleId: definition.pipelineId,
+      version: definition.version,
+      config: structuredClone(definition.config || {}),
+      configSchema: pipelineBacktestConfigSchema(),
+    });
+  }
+  descriptors.push(...Object.entries(definition.instances || {}).map(([instanceId, instance]) => {
+    const module = backtestConfigModuleDefinition(resource, instance);
+    return {
+      scope: "module",
+      instanceId,
+      name: visibleResourceName(module, `${forms.humanizeName(instance.kind || "")} Module`.trim()),
+      moduleId: instance.moduleId,
+      version: instance.version,
+      config: structuredClone(instance.config || {}),
+      configSchema: module?.configSchema || null,
+    };
+  }));
+  return descriptors;
+}
+
+function selectedBacktestConfigDescriptor() {
+  const descriptors = backtestConfigDescriptors();
+  return descriptors.find((descriptor) => (
+    descriptor.instanceId === activeBacktestConfigInstanceId
+      && descriptor.scope === activeBacktestConfigScope
+  ))
+    || descriptors[0]
+    || null;
+}
+
+function validateBacktestConfigDraft(resource, value) {
+  if (!isBacktestConfigObject(value)) throw new Error("Configuration must be a JSON object");
+  const descriptors = backtestConfigDescriptors(resource);
+  if (resource === "sampler") {
+    const descriptor = descriptors[0];
+    if (!descriptor?.configSchema) throw new Error("Selected Sampler has no public parameterSchema");
+    forms.validateSchemaValue(value, descriptor.configSchema, "Sampler parameters");
+    return;
+  }
+  const allowedFields = resource === "pipeline"
+    ? new Set(["configOverride", "moduleConfigOverrides"])
+    : new Set(["moduleConfigOverrides"]);
+  const unknownFields = Object.keys(value).filter((field) => !allowedFields.has(field));
+  if (unknownFields.length) {
+    throw new Error(`Unknown ${resource} configuration field: ${unknownFields[0]}`);
+  }
+  const moduleOverrides = value.moduleConfigOverrides || {};
+  if (!isBacktestConfigObject(moduleOverrides)) {
+    throw new Error(`${resource}.moduleConfigOverrides must be a JSON object`);
+  }
+  if (resource === "pipeline") {
+    const configOverride = value.configOverride || {};
+    if (!isBacktestConfigObject(configOverride)) {
+      throw new Error("pipeline.configOverride must be a JSON object");
+    }
+    const descriptor = descriptors.find(({ scope }) => scope === "resource");
+    const effective = mergeBacktestConfig(descriptor?.config || {}, configOverride);
+    forms.validateSchemaValue(effective, descriptor?.configSchema || {}, "Pipeline config");
+    const observationInput = effective.observationInput || {};
+    for (const [name, entries] of Object.entries({
+      whitelist: observationInput.whitelist || [],
+      blacklist: observationInput.blacklist || [],
+    })) {
+      entries.forEach((path) => {
+        const error = observationPathError(path);
+        if (error) throw new Error(`Pipeline config.observationInput.${name}: ${error}`);
+      });
+    }
+    const outside = (observationInput.blacklist || []).filter((path) => (
+      !(observationInput.whitelist || []).some((allowed) => observationPathIsCovered(path, allowed))
+    ));
+    if (outside.length) {
+      throw new Error(`Pipeline config.observationInput.blacklist DataKey “${outside[0]}” must be inside a Whitelist path.`);
+    }
+  }
+  const byId = new Map(descriptors
+    .filter(({ scope }) => scope === "module")
+    .map((descriptor) => [descriptor.instanceId, descriptor]));
+  Object.entries(moduleOverrides).forEach(([instanceId, override]) => {
+    const descriptor = byId.get(instanceId);
+    if (!descriptor) throw new Error(`Unknown ${resource} Module instance: ${instanceId}`);
+    if (!isBacktestConfigObject(override)) {
+      throw new Error(`${instanceId} override must be a JSON object`);
+    }
+    if (!descriptor.configSchema) {
+      throw new Error(`${instanceId} is missing its exact Module configSchema`);
+    }
+    forms.validateSchemaValue(
+      mergeBacktestConfig(descriptor.config, override),
+      descriptor.configSchema,
+      instanceId,
+    );
+  });
+}
+
+function setBacktestConfigLoading(loading) {
+  $("backtestConfigLoading").hidden = !loading;
+  $("backtestConfigWorkbench").hidden = loading;
+  $("applyBacktestSamplerConfigBtn").disabled = loading;
+  $("resetBacktestConfigBtn").disabled = loading;
+}
+
+function backtestConfigPresentationAlias(value) {
+  const exact = String(value ?? "");
+  for (const [alias, canonical] of activeBacktestConfigPresentationAliases.entries()) {
+    if (canonical === exact) return alias;
+  }
+  const kind = forms.opaqueMachineIdentityKind?.(exact) || "Technical reference";
+  let sequence = activeBacktestConfigPresentationAliases.size + 1;
+  let alias = `${kind} (${sequence})`;
+  while (activeBacktestConfigPresentationAliases.has(alias)) {
+    sequence += 1;
+    alias = `${kind} (${sequence})`;
+  }
+  activeBacktestConfigPresentationAliases.set(alias, exact);
+  return alias;
+}
+
+function backtestConfigPresentationDraft(value) {
+  const visit = (current) => {
+    if (Array.isArray(current)) return current.map(visit);
+    if (!current || typeof current !== "object") {
+      if (typeof current !== "string") return current;
+      return visibleText(current) === current ? current : backtestConfigPresentationAlias(current);
+    }
+    return Object.fromEntries(Object.entries(current).map(([key, child]) => [
+      forms.opaqueMachineIdentityKind?.(key) ? backtestConfigPresentationAlias(key) : key,
+      visit(child),
+    ]));
+  };
+  return visit(value);
+}
+
+function restoreBacktestConfigPresentationDraft(value) {
+  const visit = (current) => {
+    if (Array.isArray(current)) return current.map(visit);
+    if (!current || typeof current !== "object") {
+      return typeof current === "string" && activeBacktestConfigPresentationAliases.has(current)
+        ? activeBacktestConfigPresentationAliases.get(current)
+        : current;
+    }
+    return Object.fromEntries(Object.entries(current).map(([key, child]) => [
+      activeBacktestConfigPresentationAliases.get(key) || key,
+      visit(child),
+    ]));
+  };
+  return visit(value);
+}
+
+function syncBacktestConfigJsonFromDraft() {
+  activeBacktestConfigPresentationAliases = new Map();
+  $("backtestConfigJson").value = JSON.stringify(backtestConfigPresentationDraft(activeBacktestConfigDraft), null, 2);
+  activeBacktestConfigJsonDirty = false;
+}
+
+function renderBacktestConfigMode() {
+  const sampler = activeBacktestConfigResource === "sampler";
+  $("backtestConfigModeBadge").textContent = sampler ? "Complete parameters" : "Sparse override";
+  $("backtestConfigInstanceHeading").textContent = sampler
+    ? "Sampler"
+    : (activeBacktestConfigResource === "pipeline" ? "Resource + Modules" : "Module instances");
+  $("backtestConfigJsonHeading").textContent = sampler ? "Sampler Parameters JSON" : "Backtest Configuration JSON";
+  $("backtestConfigJsonHint").textContent = sampler
+    ? "This object replaces the complete Sampler parameters for this Backtest."
+    : "Resource config and inner Module config stay in separate override objects. Objects merge recursively; arrays and scalar values replace defaults.";
+  $("backtestConfigInstanceSearch").hidden = sampler;
+}
+
+function backtestConfigDescriptorOverride(descriptor) {
+  if (!descriptor) return undefined;
+  if (descriptor.scope === "sampler") return activeBacktestConfigDraft;
+  if (descriptor.scope === "resource") return activeBacktestConfigDraft.configOverride;
+  return activeBacktestConfigDraft.moduleConfigOverrides?.[descriptor.instanceId];
+}
+
+function backtestConfigDescriptorIsOverridden(descriptor) {
+  if (descriptor?.scope === "sampler") {
+    return !backtestConfigEqual(activeBacktestConfigDraft, descriptor.config);
+  }
+  const override = backtestConfigDescriptorOverride(descriptor);
+  return isBacktestConfigObject(override) && Object.keys(override).length > 0;
+}
+
+function renderBacktestConfigInstanceList() {
+  const list = $("backtestConfigInstanceList");
+  const descriptors = backtestConfigDescriptors();
+  const query = $("backtestConfigInstanceSearch").value.trim().toLowerCase();
+  const visible = descriptors.filter((descriptor) => (
+    !query || `${descriptor.instanceId} ${descriptor.name} ${descriptor.moduleId}`.toLowerCase().includes(query)
+  ));
+  $("backtestConfigInstanceCount").textContent = `${descriptors.length}`;
+  list.innerHTML = visible.length
+    ? visible.map((descriptor) => {
+      const overridden = backtestConfigDescriptorIsOverridden(descriptor);
+      const active = descriptor.instanceId === activeBacktestConfigInstanceId
+        && descriptor.scope === activeBacktestConfigScope;
+      const descriptorName = visibleText(descriptor.name, `${forms.humanizeName(descriptor.scope)} configuration`);
+      const descriptorMeta = `${forms.humanizeName(visibleText(descriptor.scope, "Configuration"))} · ${visibleVersionLabel(descriptor.version)}`;
+      return `<button class="backtest-config-instance${active ? " active" : ""}${overridden ? " overridden" : ""}" type="button" data-backtest-config-instance="${escapeHtml(descriptor.instanceId)}" data-backtest-config-scope="${escapeHtml(descriptor.scope)}">
+        <span>${escapeHtml(descriptorName)}</span>
+        <small title="${escapeHtml(descriptorMeta)}">${escapeHtml(descriptorMeta)}</small>
+        <em>${overridden ? "Override" : "Default"}</em>
+      </button>`;
+    }).join("")
+    : '<div class="muted backtest-config-empty">No matching Module instances</div>';
+}
+
+function renderBacktestConfigFieldsHeader(descriptor) {
+  const sampler = descriptor.scope === "sampler";
+  const overridden = backtestConfigDescriptorIsOverridden(descriptor);
+  $("backtestConfigFieldsHeader").innerHTML = `<div>
+      <strong>${escapeHtml(visibleText(descriptor.name, `${forms.humanizeName(descriptor.scope)} configuration`))}</strong>
+      <span title="Versioned ${escapeHtml(forms.humanizeName(visibleText(descriptor.scope, "Configuration")))} configuration">${escapeHtml(forms.humanizeName(visibleText(descriptor.scope, "Configuration")))} · ${escapeHtml(visibleVersionLabel(descriptor.version))}</span>
+    </div>
+    <div class="backtest-config-field-actions">
+      <span class="backtest-config-state${overridden ? " overridden" : ""}">${overridden ? "Overridden" : "Version default"}</span>
+      <button id="resetBacktestConfigInstanceBtn" type="button" ${overridden ? "" : "disabled"}>${descriptor.scope === "resource" ? "Reset config" : "Reset instance"}</button>
+    </div>`;
+  $("resetBacktestConfigInstanceBtn")?.addEventListener("click", () => {
+    if (sampler) activeBacktestConfigDraft = structuredClone(descriptor.config);
+    else {
+      const next = structuredClone(activeBacktestConfigDraft);
+      if (descriptor.scope === "resource") next.configOverride = {};
+      else delete next.moduleConfigOverrides?.[descriptor.instanceId];
+      activeBacktestConfigDraft = next;
+    }
+    syncBacktestConfigJsonFromDraft();
+    renderBacktestConfigWorkbench();
+    setBacktestConfigError("");
+  });
+}
+
+function renderBacktestConfigFields() {
+  const descriptor = selectedBacktestConfigDescriptor();
+  const fields = $("backtestConfigFields");
+  if (!descriptor) {
+    $("backtestConfigFieldsHeader").innerHTML = '<strong>No configurable Module instances</strong>';
+    fields.innerHTML = '<div class="muted">The selected resource contains no Module instances.</div>';
+    $("backtestConfigDefaultDetails").hidden = true;
+    return;
+  }
+  activeBacktestConfigInstanceId = descriptor.instanceId;
+  activeBacktestConfigScope = descriptor.scope;
+  renderBacktestConfigFieldsHeader(descriptor);
+  $("backtestConfigDefaultDetails").hidden = false;
+  $("backtestConfigDefaultJson").textContent = visibleJsonText(descriptor.config);
+  if (!descriptor.configSchema) {
+    fields.innerHTML = '<div class="dialog-error">Exact Module configSchema is unavailable.</div>';
+    return;
+  }
+  const effective = descriptor.scope === "sampler"
+    ? activeBacktestConfigDraft
+    : mergeBacktestConfig(
+      descriptor.config,
+      backtestConfigDescriptorOverride(descriptor) || {},
+    );
+  forms.renderSchemaFields(fields, descriptor.configSchema, effective);
+  fields.onchange = () => {
+    try {
+      commitBacktestConfigFields();
+      setBacktestConfigError("");
+    } catch (error) {
+      setBacktestConfigError(error?.message || "Invalid Module configuration");
+    }
+  };
+}
+
+function renderBacktestConfigWorkbench() {
+  renderBacktestConfigMode();
+  renderBacktestConfigInstanceList();
+  renderBacktestConfigFields();
+}
+
+function commitBacktestConfigFields() {
+  const descriptor = selectedBacktestConfigDescriptor();
+  if (!descriptor?.configSchema) return;
+  const effective = forms.readSchemaFields($("backtestConfigFields"), descriptor.configSchema);
+  if (descriptor.scope === "sampler") {
+    activeBacktestConfigDraft = effective;
+  } else {
+    const next = structuredClone(activeBacktestConfigDraft);
+    const sparse = sparseBacktestConfig(descriptor.config, effective);
+    const empty = sparse === undefined || (isBacktestConfigObject(sparse) && !Object.keys(sparse).length);
+    if (descriptor.scope === "resource") {
+      next.configOverride = empty ? {} : sparse;
+    } else if (empty) {
+      delete next.moduleConfigOverrides?.[descriptor.instanceId];
+    } else {
+      next.moduleConfigOverrides ||= {};
+      next.moduleConfigOverrides[descriptor.instanceId] = sparse;
+    }
+    activeBacktestConfigDraft = next;
+  }
+  validateBacktestConfigDraft(activeBacktestConfigResource, activeBacktestConfigDraft);
+  syncBacktestConfigJsonFromDraft();
+  renderBacktestConfigInstanceList();
+  renderBacktestConfigFieldsHeader(descriptor);
+}
+
+function readBacktestConfigJsonDraft() {
+  let value;
+  try {
+    value = restoreBacktestConfigPresentationDraft(JSON.parse($("backtestConfigJson").value || "{}"));
+  } catch (error) {
+    throw new Error(`Configuration must be valid JSON: ${error?.message || "parse failed"}`);
+  }
+  validateBacktestConfigDraft(activeBacktestConfigResource, value);
+  activeBacktestConfigDraft = activeBacktestConfigResource === "sampler"
+    ? structuredClone(value)
+    : {
+      ...(activeBacktestConfigResource === "pipeline"
+        ? { configOverride: structuredClone(value.configOverride || {}) }
+        : {}),
+      moduleConfigOverrides: structuredClone(value.moduleConfigOverrides || {}),
+    };
+  activeBacktestConfigJsonDirty = false;
+  const descriptors = backtestConfigDescriptors();
+  if (!descriptors.some((descriptor) => (
+    descriptor.instanceId === activeBacktestConfigInstanceId
+      && descriptor.scope === activeBacktestConfigScope
+  ))) {
+    activeBacktestConfigInstanceId = descriptors[0]?.instanceId || "";
+    activeBacktestConfigScope = descriptors[0]?.scope || "";
+  }
+  renderBacktestConfigWorkbench();
+  return value;
+}
+
+function renderBacktestGraphConfigMeta(resource) {
+  const target = $(`chain${resource[0].toUpperCase()}${resource.slice(1)}ConfigMeta`);
+  if (!target) return;
+  const draft = backtestConfigValue(resource);
+  const moduleCount = Object.keys(draft.moduleConfigOverrides || {}).length;
+  const resourceOverridden = resource === "pipeline"
+    && Object.keys(draft.configOverride || {}).length > 0;
+  target.textContent = [
+    resourceOverridden ? "Pipeline config override" : "",
+    moduleCount ? `${moduleCount} Module override${moduleCount === 1 ? "" : "s"}` : "",
+  ].filter(Boolean).join(" · ") || "Using versioned defaults";
+}
+
+async function openBacktestConfig(resource) {
+  const selection = backtestConfigSelection(resource);
+  if (!selection) return;
+  activeBacktestConfigResource = resource;
+  activeBacktestConfigInstanceId = "";
+  activeBacktestConfigScope = "";
+  activeBacktestConfigDraft = structuredClone(backtestConfigValue(resource));
+  activeBacktestConfigJsonDirty = false;
+  const label = resource === "analysis"
+    ? "Analysis"
+    : `${resource[0].toUpperCase()}${resource.slice(1)}`;
+  $("backtestSamplerConfigTitle").textContent = `Configure ${label}`;
+  $("backtestSamplerConfigDescription").textContent = resource === "sampler"
+    ? `${visibleResourceName(selection, "Sampler")} · ${visibleVersionLabel(selection.version)} · Backtest parameters`
+    : `${visibleResourceName(selection, label)} · ${visibleVersionLabel(selection.version)} · versioned resource and Module defaults with Backtest overrides`;
+  $("backtestConfigInstanceSearch").value = "";
+  syncBacktestConfigJsonFromDraft();
+  setBacktestConfigError("");
+  setBacktestConfigLoading(true);
+  const dialog = $("backtestSamplerConfigDialog");
+  dialog.showModal();
+  try {
+    await ensureBacktestConfigModuleContracts(resource);
+    if (!dialog.open || activeBacktestConfigResource !== resource) return;
+    const descriptors = backtestConfigDescriptors(resource);
+    activeBacktestConfigInstanceId = descriptors[0]?.instanceId || "";
+    activeBacktestConfigScope = descriptors[0]?.scope || "";
+    validateBacktestConfigDraft(resource, activeBacktestConfigDraft);
+    renderBacktestConfigWorkbench();
+    setBacktestConfigLoading(false);
+  } catch (error) {
+    setBacktestConfigLoading(false);
+    $("backtestConfigWorkbench").hidden = true;
+    $("applyBacktestSamplerConfigBtn").disabled = true;
+    $("resetBacktestConfigBtn").disabled = true;
+    setBacktestConfigError(error?.message || "Unable to load exact Module contracts");
+  }
 }
 
 function renderBacktestEnvironmentParameters({ reset = false } = {}) {
@@ -5441,10 +6687,31 @@ function renderBacktestEnvironmentParameters({ reset = false } = {}) {
   const environmentKey = environment ? `${environment.environmentId}::${environment.version}` : "";
   if (reset || backtestEntryState.environmentKey !== environmentKey) {
     backtestEntryState.environmentKey = environmentKey;
+    backtestEntryState.environmentModuleConfigOverrides = {};
   }
-  const moduleCount = environment?.graph?.nodes?.length || 0;
-  const outputCount = Object.keys(environment?.graph?.outputs || {}).length;
-  $("chainEnvironmentConfigMeta").textContent = `${moduleCount} graph nodes · ${outputCount} Pipeline outputs`;
+  renderBacktestGraphConfigMeta("environment");
+}
+
+function renderBacktestPipelineParameters({ reset = false } = {}) {
+  const key = backtestEntryState.pipelineId
+    ? `${backtestEntryState.pipelineId}::${backtestEntryState.pipelineVersion}`
+    : "";
+  if (reset || backtestEntryState.pipelineConfigKey !== key) {
+    backtestEntryState.pipelineConfigKey = key;
+    backtestEntryState.pipelineConfigOverride = {};
+    backtestEntryState.pipelineModuleConfigOverrides = {};
+  }
+  renderBacktestGraphConfigMeta("pipeline");
+}
+
+function renderBacktestAnalysisParameters({ reset = false } = {}) {
+  const analysis = selectedBacktestAnalysis();
+  const key = analysis ? `${analysis.analysisId}::${analysis.version}` : "";
+  if (reset || backtestEntryState.analysisKey !== key) {
+    backtestEntryState.analysisKey = key;
+    backtestEntryState.analysisModuleConfigOverrides = {};
+  }
+  renderBacktestGraphConfigMeta("analysis");
 }
 
 function buildBacktestCompositionRequest() {
@@ -5459,7 +6726,12 @@ function buildBacktestCompositionRequest() {
   if (!datasetId || !dataset || !datasetEvidence || !sampler || !environment || !analysis
       || !pipelineId || !pipelineVersion || !state.pipelines?.[pipelineId]) return null;
   return {
-    pipeline: { pipelineId, version: pipelineVersion },
+    pipeline: {
+      pipelineId,
+      version: pipelineVersion,
+      configOverride: structuredClone(backtestEntryState.pipelineConfigOverride || {}),
+      moduleConfigOverrides: structuredClone(backtestEntryState.pipelineModuleConfigOverrides || {}),
+    },
     datasetId,
     datasetVersionId: datasetEvidence.datasetVersionId,
     sampler: {
@@ -5470,10 +6742,12 @@ function buildBacktestCompositionRequest() {
     environment: {
       environmentId: environment.environmentId,
       version: environment.version,
+      moduleConfigOverrides: structuredClone(backtestEntryState.environmentModuleConfigOverrides || {}),
     },
     analysis: {
       analysisId: analysis.analysisId,
       version: analysis.version,
+      moduleConfigOverrides: structuredClone(backtestEntryState.analysisModuleConfigOverrides || {}),
     },
   };
 }
@@ -5491,7 +6765,7 @@ function renderBacktestCompositionStatus() {
     submitting: "Submitting Backtest",
     submitted: "Backtest queued",
   };
-  status.textContent = backtestEntryState.compositionMessage;
+  status.textContent = visibleText(backtestEntryState.compositionMessage);
   status.dataset.state = validation;
   status.classList.toggle("dialog-error", validation === "invalid");
   status.classList.toggle("muted", validation !== "invalid");
@@ -5517,7 +6791,7 @@ function backtestRequestFingerprint(request) {
 
 let backtestBuildExpiryTimer = 0;
 let backtestBuildSelectionRestoreAttempted = false;
-const BACKTEST_BUILD_CACHE_KEY = "trade.backtest.build.v1";
+const BACKTEST_BUILD_CACHE_KEY = "trade.backtest.build.v2";
 
 function readPersistedBacktestBuildCache() {
   try {
@@ -5612,10 +6886,15 @@ function restoreBacktestControlsFromBuildCache() {
   });
   backtestEntryState.pipelineId = request.pipeline.pipelineId;
   backtestEntryState.pipelineVersion = request.pipeline.version;
+  backtestEntryState.pipelineConfigKey = values.pipeline;
+  backtestEntryState.pipelineConfigOverride = structuredClone(request.pipeline.configOverride || {});
+  backtestEntryState.pipelineModuleConfigOverrides = structuredClone(request.pipeline.moduleConfigOverrides || {});
   backtestEntryState.samplerKey = values.sampler;
   backtestEntryState.samplerParameters = structuredClone(request.sampler.parameters || {});
   backtestEntryState.environmentKey = values.environment;
+  backtestEntryState.environmentModuleConfigOverrides = structuredClone(request.environment.moduleConfigOverrides || {});
   backtestEntryState.analysisKey = values.analysis;
+  backtestEntryState.analysisModuleConfigOverrides = structuredClone(request.analysis.moduleConfigOverrides || {});
   return true;
 }
 
@@ -5779,7 +7058,7 @@ function renderBacktestChain() {
       ? `${datasetEvidenceSummary(datasetEvidence)} · evidence locked automatically`
       : "No sealed evidence available";
   $("chainSamplerMeta").textContent = sampler
-    ? `${sampler.type} · v${sampler.version}`
+    ? `${visibleText(sampler.type, "Sampler")} · ${visibleVersionLabel(sampler.version)}`
     : "DataKey mapping";
   const samplerOpenButton = $("chainSampler");
   const samplerReadOnly = !!sampler?.builtin;
@@ -5793,13 +7072,13 @@ function renderBacktestChain() {
         ? "This Sampler type cannot be edited"
         : "Open an isolated Jupyter edit Workspace";
   $("chainEnvironmentMeta").textContent = environment
-    ? `${environment.environmentId} · v${environment.version}`
+    ? `${visibleResourceName(environment, "Environment")} · ${visibleVersionLabel(environment.version)}`
     : "Select an Environment";
   $("chainAnalysisMeta").textContent = analysis
-    ? `${analysis.analysisId} · v${analysis.version}`
+    ? `${visibleResourceName(analysis, "Analysis")} · ${visibleVersionLabel(analysis.version)}`
     : "Select an Analysis";
   $("chainPipelineMeta").textContent = pipelineId
-    ? `${pipelineId} · v${pipelineVersion}`
+    ? `${visibleResourceName(pipeline, "Pipeline")} · ${visibleVersionLabel(pipelineVersion)}`
     : "Select a Pipeline";
   requestAnimationFrame(drawBacktestGraphEdges);
   const request = buildBacktestCompositionRequest();
@@ -5857,6 +7136,14 @@ function syncBacktestRunState() {
       || typeof backtestEntryState.samplerParameters !== "object") {
     disabled = true;
     title = "Sampler parameters are invalid";
+  } else if ([
+    backtestEntryState.pipelineConfigOverride,
+    backtestEntryState.pipelineModuleConfigOverrides,
+    backtestEntryState.environmentModuleConfigOverrides,
+    backtestEntryState.analysisModuleConfigOverrides,
+  ].some((value) => !value || Array.isArray(value) || typeof value !== "object")) {
+    disabled = true;
+    title = "Backtest config overrides are invalid";
   } else if (backtestEntryState.compositionValidation === "pending") {
     disabled = true;
     title = "Engine is checking the configuration";
@@ -5878,7 +7165,7 @@ function syncBacktestRunState() {
     }
   }
   button.disabled = disabled;
-  button.title = title;
+  button.title = visibleText(title);
   button.textContent = label;
 }
 
@@ -5886,20 +7173,33 @@ function currentResultBacktestId() {
   return state.resultBacktestId || "";
 }
 
+function currentResultViewError(backtestId = currentResultBacktestId()) {
+  const error = state.resultViewError;
+  return error?.backtestId === backtestId ? error : null;
+}
+
 function syncResultsActionState() {
   const backtestId = currentResultBacktestId();
   const addChartButton = $("addChartBtn");
   const saveSpecButton = $("saveVisualizationBtn");
   const hasBacktest = !!backtestId;
-  setResultsActionError(hasBacktest ? "" : "Open a completed Result from the Backtest Browser.");
+  const hasLoadedBacktest = !!state.selectedBacktest && state.selectedBacktest.backtestId === backtestId;
+  const loadError = currentResultViewError(backtestId);
+  setResultsActionError(loadError
+    ? `Result could not be loaded: ${loadError.message}`
+    : (hasBacktest ? "" : "Open a completed Result from the Backtest Browser."));
   if (addChartButton) {
-    addChartButton.disabled = !hasBacktest;
-    addChartButton.title = hasBacktest ? "" : "Open a Result from the Backtest Browser first";
+    addChartButton.disabled = !hasLoadedBacktest;
+    addChartButton.title = hasLoadedBacktest
+      ? ""
+      : (loadError ? "Retry loading the Result first" : "Open a Result from the Backtest Browser first");
   }
   if (!saveSpecButton) return;
-  if (!hasBacktest) {
+  if (!hasLoadedBacktest) {
     saveSpecButton.disabled = true;
-    saveSpecButton.title = "Open a Result from the Backtest Browser first";
+    saveSpecButton.title = loadError
+      ? "Retry loading the Result first"
+      : "Open a Result from the Backtest Browser first";
     return;
   }
   try {
@@ -5910,10 +7210,6 @@ function syncResultsActionState() {
     saveSpecButton.disabled = true;
     saveSpecButton.title = "Fix visualization JSON first";
   }
-}
-
-function formatPercent(value) {
-  return typeof value === "number" ? `${(value * 100).toFixed(2)}%` : "-";
 }
 
 function formatNumber(value) {
@@ -5936,10 +7232,10 @@ function renderHistory() {
     item.className = "event";
     item.innerHTML = `
       <div class="event-title">
-        <span>${event.type || "event"}</span>
+        <span>${escapeHtml(visibleText(event.type || "event", "Event"))}</span>
         <span class="muted">${formatTime(event.timestamp)}</span>
       </div>
-      <pre>${JSON.stringify(event.payload || {}, null, 2)}</pre>
+      <pre>${escapeHtml(visibleJsonText(event.payload || {}))}</pre>
     `;
     node.appendChild(item);
   });
@@ -5952,25 +7248,119 @@ function renderManifest() {
   const pipeline = state.pipelines?.[pipelineId] || {};
   const meta = $("pipelineManifestMeta");
   if (meta) {
-    const identity = pipeline.name || pipelineId;
-    meta.textContent = identity === pipelineId ? pipelineId : `${identity} · ${pipelineId}`;
+    meta.textContent = `${visibleResourceName(pipeline, "Pipeline")} · ${visibleVersionLabel(pipelineEditorState.loadedVersion || pipeline.currentVersion)}`;
   }
-  target.textContent = JSON.stringify(pipelineEditorState.manifest || {}, null, 2);
+  target.textContent = visibleJsonText(pipelineEditorState.manifest || {});
 }
 
 function normalizeVisualizationSpec(result, spec) {
   return window.TradeChartCore.normalizeVisualizationSpec(result, spec);
 }
 
+function failOpenResultVisualizationSpec(result, rawSpec) {
+  let fallbackSpec;
+  try {
+    fallbackSpec = structuredClone(rawSpec || {});
+  } catch {
+    fallbackSpec = rawSpec || {};
+  }
+  try {
+    return {
+      spec: normalizeVisualizationSpec(result, fallbackSpec),
+      changed: false,
+      error: null,
+    };
+  } catch (error) {
+    console.error("Visualization spec normalization failed", error);
+    return { spec: fallbackSpec, changed: false, error };
+  }
+}
+
+function compactResultVersion(value) {
+  const text = String(value || "");
+  if (!text) return "";
+  return (forms.opaqueMachineIdentityKind?.(text) || text.includes("@sha256:"))
+    ? "Sealed version"
+    : visibleText(text);
+}
+
+function resultContextResource(kind, identity, chainRecord = {}) {
+  const records = {
+    Dataset: state.datasets || [],
+    Sampler: state.samplers || [],
+    Pipeline: Object.values(state.pipelines || {}),
+    Environment: state.environments || [],
+    Analyzer: state.analyses || [],
+  }[kind] || [];
+  const identityFields = {
+    Dataset: "datasetId",
+    Sampler: "samplerId",
+    Pipeline: "pipelineId",
+    Environment: "environmentId",
+    Analyzer: "analysisId",
+  };
+  return records.find((record) => record?.[identityFields[kind]] === identity)
+    || chainRecord
+    || {};
+}
+
+function renderResultContext(backtest = state.selectedBacktest) {
+  const target = $("resultContextBar");
+  if (!target) return;
+  if (!backtest) {
+    target.innerHTML = "";
+    return;
+  }
+  const chain = backtest.executionSummary || {};
+  const resources = [
+    ["Dataset", chain.dataset?.datasetId || backtest.datasetId, chain.dataset, compactResultVersion(chain.dataset?.datasetVersionId)],
+    ["Sampler", chain.sampler?.samplerId, chain.sampler, chain.sampler?.version ? visibleVersionLabel(chain.sampler.version) : ""],
+    ["Pipeline", chain.pipeline?.pipelineId || backtest.pipelineId, chain.pipeline, chain.pipeline?.version ? visibleVersionLabel(chain.pipeline.version) : ""],
+    ["Environment", chain.environment?.environmentId, chain.environment, chain.environment?.version ? visibleVersionLabel(chain.environment.version) : ""],
+    ["Analyzer", chain.analysis?.analysisId, chain.analysis, chain.analysis?.version ? visibleVersionLabel(chain.analysis.version) : ""],
+  ];
+  const items = [
+    ["Backtest", visibleResourceName(backtest, "Completed Backtest"), forms.humanizeName(visibleText(backtest.status || "completed", "Completed"))],
+    ...resources.map(([kind, identity, chainRecord, detail]) => [
+      kind,
+      visibleResourceName(resultContextResource(kind, identity, chainRecord), kind),
+      detail,
+    ]),
+  ];
+  target.innerHTML = items.map(([label, name, detail]) => `
+    <div class="result-context-item">
+      <dt>${escapeHtml(label)}</dt>
+      <dd title="${escapeHtml(name || "Unavailable")}">
+        <strong>${escapeHtml(name || "Unavailable")}</strong>
+        ${detail ? `<span>${escapeHtml(detail)}</span>` : ""}
+      </dd>
+    </div>
+  `).join("");
+}
+
+function renderResultViewLoadError(error, { replace = false } = {}) {
+  const area = $("chartArea");
+  if (!area || !error) return;
+  const failure = `<div class="chart-load-error result-view-load-error" role="alert"><span>${escapeHtml(visibleText(error.message, "The Result view is unavailable."))}</span><button type="button" data-retry-result-view>Retry</button></div>`;
+  if (replace) {
+    area.innerHTML = `<section class="chart-panel result-load-failure"><div class="chart-title"><span>Result unavailable</span></div>${failure}</section>`;
+  } else {
+    area.insertAdjacentHTML("afterbegin", failure);
+  }
+  area.querySelector("[data-retry-result-view]")?.addEventListener("click", (event) => {
+    event.currentTarget.disabled = true;
+    void runUiAction("Loading Result", () => refreshSelectedBacktest());
+  });
+}
+
 function renderResults() {
   const backtestId = currentResultBacktestId();
+  const loadError = currentResultViewError(backtestId);
   const title = $("resultTitle");
-  const meta = $("resultMeta");
-  if (title) title.textContent = state.selectedBacktest?.name || "Result";
-  if (meta) meta.textContent = backtestId ? `Backtest · ${backtestId}` : "";
+  if (title) title.textContent = visibleResourceName(state.selectedBacktest, "Backtest Result");
   if (!backtestId) {
     clearResultCharts();
-    $("metricStrip").innerHTML = "";
+    renderResultContext(null);
     $("chartArea").innerHTML = "";
     $("visualizationSpec").value = "";
     setVisualizationSpecError("");
@@ -5981,41 +7371,27 @@ function renderResults() {
   setResultsActionError("");
   if (!state.selectedBacktest || state.selectedBacktest.backtestId !== backtestId) {
     clearResultCharts();
-    $("metricStrip").innerHTML = "";
-    $("chartArea").innerHTML = '<div class="muted">Loading selected backtest</div>';
+    renderResultContext(null);
+    if (loadError) {
+      renderResultViewLoadError(loadError, { replace: true });
+    } else {
+      $("chartArea").innerHTML = '<div class="muted">Loading selected backtest</div>';
+    }
     syncResultsActionState();
     return;
   }
-  const metrics = state.selectedBacktest.metrics || {};
-  const findPerformance = (value) => {
-    if (!value || typeof value !== "object") return null;
-    if (["annualizedReturn", "sharpeRatio", "maxDrawdown"].some((key) => key in value)) {
-      return value;
-    }
-    for (const child of Object.values(value)) {
-      const match = findPerformance(child);
-      if (match) return match;
-    }
-    return null;
-  };
-  const performance = findPerformance(metrics.analysis) || {};
-  const chain = state.selectedBacktest.executionSummary || {};
-  $("metricStrip").innerHTML = [
-    ["Cycles", metrics.cycleCount ?? "-"],
-    ["Annualized", formatPercent(performance.annualizedReturn)],
-    ["Sharpe", typeof performance.sharpeRatio === "number" ? performance.sharpeRatio.toFixed(3) : "-"],
-    ["Max Drawdown", formatPercent(performance.maxDrawdown)],
-    ["Dataset", chain.dataset?.datasetId || state.selectedBacktest.datasetId || "-"],
-    ["Sampler", chain.sampler ? `${chain.sampler.samplerId}@${chain.sampler.version}` : "-"],
-    ["Status", state.selectedBacktest.status || "completed"],
-  ].map(([label, value]) => `<div><span>${label}</span><strong>${value}</strong></div>`).join("");
-  const spec = normalizeVisualizationSpec({ dataKeys: state.selectedBacktest.dataKeys || {} }, state.selectedBacktest.visualization || {});
+  renderResultContext();
+  const styleNormalization = failOpenResultVisualizationSpec(
+    { dataKeys: state.selectedBacktest.dataKeys || {} },
+    state.selectedBacktest.visualization || {},
+  );
+  const spec = styleNormalization.spec;
   state.selectedBacktest.visualization = spec;
-  syncResultTimezoneButton(spec);
   $("visualizationSpec").value = JSON.stringify(spec, null, 2);
-  setVisualizationSpecError("");
+  setVisualizationSpecError(styleNormalization.error?.message || "");
   syncResultsActionState();
   drawVisualization(spec);
+  if (loadError) renderResultViewLoadError(loadError);
 }
 
 function syncVisualizationSpec(spec) {
@@ -6027,82 +7403,360 @@ function syncVisualizationSpec(spec) {
   scheduleVisualizationSave(spec);
 }
 
-function paneResult(pane) {
-  const slice = state.selectedBacktest?.paneResults?.[pane.id] || {};
-  return {
-    dataKeys: state.selectedBacktest?.dataKeys || {},
-    ...slice,
-  };
+function instanceValueMap(source = null) {
+  const result = Object.create(null);
+  for (const [key, value] of Object.entries(source || {})) {
+    Object.defineProperty(result, key, {
+      value, enumerable: true, configurable: true, writable: true,
+    });
+  }
+  return result;
 }
 
-function paneRequestKey(pane, spec) {
-  const baseResult = { dataKeys: state.selectedBacktest?.dataKeys || {} };
-  const scoped = paneScopedSpec(spec, pane);
-  const paths = window.TradeChartCore.collectPaneSourcePaths(baseResult, pane, scoped);
-  return JSON.stringify({
-    paths,
-    visualizers: pane?.visualizers || [],
-    temporaryModules: pane?.temporaryModules || [],
+function setInstanceValue(target, visualizerId, value) {
+  Object.defineProperty(target, String(visualizerId || ""), {
+    value, enumerable: true, configurable: true, writable: true,
   });
 }
 
-function paneHasLoaded(pane, spec) {
-  return state.selectedBacktest?.loadedPanes?.[pane.id] === paneRequestKey(pane, spec);
+function paneResultRequest(pane, spec) {
+  const baseResult = { dataKeys: state.selectedBacktest?.dataKeys || {} };
+  const scoped = paneScopedSpec(spec, pane);
+  const plans = window.TradeChartCore.visualizerDependencyPlan(baseResult, pane, scoped)
+    .map((plan) => ({
+      visualizerId: String(plan.visualizerId || ""),
+      paths: [...(plan.paths || [])].sort(),
+      temporaryModules: plan.temporaryModules || [],
+      planningError: plan.planningError || null,
+    }))
+    .filter((plan) => plan.planningError || plan.paths.length || plan.temporaryModules.length)
+    .map((plan) => ({
+      ...plan,
+      dependencyKey: JSON.stringify({
+        paths: plan.paths,
+        temporaryModules: plan.temporaryModules,
+        planningError: plan.planningError,
+      }),
+    }))
+    .sort((left, right) => left.visualizerId.localeCompare(right.visualizerId));
+  return { plans };
 }
 
-async function ensurePaneResultLoaded(pane, spec) {
+function paneProjectionCache(owner, paneId, { create = true } = {}) {
+  if (!owner) return null;
+  if (!(owner.paneProjectionCaches instanceof Map)) {
+    if (!create) return null;
+    owner.paneProjectionCaches = new Map();
+  }
+  let cache = owner.paneProjectionCaches.get(paneId);
+  if (!cache && create) {
+    cache = { entries: new Map(), generation: 0, planningError: null };
+    owner.paneProjectionCaches.set(paneId, cache);
+  }
+  return cache || null;
+}
+
+function abortVisualizerProjection(entry) {
+  try { entry?.controller?.abort?.(); } catch { /* best-effort cancellation */ }
+}
+
+function abortPaneProjectionCache(cache) {
+  for (const entry of cache?.entries?.values?.() || []) abortVisualizerProjection(entry);
+}
+
+function reconcilePaneProjectionCache(cache, request) {
+  const plansById = new Map(request.plans.map((plan) => [plan.visualizerId, plan]));
+  for (const [visualizerId, entry] of cache.entries) {
+    const plan = plansById.get(visualizerId);
+    if (plan && entry.dependencyKey === plan.dependencyKey) continue;
+    abortVisualizerProjection(entry);
+    cache.entries.delete(visualizerId);
+  }
+}
+
+function currentPaneProjection(owner, pane, spec) {
+  const cache = paneProjectionCache(owner, pane.id);
+  try {
+    const request = paneResultRequest(pane, spec);
+    cache.planningError = null;
+    reconcilePaneProjectionCache(cache, request);
+    return { cache, request };
+  } catch (error) {
+    cache.planningError = {
+      message: error?.message || "Chart data dependencies could not be planned",
+    };
+    return { cache, request: null };
+  }
+}
+
+function paneProjectionWrapper(cache, request = null) {
+  const instanceResults = instanceValueMap();
+  const errors = instanceValueMap();
+  const plans = request?.plans || [...cache.entries].map(([visualizerId, entry]) => ({
+    visualizerId, dependencyKey: entry.dependencyKey,
+  }));
+  for (const plan of plans) {
+    const entry = cache.entries.get(plan.visualizerId);
+    if (!entry || entry.dependencyKey !== plan.dependencyKey) continue;
+    if (entry.status === "ready") {
+      setInstanceValue(instanceResults, plan.visualizerId, entry.result || {});
+    } else if (entry.status === "error") {
+      setInstanceValue(errors, plan.visualizerId, entry.error || {
+        message: "Chart data could not be loaded",
+      });
+    }
+  }
+  return { instanceResults, errors };
+}
+
+function paneResult(pane, spec = state.selectedBacktest?.visualization) {
+  const owner = state.selectedBacktest;
+  const projection = currentPaneProjection(owner, pane, spec || {});
+  return {
+    dataKeys: owner?.dataKeys || {},
+    ...paneProjectionWrapper(projection.cache, projection.request),
+  };
+}
+
+function paneHasLoaded(pane, spec) {
+  const { cache, request } = currentPaneProjection(state.selectedBacktest, pane, spec);
+  if (!request) return false;
+  return request.plans.every((plan) => {
+    const entry = cache.entries.get(plan.visualizerId);
+    return entry?.dependencyKey === plan.dependencyKey
+      && ["ready", "error"].includes(entry.status);
+  });
+}
+
+function panePendingVisualizerIds(pane, spec) {
+  const { cache, request } = currentPaneProjection(state.selectedBacktest, pane, spec);
+  if (!request) return new Set();
+  return new Set(request.plans.filter((plan) => {
+    const entry = cache.entries.get(plan.visualizerId);
+    return entry?.dependencyKey === plan.dependencyKey && entry.status === "loading";
+  }).map((plan) => plan.visualizerId));
+}
+
+async function ensurePaneResultLoaded(pane, spec, { force = false, visualizerId = "" } = {}) {
   if (!state.selectedBacktest?.backtestId || !pane?.id) return;
   const owner = state.selectedBacktest;
   const backtestId = owner.backtestId;
-  owner.paneResults ||= {};
-  owner.loadingPanes ||= {};
-  owner.loadedPanes ||= {};
-  const requestKey = paneRequestKey(pane, spec);
-  if (owner.loadingPanes[pane.id] === requestKey || owner.loadedPanes[pane.id] === requestKey) return;
-  owner.loadingPanes[pane.id] = requestKey;
-  try {
-    const parsed = JSON.parse(requestKey);
-    if (!parsed.paths.length) {
-      if (state.selectedBacktest === owner && owner.loadingPanes[pane.id] === requestKey) {
-        owner.paneResults[pane.id] = {};
-        owner.loadedPanes[pane.id] = requestKey;
+  const { cache, request } = currentPaneProjection(owner, pane, spec);
+  if (!request) return false;
+  const { plans } = request;
+  const selectedPlans = visualizerId
+    ? plans.filter((plan) => plan.visualizerId === visualizerId)
+    : plans;
+  if (visualizerId && !selectedPlans.length) return false;
+  const tasks = [];
+  let immediateChange = false;
+  for (const plan of selectedPlans) {
+    const existing = cache.entries.get(plan.visualizerId);
+    const retryExisting = force && (
+      visualizerId === plan.visualizerId
+      || (!visualizerId && existing?.status === "error")
+    );
+    if (existing?.dependencyKey === plan.dependencyKey && !retryExisting) continue;
+    if (existing) abortVisualizerProjection(existing);
+    if (plan.planningError) {
+      cache.entries.set(plan.visualizerId, {
+        dependencyKey: plan.dependencyKey,
+        generation: ++cache.generation,
+        status: "error",
+        controller: null,
+        result: null,
+        error: {
+          code: "instance-planning-error",
+          message: plan.planningError.message || "Chart data dependencies could not be planned",
+          planningCode: plan.planningError.code || "dependency-planning-error",
+        },
+      });
+      immediateChange = true;
+      continue;
+    }
+    const controller = new AbortController();
+    const entry = {
+      dependencyKey: plan.dependencyKey,
+      generation: ++cache.generation,
+      status: "loading",
+      controller,
+      result: null,
+      error: null,
+    };
+    cache.entries.set(plan.visualizerId, entry);
+    const generation = entry.generation;
+    tasks.push((async () => {
+      try {
+        const response = await postResultJson(
+          `/api/backtests/${encodeURIComponent(backtestId)}/result`,
+          { paths: plan.paths, temporaryModules: plan.temporaryModules },
+          controller,
+          "Chart data request timed out. Retry when the Result service is available.",
+        );
+        const current = cache.entries.get(plan.visualizerId);
+        if (
+          state.selectedBacktest !== owner
+          || current !== entry
+          || current.generation !== generation
+          || current.dependencyKey !== plan.dependencyKey
+        ) return;
+        entry.status = "ready";
+        entry.result = response.result || {};
+        entry.error = null;
+      } catch (error) {
+        const current = cache.entries.get(plan.visualizerId);
+        if (
+          state.selectedBacktest !== owner
+          || current !== entry
+          || current.generation !== generation
+          || current.dependencyKey !== plan.dependencyKey
+        ) return;
+        entry.status = "error";
+        entry.result = null;
+        entry.error = { message: error?.message || "Chart data could not be loaded" };
+      } finally {
+        const current = cache.entries.get(plan.visualizerId);
+        if (current === entry) entry.controller = null;
+        if (current === entry && state.selectedBacktest === owner) renderResults();
       }
-      return;
-    }
-    const response = await postJson(`/api/backtests/${encodeURIComponent(backtestId)}/result`, {
-      paths: parsed.paths,
-      temporaryModules: pane.temporaryModules || [],
-    });
-    if (state.selectedBacktest !== owner || owner.loadingPanes[pane.id] !== requestKey) return;
-    owner.paneResults[pane.id] = response.result || {};
-    owner.loadedPanes[pane.id] = requestKey;
-  } finally {
-    if (owner.loadingPanes[pane.id] === requestKey) {
-      delete owner.loadingPanes[pane.id];
-    }
-    if (state.selectedBacktest === owner) renderResults();
+    })());
   }
+  if (immediateChange) {
+    queueMicrotask(() => {
+      if (state.selectedBacktest === owner) renderResults();
+    });
+  }
+  if (!tasks.length) return true;
+  await Promise.all(tasks);
+  return true;
+}
+
+function paneLoadError(pane, spec) {
+  void spec;
+  return paneProjectionCache(state.selectedBacktest, pane?.id, { create: false })
+    ?.planningError || null;
+}
+
+function retryPaneResult(paneIndex, visualizerId = "") {
+  const owner = state.selectedBacktest;
+  const spec = owner?.visualization;
+  const pane = spec?.panes?.[paneIndex];
+  if (!owner || !pane) return;
+  if (visualizerId) {
+    void ensurePaneResultLoaded(pane, spec, { force: true, visualizerId });
+    return;
+  }
+  const cache = paneProjectionCache(owner, pane.id);
+  cache.planningError = null;
+  void ensurePaneResultLoaded(pane, spec, { force: true });
 }
 
 function scheduleVisualizationSave(spec) {
   const backtestId = currentResultBacktestId();
   if (!backtestId) return;
   const saveSeq = ++visualizationSaveSeq;
+  const snapshot = structuredClone(spec);
   clearTimeout(visualizationSaveTimer);
-  setHealth(false, "Saving visualization");
+  setHealth(true, "Saving visualization");
   visualizationSaveTimer = setTimeout(async () => {
     try {
-      await postJson("/api/visualizations", {
-        backtestId,
-        visualizationId: `${backtestId}-current`,
-        name: "current",
-        spec,
-      });
+      await enqueueVisualizationSave(backtestId, snapshot);
       if (saveSeq === visualizationSaveSeq) setHealth(true, "Online");
     } catch (error) {
       if (saveSeq === visualizationSaveSeq) setHealth(false, error.message);
     }
   }, 350);
+}
+
+function currentVisualizationRecord(records, backtestId, visualizationId) {
+  if (typeof visualizationId !== "string" || !visualizationId.trim()) {
+    throw new Error("Visualization repository response has no currentVisualizationId.");
+  }
+  const matches = (records || []).filter((record) => (
+    record?.visualizationId === visualizationId
+    && record?.backtestId === backtestId
+  ));
+  if (matches.length > 1) {
+    throw new Error(`Visualization '${visualizationId}' is not unique.`);
+  }
+  const record = matches[0] || null;
+  if (record && (!Number.isSafeInteger(record.revision) || record.revision < 1)) {
+    throw new Error(`Visualization '${visualizationId}' has an invalid revision.`);
+  }
+  return record;
+}
+
+function applyCurrentVisualizationRecord(backtest, response) {
+  if (!response || typeof response !== "object" || Array.isArray(response)) {
+    throw new Error("Visualization repository response must be an object.");
+  }
+  const visualizationId = response.currentVisualizationId;
+  const record = currentVisualizationRecord(
+    response.visualizations || [], backtest.backtestId, visualizationId,
+  );
+  backtest.visualizationId = visualizationId;
+  backtest.visualizationRevision = record?.revision || 0;
+  if (record) backtest.visualization = structuredClone(record.spec);
+  return record;
+}
+
+function visualizationRevisionConflict(error) {
+  return error?.status === 409
+    && error?.payload?.code === "visualization_revision_conflict";
+}
+
+function enqueueVisualizationSave(backtestId, spec) {
+  const snapshot = structuredClone(spec);
+  const epoch = visualizationSaveEpoch;
+  const operation = visualizationSaveQueue.then(async () => {
+    if (
+      epoch !== visualizationSaveEpoch
+      || state.selectedBacktest?.backtestId !== backtestId
+    ) {
+      throw new Error("Visualization save was superseded by a newer read.");
+    }
+    const expectedRevision = state.selectedBacktest.visualizationRevision;
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+      throw new Error("Visualization revision is unavailable; read it again before saving.");
+    }
+    const visualizationId = state.selectedBacktest.visualizationId;
+    if (typeof visualizationId !== "string" || !visualizationId.trim()) {
+      throw new Error("Visualization current identity is unavailable; read it again before saving.");
+    }
+    try {
+      const response = await postJson("/api/visualizations", {
+        backtestId,
+        expectedRevision,
+        visualizationId,
+        name: "current",
+        spec: snapshot,
+      });
+      if (
+        epoch !== visualizationSaveEpoch
+        || state.selectedBacktest?.backtestId !== backtestId
+      ) return response;
+      const saved = response.visualization;
+      if (
+        saved?.backtestId !== backtestId
+        || saved?.visualizationId !== visualizationId
+        || saved?.revision !== expectedRevision + 1
+      ) {
+        throw new Error("Visualization save returned invalid revision evidence.");
+      }
+      state.selectedBacktest.visualizationRevision = saved.revision;
+      return response;
+    } catch (error) {
+      if (visualizationRevisionConflict(error) && epoch === visualizationSaveEpoch) {
+        await refreshSelectedBacktest();
+        throw new Error(
+          "Visualization changed elsewhere. The current saved revision was reloaded."
+        );
+      }
+      throw error;
+    }
+  });
+  visualizationSaveQueue = operation.catch(() => null);
+  return operation;
 }
 
 function createLayerInstanceId(dataKey) {
@@ -6126,26 +7780,30 @@ function resultsUiState() {
   return state.selectedBacktest.ui;
 }
 
+function paneUiStateKey(paneIndex) {
+  return state.selectedBacktest?.visualization?.panes?.[paneIndex]?.id || String(paneIndex);
+}
+
 function selectedTempModuleId(paneIndex) {
-  return resultsUiState().selectedTempByPane[paneIndex] || "";
+  return resultsUiState().selectedTempByPane[paneUiStateKey(paneIndex)] || "";
 }
 
 function selectedVisualizerId(paneIndex) {
-  return resultsUiState().selectedVisualizerByPane[paneIndex] || "";
+  return resultsUiState().selectedVisualizerByPane[paneUiStateKey(paneIndex)] || "";
 }
 
 function paneSelectionHint(paneIndex) {
-  return resultsUiState().selectionHintByPane?.[paneIndex] || "";
+  return resultsUiState().selectionHintByPane?.[paneUiStateKey(paneIndex)] || "";
 }
 
 function setPaneSelectionHint(paneIndex, message = "") {
-  resultsUiState().selectionHintByPane[paneIndex] = message || "";
+  resultsUiState().selectionHintByPane[paneUiStateKey(paneIndex)] = message || "";
 }
 
 function setPaneControlError(paneIndex, message = "") {
   const node = document.querySelector(`[data-chart-control-error="${paneIndex}"]`);
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
 }
 
@@ -6171,11 +7829,11 @@ function clearPaneErrorForTarget(target) {
 }
 
 function setSelectedTempModuleId(paneIndex, instanceId) {
-  resultsUiState().selectedTempByPane[paneIndex] = instanceId || "";
+  resultsUiState().selectedTempByPane[paneUiStateKey(paneIndex)] = instanceId || "";
 }
 
 function setSelectedVisualizerId(paneIndex, visualizerId) {
-  resultsUiState().selectedVisualizerByPane[paneIndex] = visualizerId || "";
+  resultsUiState().selectedVisualizerByPane[paneUiStateKey(paneIndex)] = visualizerId || "";
 }
 
 function tempModuleActionState(paneIndex) {
@@ -6205,6 +7863,7 @@ function tempModuleActionState(paneIndex) {
       document.querySelector(`[data-temp-outputs-fields="${paneIndex}"]`),
       Object.keys(tempModule.ports?.outputs || {}).map((name) => ({ name, type: "string" })),
     );
+    validateTemporaryModuleOutputs(tempModule, outputs);
     const duplicateOutputKey = temporaryModuleOutputConflict(paneIndex, outputs, selectedTempModuleId(paneIndex) || "");
     if (duplicateOutputKey) {
       return { disabled: true, title: `Output data key ${duplicateOutputKey} already exists` };
@@ -6226,18 +7885,26 @@ function visualizerActionState(paneIndex) {
         : "No visualizers available for this pane",
     };
   }
-  const params = forms.readParamFields(
-    document.querySelector(`[data-visualizer-fields="${paneIndex}"]`),
-    visualizerDefinition.params || [],
-  );
-  const missing = (visualizerDefinition.params || []).filter((field) => !params[field.name]);
-  if (missing.length) {
-    return {
-      disabled: true,
-      title: `Missing visualizer params: ${missing.map((field) => field.label || field.name).join(", ")}`,
-    };
-  }
   try {
+    const selectedItem = selectedVisualizerId(paneIndex)
+      ? visualizerById(paneIndex, selectedVisualizerId(paneIndex))
+      : null;
+    const editorDefinition = visualizerDefinitionForEditor(
+      paneIndex, visualizerDefinition, selectedItem?.params || {},
+    );
+    const params = forms.readParamFields(
+      document.querySelector(`[data-visualizer-fields="${paneIndex}"]`),
+      editorDefinition?.params || [],
+    );
+    const missing = (visualizerDefinition.params || []).filter((field) => (
+      field.required && (params[field.name] === undefined || params[field.name] === "")
+    ));
+    if (missing.length) {
+      return {
+        disabled: true,
+        title: `Missing visualizer params: ${missing.map((field) => field.label || field.name).join(", ")}`,
+      };
+    }
     validateVisualizerInputs(paneIndex, visualizerDefinition, params);
   } catch (error) {
     return { disabled: true, title: error?.message || "Invalid visualizer DataKey" };
@@ -6254,24 +7921,6 @@ function paneValidationMessage(paneIndex) {
   if (selectedVisualizerDefinition(paneIndex) && visualizerState.disabled) {
     return visualizerState.title;
   }
-  const idleMessages = [];
-  const tempSelect = document.querySelector(`[data-temp-module-select="${paneIndex}"]`);
-  if (!tempSelect?.value && !selectedTempModuleId(paneIndex) && (
-    tempState.title === "Select a template first"
-    || tempState.title === "No temporary module templates available"
-  )) {
-    idleMessages.push(tempState.title);
-  }
-  const visualizerSelect = document.querySelector(`[data-visualizer-select="${paneIndex}"]`);
-  if (!visualizerSelect?.value && !selectedVisualizerId(paneIndex) && (
-    visualizerState.title === "Select a visualizer first"
-    || visualizerState.title === "No visualizers available for this pane"
-  )) {
-    idleMessages.push(visualizerState.title);
-  }
-  if (idleMessages.length) {
-    return idleMessages.join(" | ");
-  }
   return paneSelectionHint(paneIndex);
 }
 
@@ -6284,8 +7933,11 @@ function emptyPaneSelectionMessage(kind, select) {
 }
 
 function syncInitialPaneSelectionHint(paneIndex, kind, select) {
-  if (!select || select.value || (select.options?.length || 0) > 1 || paneSelectionHint(paneIndex)) return;
-  setPaneSelectionHint(paneIndex, emptyPaneSelectionMessage(kind, select));
+  // Template and Data Display are independent optional editors.  An untouched
+  // empty editor is not a pane validation error.
+  void paneIndex;
+  void kind;
+  void select;
 }
 
 function setActionButtonLabels(paneIndex) {
@@ -6294,14 +7946,14 @@ function setActionButtonLabels(paneIndex) {
   if (tempButton) {
     tempButton.textContent = applyButtonLabel("Template", selectedTempModuleId(paneIndex));
     tempButton.disabled = tempState.disabled;
-    tempButton.title = tempState.title;
+    tempButton.title = visibleText(tempState.title);
   }
   const visualizerState = visualizerActionState(paneIndex);
   const visualizerButton = document.querySelector(`[data-add-visualizer="${paneIndex}"]`);
   if (visualizerButton) {
     visualizerButton.textContent = applyButtonLabel("Visualizer", selectedVisualizerId(paneIndex));
     visualizerButton.disabled = visualizerState.disabled;
-    visualizerButton.title = visualizerState.title;
+    visualizerButton.title = visibleText(visualizerState.title);
   }
   setPaneControlError(paneIndex, paneValidationMessage(paneIndex));
 }
@@ -6315,35 +7967,162 @@ function syncResultPaneActionState(scope = document) {
   });
 }
 
+function invalidatePaneResult(pane) {
+  const owner = state.selectedBacktest;
+  if (!owner || !pane?.id) return;
+  const cache = paneProjectionCache(owner, pane.id, { create: false });
+  abortPaneProjectionCache(cache);
+  owner.paneProjectionCaches?.delete?.(pane.id);
+}
+
+function visualizerCapabilityDescriptors(definition, direction) {
+  const descriptors = definition?.capabilities?.[direction];
+  return Array.isArray(descriptors)
+    ? descriptors.filter((descriptor) => descriptor && typeof descriptor === "object")
+    : [];
+}
+
+function visualizerReferenceRequirements(definition) {
+  return visualizerCapabilityDescriptors(definition, "requires").filter((requirement) => (
+    typeof requirement.name === "string" && requirement.name
+    && typeof requirement.kind === "string" && requirement.kind
+    && typeof requirement.bindingParam === "string" && requirement.bindingParam
+    && requirement.matches && typeof requirement.matches === "object"
+    && !Array.isArray(requirement.matches)
+  ));
+}
+
+function visualizerCapabilityValuesEqual(left, right) {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right)
+      && left.length === right.length
+      && left.every((value, index) => visualizerCapabilityValuesEqual(value, right[index]));
+  }
+  if (!left || !right || typeof left !== "object" || typeof right !== "object") return false;
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key, index) => key === rightKeys[index]
+      && visualizerCapabilityValuesEqual(left[key], right[key]));
+}
+
+function visualizerProviderMatchesRequirement(
+  requirement,
+  consumerParams,
+  providerDefinition,
+  providerParams,
+  { allowUnboundMatches = false } = {},
+) {
+  if (!requirement || typeof requirement.kind !== "string") return false;
+  const providers = visualizerCapabilityDescriptors(providerDefinition, "provides")
+    .filter((provided) => provided.kind === requirement.kind);
+  if (providers.length !== 1) return false;
+  const provided = providers[0];
+  if (!provided.attributes || typeof provided.attributes !== "object"
+      || Array.isArray(provided.attributes)) return false;
+  return Object.entries(requirement.matches || {}).every(([attributeName, consumerParam]) => {
+    if (typeof consumerParam !== "string" || !consumerParam) return false;
+    const providerParam = provided.attributes[attributeName];
+    if (typeof providerParam !== "string" || !providerParam) return false;
+    if (!Object.prototype.hasOwnProperty.call(providerParams || {}, providerParam)) return false;
+    const hasExpected = Object.prototype.hasOwnProperty.call(consumerParams || {}, consumerParam);
+    const expected = consumerParams?.[consumerParam];
+    if (allowUnboundMatches && (!hasExpected || expected === undefined || expected === "")) return true;
+    if (!hasExpected) return false;
+    return visualizerCapabilityValuesEqual(expected, providerParams?.[providerParam]);
+  });
+}
+
+function visualizerDependents(pane, referencedVisualizerId, definitionsById) {
+  if (!definitionsById || typeof definitionsById.get !== "function") return [];
+  return (pane?.visualizers || []).filter((item) => {
+    if (!item?.id || item.id === referencedVisualizerId) return false;
+    const definition = definitionsById.get(item.callback);
+    return visualizerReferenceRequirements(definition).some((requirement) => (
+      item.params?.[requirement.bindingParam] === referencedVisualizerId
+    ));
+  });
+}
+
 function removePaneLayer(paneIndex, layerId) {
   const spec = state.selectedBacktest.visualization;
   const pane = spec.panes[paneIndex];
+  const dependents = visualizerDependents(
+    pane, layerId, visualizerDefinitionMapForPane(paneIndex),
+  );
+  if (dependents.length) {
+    setPaneControlError(paneIndex, `Remove ${dependents.length} dependent data display${dependents.length === 1 ? "" : "s"} first.`);
+    return false;
+  }
   pane.visualizers = (pane.visualizers || []).filter((item) => item.id !== layerId);
   if (selectedVisualizerId(paneIndex) === layerId) setSelectedVisualizerId(paneIndex, "");
   syncVisualizationSpec(spec);
+  return true;
+}
+
+function dataKeyConsumesOutput(binding, outputKeys) {
+  if (typeof binding !== "string" || !binding) return false;
+  return outputKeys.some((output) => (
+    binding === output || binding.startsWith(`${output}.`)
+  ));
+}
+
+function temporaryModuleConsumers(pane, spec, module) {
+  const outputKeys = Object.values(module?.outputs || {})
+    .filter((value) => typeof value === "string" && value);
+  if (!outputKeys.length) return { visualizers: [], temporaryModules: [] };
+  let definitions = new Map();
+  try {
+    const scoped = paneScopedSpec(spec, pane);
+    definitions = new Map(window.TradeChartCore.visualizerCatalog(
+      { dataKeys: state.selectedBacktest?.dataKeys || {} }, scoped,
+    ).map((definition) => [definition.id, definition]));
+  } catch { /* unknown definitions are checked conservatively below */ }
+  const visualizers = (pane.visualizers || []).filter((visualizer) => {
+    const definition = definitions.get(visualizer.callback);
+    const bindings = definition
+      ? Object.keys(definition.inputPorts || {}).map((name) => visualizer.params?.[name])
+      : Object.values(visualizer.params || {});
+    return bindings.some((value) => dataKeyConsumesOutput(value, outputKeys));
+  });
+  const temporaryModules = (pane.temporaryModules || []).filter((candidate) => (
+    candidate.instanceId !== module?.instanceId
+    && Object.values(candidate.inputs || {}).some((value) => (
+      dataKeyConsumesOutput(value, outputKeys)
+    ))
+  ));
+  return { visualizers, temporaryModules };
 }
 
 function removePaneTemporaryModule(paneIndex, instanceId) {
   const spec = state.selectedBacktest.visualization;
   const pane = spec.panes[paneIndex];
   const module = (pane.temporaryModules || []).find((item) => item.instanceId === instanceId);
-  const outputKeys = Object.values(module?.outputs || {});
+  const consumers = temporaryModuleConsumers(pane, spec, module);
+  if (consumers.visualizers.length || consumers.temporaryModules.length) {
+    const count = consumers.visualizers.length + consumers.temporaryModules.length;
+    setPaneControlError(paneIndex, `Remove ${count} dependent display instance${count === 1 ? "" : "s"} first.`);
+    return false;
+  }
   pane.temporaryModules = (pane.temporaryModules || []).filter((item) => item.instanceId !== instanceId);
-  pane.visualizers = (pane.visualizers || []).filter((item) => {
-    const params = item.params || {};
-    return !Object.values(params).some((value) => outputKeys.includes(value));
-  });
   if (selectedTempModuleId(paneIndex) === instanceId) setSelectedTempModuleId(paneIndex, "");
-  if (state.selectedBacktest?.paneResults) delete state.selectedBacktest.paneResults[pane.id];
-  if (state.selectedBacktest?.loadedPanes) delete state.selectedBacktest.loadedPanes[pane.id];
   syncVisualizationSpec(spec);
+  return true;
 }
 
-function resultModuleDefinitions() {
+function allResultModuleDefinitions() {
   return Object.entries(state.resultModules || {})
     .map(([key, value]) => ({ key, ...value, folderPath: repositoryPlacement("modules", key).folderPath }))
     .filter((row) => Object.keys(row.ports?.outputs || {}).length)
     .sort((a, b) => `${a.kind}.${a.moduleId}`.localeCompare(`${b.kind}.${b.moduleId}`));
+}
+
+function resultModuleDefinitions() {
+  return window.TradeVersionSelection.currentRows(
+    allResultModuleDefinitions(),
+    ["kind", "moduleId"],
+  );
 }
 
 function selectedResultModule(paneIndex) {
@@ -6381,7 +8160,9 @@ function uniqueTemporaryModuleInstanceId(paneIndex, preferred = "", currentId = 
 
 function resultModuleDefinitionKey(module) {
   if (!module) return "";
-  const definition = resultModuleDefinitions().find((row) => row.kind === module.kind && row.moduleId === module.moduleId && row.version === module.version);
+  const definition = resultModuleDefinitions().find((row) => (
+    row.kind === module.kind && row.moduleId === module.moduleId
+  ));
   return definition?.key || "";
 }
 
@@ -6418,6 +8199,11 @@ function currentDataKeyDeclaration(paneIndex, dataKey) {
 }
 
 function validateTemporaryModuleInputs(paneIndex, module, inputs) {
+  for (const [portName, port] of Object.entries(module.ports?.inputs || {})) {
+    if (port?.required !== false && !String(inputs?.[portName] || "").trim()) {
+      throw new Error(`Input ${forms.humanizeName(portName)} is required`);
+    }
+  }
   for (const [portName, dataKey] of Object.entries(inputs || {})) {
     const declaration = currentDataKeyDeclaration(paneIndex, dataKey);
     const requiredSchema = module.ports?.inputs?.[portName]?.schema || {};
@@ -6430,17 +8216,133 @@ function validateTemporaryModuleInputs(paneIndex, module, inputs) {
   }
 }
 
+function validateTemporaryModuleOutputs(module, outputs) {
+  const bound = Object.entries(outputs || {}).filter(([, dataKey]) => String(dataKey || "").trim());
+  if (!bound.length) throw new Error("Bind at least one temporary module output");
+  for (const [portName, port] of Object.entries(module.ports?.outputs || {})) {
+    if (port?.required !== false && !String(outputs?.[portName] || "").trim()) {
+      throw new Error(`Output ${forms.humanizeName(portName)} is required`);
+    }
+  }
+}
+
 function validateVisualizerInputs(paneIndex, definition, params) {
+  const isCompatible = window.TradeChartCore.visualizerSchemasCompatible
+    || window.TradeChartCore.schemasCompatible;
   for (const [portName, port] of Object.entries(definition.inputPorts || {})) {
     const dataKey = params?.[portName];
     const declaration = currentDataKeyDeclaration(paneIndex, dataKey);
-    if (!declaration || !window.TradeChartCore.schemasCompatible(
+    if (!declaration || !isCompatible(
       declaration.schema,
       port.schema || {},
     )) {
       throw new Error(`${forms.humanizeName(portName)} must reference a compatible DataKey`);
     }
   }
+  for (const requirement of visualizerReferenceRequirements(definition)) {
+    const candidates = new Set(visualizerReferenceCandidates(
+      paneIndex, definition, requirement, params,
+    ).map((item) => item.id));
+    const referencedId = params?.[requirement.bindingParam];
+    if (!referencedId || !candidates.has(referencedId)) {
+      const field = (definition.params || []).find((item) => item.name === requirement.bindingParam);
+      throw new Error(`${field?.label || forms.humanizeName(requirement.bindingParam)} must reference a visible compatible display`);
+    }
+  }
+}
+
+function visualizerDefinitionMapForPane(paneIndex) {
+  const pane = state.selectedBacktest?.visualization?.panes?.[paneIndex];
+  if (!pane) return new Map();
+  const scoped = paneScopedSpec(state.selectedBacktest.visualization, pane);
+  const catalog = window.TradeChartCore.visualizerCatalog(
+    { dataKeys: state.selectedBacktest.dataKeys || {} },
+    scoped,
+  );
+  return new Map(catalog.map((definition) => [definition.id, definition]));
+}
+
+function visualizerReferenceCandidates(
+  paneIndex,
+  consumerDefinition,
+  requirement,
+  consumerParams = {},
+  { allowUnboundMatches = false } = {},
+) {
+  const pane = state.selectedBacktest?.visualization?.panes?.[paneIndex];
+  if (!pane || !requirement) return [];
+  const byId = visualizerDefinitionMapForPane(paneIndex);
+  const currentId = selectedVisualizerId(paneIndex);
+  return (pane.visualizers || []).filter((instance) => {
+    if (!instance?.id || instance.id === currentId || instance.visible === false) return false;
+    return visualizerProviderMatchesRequirement(
+      requirement,
+      consumerParams,
+      byId.get(instance.callback),
+      instance.params || {},
+      { allowUnboundMatches },
+    );
+  });
+}
+
+function visualizerDefinitionForEditor(paneIndex, definition, params = {}) {
+  if (!definition) return null;
+  const requirementsByParam = new Map(visualizerReferenceRequirements(definition).map(
+    (requirement) => [requirement.bindingParam, requirement],
+  ));
+  return {
+    ...definition,
+    params: (definition.params || []).map((field) => {
+      const requirement = requirementsByParam.get(field.name);
+      if (!requirement) return field;
+      const candidates = visualizerReferenceCandidates(
+        paneIndex,
+        definition,
+        requirement,
+        params,
+        { allowUnboundMatches: true },
+      );
+      const definitionsById = visualizerDefinitionMapForPane(paneIndex);
+      return {
+        ...field,
+        type: "visualizerRef",
+        options: [
+          { value: "", label: "Select…" },
+          ...candidates.map((item) => ({
+            value: item.id,
+            label: visualizerTagLabel(
+              state.selectedBacktest,
+              paneScopedSpec(
+                state.selectedBacktest.visualization,
+                state.selectedBacktest.visualization.panes[paneIndex],
+              ),
+              item,
+              definitionsById.get(item.callback),
+            ),
+          })),
+        ],
+      };
+    }),
+  };
+}
+
+function incompatibleVisualizerDependents(
+  paneIndex, referencedVisualizerId, providerDefinition, providerParams,
+) {
+  const pane = state.selectedBacktest?.visualization?.panes?.[paneIndex];
+  const byId = visualizerDefinitionMapForPane(paneIndex);
+  return visualizerDependents(pane, referencedVisualizerId, byId).filter((instance) => {
+    const consumerDefinition = byId.get(instance.callback);
+    return visualizerReferenceRequirements(consumerDefinition).some((requirement) => (
+      instance.params?.[requirement.bindingParam] === referencedVisualizerId
+      && !visualizerProviderMatchesRequirement(
+        requirement,
+        instance.params || {},
+        providerDefinition,
+        providerParams || {},
+      )
+    ));
+  });
 }
 
 function temporaryModuleOutputConflict(paneIndex, outputs = {}, currentId = "") {
@@ -6489,7 +8391,8 @@ function fillTemporaryModuleDraft(paneIndex) {
       name,
       label: forms.humanizeName(name),
       type: "dataKey",
-      description: JSON.stringify(module.ports.inputs[name]?.schema || {}),
+      required: module.ports.inputs[name]?.required !== false,
+      description: forms.schemaTypeLabel(module.ports.inputs[name]?.schema || {}),
     })),
     selectedItem?.inputs || {},
     Object.fromEntries(Object.keys(module.ports?.inputs || {}).map((name) => [
@@ -6503,11 +8406,80 @@ function fillTemporaryModuleDraft(paneIndex) {
       name,
       label: forms.humanizeName(name),
       type: "string",
-      description: JSON.stringify(module.ports.outputs[name]?.schema || {}),
+      required: module.ports.outputs[name]?.required !== false,
+      description: forms.schemaTypeLabel(module.ports.outputs[name]?.schema || {}),
       default: nextUniqueDataKey(`${semanticDataKeySegment(module.name || module.kind)}.${semanticDataKeySegment(name, "output")}`, paneIndex),
     })),
     selectedItem?.outputs || {},
   );
+}
+
+function remapDataKeyBinding(binding, mappings) {
+  if (typeof binding !== "string") return binding;
+  const match = mappings.find(({ oldKey }) => (
+    binding === oldKey || binding.startsWith(`${oldKey}.`)
+  ));
+  return match ? `${match.newKey}${binding.slice(match.oldKey.length)}` : binding;
+}
+
+function remapTemporaryModuleConsumers(pane, spec, previousItem, outputs) {
+  const mappings = Object.entries(previousItem?.outputs || {}).flatMap(([portName, oldKey]) => {
+    const newKey = outputs?.[portName];
+    return typeof oldKey === "string" && oldKey && typeof newKey === "string" && newKey
+      ? [{ oldKey, newKey }]
+      : [];
+  }).sort((left, right) => right.oldKey.length - left.oldKey.length);
+  const removedOutputs = Object.entries(previousItem?.outputs || {}).filter(([portName, oldKey]) => (
+    typeof oldKey === "string" && oldKey
+    && !(typeof outputs?.[portName] === "string" && outputs[portName])
+  ));
+  const blockedVisualizers = new Map();
+  const blockedModules = new Map();
+  removedOutputs.forEach(([portName, oldKey]) => {
+    const consumers = temporaryModuleConsumers(
+      pane, spec, { ...previousItem, outputs: { [portName]: oldKey } },
+    );
+    consumers.visualizers.forEach((item) => blockedVisualizers.set(item.id, item));
+    consumers.temporaryModules.forEach((item) => blockedModules.set(item.instanceId, item));
+  });
+  if (blockedVisualizers.size || blockedModules.size) {
+    const dependents = [
+      blockedVisualizers.size
+        ? `${blockedVisualizers.size} data display${blockedVisualizers.size === 1 ? "" : "s"}`
+        : "",
+      blockedModules.size
+        ? `${blockedModules.size} temporary module${blockedModules.size === 1 ? "" : "s"}`
+        : "",
+    ].filter(Boolean).join(" and ");
+    return {
+      error: `Cannot remove a bound output; remove the dependent ${dependents} first.`,
+    };
+  }
+  let definitions = new Map();
+  try {
+    definitions = new Map(window.TradeChartCore.visualizerCatalog(
+      { dataKeys: state.selectedBacktest?.dataKeys || {} }, paneScopedSpec(spec, pane),
+    ).map((definition) => [definition.id, definition]));
+  } catch { /* unknown definitions are remapped conservatively below */ }
+  const visualizers = (pane.visualizers || []).map((visualizer) => {
+    const params = { ...(visualizer.params || {}) };
+    const definition = definitions.get(visualizer.callback);
+    const names = definition
+      ? Object.keys(definition.inputPorts || {})
+      : Object.keys(params);
+    names.forEach((name) => {
+      params[name] = remapDataKeyBinding(params[name], mappings);
+    });
+    return { ...visualizer, params };
+  });
+  const temporaryModules = (pane.temporaryModules || []).map((candidate) => {
+    if (candidate.instanceId === previousItem?.instanceId) return candidate;
+    const remappedInputs = Object.fromEntries(Object.entries(candidate.inputs || {}).map(
+      ([name, value]) => [name, remapDataKeyBinding(value, mappings)],
+    ));
+    return { ...candidate, inputs: remappedInputs };
+  });
+  return { visualizers, temporaryModules };
 }
 
 function addPaneTemporaryModule(paneIndex) {
@@ -6536,6 +8508,7 @@ function addPaneTemporaryModule(paneIndex) {
       document.querySelector(`[data-temp-outputs-fields="${paneIndex}"]`),
       Object.keys(module.ports?.outputs || {}).map((name) => ({ name, type: "string" })),
     );
+    validateTemporaryModuleOutputs(module, outputs);
   } catch (error) {
     setPaneControlError(paneIndex, error?.message || "Invalid temporary module fields");
     return false;
@@ -6555,30 +8528,23 @@ function addPaneTemporaryModule(paneIndex) {
   pane.temporaryModules ||= [];
   setPaneControlError(paneIndex, "");
   if (selectedId) {
+    const remapped = remapTemporaryModuleConsumers(pane, spec, previousItem, outputs);
+    if (remapped.error) {
+      setPaneControlError(paneIndex, remapped.error);
+      return false;
+    }
+    pane.visualizers = remapped.visualizers;
+    pane.temporaryModules = remapped.temporaryModules;
     pane.temporaryModules = window.TradeChartCore.upsertIdentity(
       pane.temporaryModules, selectedId, nextItem, "instanceId",
     );
     if (selectedId !== instanceId) setSelectedTempModuleId(paneIndex, instanceId);
-    if (previousItem) {
-      pane.visualizers = (pane.visualizers || []).map((visualizer) => {
-        const params = { ...(visualizer.params || {}) };
-        for (const [portName, newKey] of Object.entries(outputs)) {
-          const oldKey = previousItem.outputs?.[portName];
-          for (const key of Object.keys(params)) {
-            if (params[key] === oldKey) params[key] = newKey;
-          }
-        }
-        return { ...visualizer, params };
-      });
-    }
   } else {
     pane.temporaryModules = window.TradeChartCore.upsertIdentity(
       pane.temporaryModules, "", nextItem, "instanceId",
     );
     setSelectedTempModuleId(paneIndex, "");
   }
-  if (state.selectedBacktest?.paneResults) delete state.selectedBacktest.paneResults[pane.id];
-  if (state.selectedBacktest?.loadedPanes) delete state.selectedBacktest.loadedPanes[pane.id];
   syncVisualizationSpec(spec);
   return true;
 }
@@ -6630,11 +8596,14 @@ function fillVisualizerDraft(paneIndex) {
   const refreshed = window.TradeChartCore.visualizerCatalog({ dataKeys: state.selectedBacktest.dataKeys || {} }, scoped)
     .find((item) => item.id === definition.id);
   const selectedItem = selectedVisualizerId(paneIndex) ? visualizerById(paneIndex, selectedVisualizerId(paneIndex)) : null;
+  const editorDefinition = visualizerDefinitionForEditor(
+    paneIndex, refreshed, selectedItem?.params || {},
+  );
   forms.renderParamFields(
     visualizerFields,
-    refreshed?.params || [],
+    editorDefinition?.params || [],
     selectedItem?.params || {},
-    refreshed?.optionMap || {},
+    editorDefinition?.optionMap || {},
   );
 }
 
@@ -6643,18 +8612,35 @@ function addPaneVisualizer(paneIndex) {
   const pane = spec.panes[paneIndex];
   const definition = selectedVisualizerDefinition(paneIndex);
   if (!definition) return;
+  const fields = document.querySelector(`[data-visualizer-fields="${paneIndex}"]`);
+  const selectedId = selectedVisualizerId(paneIndex);
+  const previousItem = selectedId ? visualizerById(paneIndex, selectedId) : null;
+  const editorDefinition = visualizerDefinitionForEditor(
+    paneIndex, definition, previousItem?.params || {},
+  );
   const params = forms.readParamFields(
-    document.querySelector(`[data-visualizer-fields="${paneIndex}"]`),
-    definition.params || [],
+    fields,
+    editorDefinition?.params || [],
   );
   pane.visualizers ||= [];
-  const selectedId = selectedVisualizerId(paneIndex);
   let nextItem;
   try {
     validateVisualizerInputs(paneIndex, definition, params);
+    const id = uniquePaneVisualizerId(definition.id, paneIndex, selectedId || "");
     nextItem = window.TradeChartCore.createVisualizerInstance(definition, {
-      id: uniquePaneVisualizerId(definition.id, paneIndex, selectedId || ""), params,
+      id, params,
     });
+    if (previousItem && Object.prototype.hasOwnProperty.call(previousItem, "visible")) {
+      nextItem.visible = previousItem.visible;
+    }
+    if (selectedId) {
+      const incompatible = incompatibleVisualizerDependents(
+        paneIndex, selectedId, definition, nextItem.params,
+      );
+      if (incompatible.length) {
+        throw new Error(`This change would break ${incompatible.length} dependent data display${incompatible.length === 1 ? "" : "s"}.`);
+      }
+    }
   } catch (error) {
     setPaneControlError(paneIndex, error?.message || "Invalid visualizer parameters");
     return false;
@@ -6670,21 +8656,52 @@ function addPaneVisualizer(paneIndex) {
     );
     setSelectedVisualizerId(paneIndex, "");
   }
-  if (state.selectedBacktest?.paneResults) delete state.selectedBacktest.paneResults[pane.id];
-  if (state.selectedBacktest?.loadedPanes) delete state.selectedBacktest.loadedPanes[pane.id];
   syncVisualizationSpec(spec);
   return true;
 }
 
-function visualizerSummary(result, spec, pane, visualizer) {
-  if (visualizer.displayName) return visualizer.displayName;
-  const definition = window.TradeChartCore.visualizerCatalog(result, spec).find((item) => item.id === visualizer.callback);
-  const params = visualizer.params || {};
-  const summary = Object.entries(params)
-    .filter(([, value]) => value !== undefined && value !== "")
-    .map(([key, value]) => `${forms.humanizeName(key)}=${value}`)
-    .join(", ");
-  return `${definition?.label || visualizer.callback}${summary ? ` (${summary})` : ""}`;
+function semanticVisualizerLabel(visualizer = {}, definition = {}) {
+  const forbidden = [visualizer.id, visualizer.callback, definition?.id]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  const declared = [visualizer.displayName, definition?.label]
+    .map((value) => String(value || "").trim())
+    .find((value) => (
+      value
+      && !forms.opaqueMachineIdentityKind?.(value)
+      && !forbidden.some((identity) => value.includes(identity))
+    ));
+  return visibleText(declared, "Data display");
+}
+
+function visualizerTagLabel(result, spec, visualizer, definition = null) {
+  definition ||= window.TradeChartCore.visualizerCatalog(result, spec).find((item) => item.id === visualizer.callback);
+  const label = semanticVisualizerLabel(visualizer, definition);
+  const dataKeys = [...new Set(Object.keys(definition?.inputPorts || {})
+    .map((name) => visualizer.params?.[name])
+    .filter((value) => value !== undefined && value !== "")
+    .map((value) => visibleText(value, "Data")))];
+  return [label, ...dataKeys].join(" · ");
+}
+
+function isDrawingVisualizerInstance(result, spec, visualizer) {
+  const definition = window.TradeChartCore.visualizerCatalog(result, spec)
+    .find((item) => item.id === visualizer?.callback);
+  return definition?.renderer?.apiVersion === 1
+    && (definition.capabilities?.interactions || []).includes("chart.pointer");
+}
+
+function visualizerSummary(result, spec, pane, visualizer, definition = null) {
+  return visualizerTagLabel(result, spec, visualizer, definition);
+}
+
+function semanticPaneTitle(pane = {}, paneIndex = 0) {
+  const title = String(pane.title || "").trim();
+  const identity = String(pane.id || "").trim();
+  if (!title || (identity && title.includes(identity)) || forms.opaqueMachineIdentityKind?.(title)) {
+    return `Chart ${paneIndex + 1}`;
+  }
+  return visibleText(title, `Chart ${paneIndex + 1}`);
 }
 
 function applyButtonLabel(base, selected) {
@@ -6693,15 +8710,7 @@ function applyButtonLabel(base, selected) {
 
 function currentResultTimeZone(spec = state.selectedBacktest?.visualization) {
   const timeZone = spec?.timeZone || "UTC";
-  return { timeZone, label: timeZone };
-}
-
-function syncResultTimezoneButton(spec = state.selectedBacktest?.visualization) {
-  const button = $("resultTimezoneBtn");
-  if (!button) return;
-  const zone = currentResultTimeZone(spec);
-  button.textContent = `TZ: ${zone.label}`;
-  button.title = zone.timeZone;
+  return { timeZone };
 }
 
 function persistVisualizationView(spec) {
@@ -6713,6 +8722,357 @@ function persistVisualizationView(spec) {
   scheduleVisualizationSave(spec);
 }
 
+function chartDiagnosticMessage(diagnostic) {
+  const identity = [diagnostic?.renderer, diagnostic?.code]
+    .map((value) => visibleText(value))
+    .filter(Boolean).join(" · ");
+  const message = diagnostic?.message || (
+    diagnostic?.code === "missing-overlay-target"
+      ? "A visible compatible target display is required."
+      : "The display could not be drawn."
+  );
+  return visibleText(`${identity ? `${identity}: ` : ""}${message}`, "The display could not be drawn.");
+}
+
+function mergeChartDiagnostics(...groups) {
+  const seen = new Set();
+  return groups.flatMap((group) => Array.isArray(group) ? group : []).filter((item) => {
+    const key = JSON.stringify([
+      item?.visualizerId || item?.instanceId || item?.renderer || "",
+      item?.code || "",
+      item?.message || "",
+    ]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function renderChartDiagnostics(panel, diagnostics, paneIndex) {
+  if (!diagnostics.length) return;
+  const container = document.createElement("div");
+  container.className = "chart-load-error";
+  diagnostics.forEach((item) => {
+    const row = document.createElement("div");
+    const message = document.createElement("span");
+    message.textContent = chartDiagnosticMessage(item);
+    row.appendChild(message);
+    if (item?.code === "instance-load-error" && item.visualizerId) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.textContent = "Retry";
+      retry.dataset.retryChartInstance = String(paneIndex);
+      retry.dataset.visualizerId = item.visualizerId;
+      row.appendChild(retry);
+    }
+    container.appendChild(row);
+  });
+  panel.appendChild(container);
+}
+
+function runChartCleanups(cleanups = []) {
+  for (const cleanup of cleanups) {
+    try { cleanup?.(); } catch { /* one cleanup must not block the rest */ }
+  }
+}
+
+function resultDrawingUiState(paneIndex) {
+  const backtestId = state.selectedBacktest?.backtestId || "";
+  const paneId = state.selectedBacktest?.visualization?.panes?.[paneIndex]?.id || String(paneIndex);
+  const key = `${backtestId}:${paneId}`;
+  if (!resultDrawingUiByPane.has(key)) {
+    resultDrawingUiByPane.set(key, {
+      toolId: "",
+      bindings: {},
+      selectedVisualizerId: "",
+    });
+  }
+  return resultDrawingUiByPane.get(key);
+}
+
+function drawingControllerCapabilities(controller) {
+  if (!controller) return { tools: [] };
+  if (typeof controller.listTools !== "function") {
+    throw new Error("Drawing controller listTools() is required.");
+  }
+  const capability = controller.listTools();
+  if (!capability || typeof capability !== "object" || Array.isArray(capability)
+      || !Array.isArray(capability.tools)) {
+    throw new Error("Drawing controller listTools() must return a tools array.");
+  }
+  return { tools: capability.tools };
+}
+
+function drawingDescriptorHasExactFields(value, fields) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === fields.length
+    && fields.every((field) => Object.prototype.hasOwnProperty.call(value, field));
+}
+
+function drawingToolDescriptorError(tool) {
+  if (!tool || typeof tool !== "object" || Array.isArray(tool)) return "Drawing tool descriptor must be an object.";
+  if (typeof tool.id !== "string" || !tool.id.trim()) return "Drawing tool id is required.";
+  if (typeof tool.label !== "string" || !tool.label.trim()) return `Drawing tool '${tool.id}' label is required.`;
+  if (!Array.isArray(tool.bindings)) return `Drawing tool '${tool.id}' bindings must be an array.`;
+  if (!drawingDescriptorHasExactFields(tool, ["id", "label", "bindings"])) {
+    return `Drawing tool '${tool.id}' must contain exactly id, label, and bindings.`;
+  }
+  const names = new Set();
+  for (const binding of tool.bindings) {
+    if (!drawingDescriptorHasExactFields(binding, ["name", "label", "kind", "candidates"])
+        || typeof binding.name !== "string" || !binding.name.trim()
+        || typeof binding.label !== "string" || !binding.label.trim()
+        || typeof binding.kind !== "string" || !binding.kind.trim()
+        || !Array.isArray(binding.candidates)) {
+      return `Drawing tool '${tool.id}' contains an invalid binding descriptor.`;
+    }
+    if (names.has(binding.name)) return `Drawing tool '${tool.id}' contains duplicate binding '${binding.name}'.`;
+    names.add(binding.name);
+    const candidateIds = new Set();
+    for (const candidate of binding.candidates) {
+      if (!drawingDescriptorHasExactFields(candidate, ["visualizerId", "label"])
+          || typeof candidate.visualizerId !== "string" || !candidate.visualizerId.trim()
+          || typeof candidate.label !== "string" || !candidate.label.trim()) {
+        return `Drawing tool '${tool.id}' binding '${binding.name}' contains an invalid candidate.`;
+      }
+      if (candidateIds.has(candidate.visualizerId)) {
+        return `Drawing tool '${tool.id}' binding '${binding.name}' contains duplicate candidates.`;
+      }
+      candidateIds.add(candidate.visualizerId);
+    }
+  }
+  return "";
+}
+
+function persistDrawingControllerEvent(paneIndex, event) {
+  const spec = state.selectedBacktest?.visualization;
+  const pane = spec?.panes?.[paneIndex];
+  if (!pane || !event) return false;
+  if (event.type === "commit") {
+    const instance = event.instance || event.visualizer;
+    const scoped = paneScopedSpec(spec, pane);
+    const result = paneResult(pane, spec);
+    if (!instance?.id || !isDrawingVisualizerInstance(result, scoped, instance) || !instance.params) return false;
+    const existing = (pane.visualizers || []).find((item) => item.id === instance.id);
+    if (existing) {
+      const definition = window.TradeChartCore.visualizerCatalog(result, scoped)
+        .find((item) => item.id === instance.callback);
+      const incompatible = incompatibleVisualizerDependents(
+        paneIndex, instance.id, definition, instance.params,
+      );
+      if (incompatible.length) {
+        setPaneControlError(
+          paneIndex,
+          `This change would break ${incompatible.length} dependent data display${incompatible.length === 1 ? "" : "s"}.`,
+        );
+        return false;
+      }
+    }
+    pane.visualizers = window.TradeChartCore.upsertIdentity(
+      pane.visualizers || [],
+      (pane.visualizers || []).some((item) => item.id === instance.id) ? instance.id : "",
+      structuredClone(instance),
+      "id",
+    );
+    resultDrawingUiState(paneIndex).selectedVisualizerId = "";
+    syncVisualizationSpec(spec);
+    return true;
+  }
+  if (event.type === "delete" && event.visualizerId) {
+    const dependents = visualizerDependents(
+      pane, event.visualizerId, visualizerDefinitionMapForPane(paneIndex),
+    );
+    if (dependents.length) {
+      setPaneControlError(
+        paneIndex,
+        `Remove ${dependents.length} dependent data display${dependents.length === 1 ? "" : "s"} first.`,
+      );
+      return false;
+    }
+    const previousLength = (pane.visualizers || []).length;
+    pane.visualizers = (pane.visualizers || []).filter((item) => item.id !== event.visualizerId);
+    if (pane.visualizers.length === previousLength) return false;
+    if (selectedVisualizerId(paneIndex) === event.visualizerId) setSelectedVisualizerId(paneIndex, "");
+    resultDrawingUiState(paneIndex).selectedVisualizerId = "";
+    syncVisualizationSpec(spec);
+    return true;
+  }
+  return false;
+}
+
+function createDrawingToolbar(paneIndex, controller, interactionSurface) {
+  const element = document.createElement("div");
+  element.className = "chart-drawing-toolbar";
+  element.setAttribute("aria-label", "Chart drawing controls");
+  const ui = resultDrawingUiState(paneIndex);
+  if (!ui.bindings || typeof ui.bindings !== "object" || Array.isArray(ui.bindings)) ui.bindings = {};
+  let capabilities;
+  let capabilityError = null;
+  try {
+    capabilities = drawingControllerCapabilities(controller);
+  } catch (error) {
+    capabilities = { tools: [] };
+    capabilityError = error;
+    console.error("Drawing capabilities failed", error);
+  }
+  const toolIdCounts = new Map();
+  capabilities.tools.forEach((tool) => {
+    if (typeof tool?.id === "string") toolIdCounts.set(tool.id, (toolIdCounts.get(tool.id) || 0) + 1);
+  });
+  const toolRecords = capabilities.tools.map((tool) => ({
+    tool,
+    error: drawingToolDescriptorError(tool) || (
+      toolIdCounts.get(tool.id) > 1 ? `Drawing tool '${tool.id}' is duplicated.` : ""
+    ),
+  }));
+  const toolById = new Map(toolRecords.filter((record) => !record.error).map((record) => [record.tool.id, record.tool]));
+  if (!toolById.has(ui.toolId)) ui.toolId = toolRecords.find((record) => !record.error)?.tool.id || "";
+  element.innerHTML = `
+    <div class="chart-drawing-bindings" data-drawing-bindings="${paneIndex}"></div>
+    <div class="chart-drawing-tools" role="toolbar" aria-label="Drawing tools">
+      ${toolRecords.map(({ tool, error }) => `<button type="button" data-drawing-tool="${escapeHtml(tool?.id || "")}" aria-pressed="${tool?.id === ui.toolId ? "true" : "false"}" ${error ? `disabled title="${escapeHtml(visibleText(error))}"` : ""}>${escapeHtml(visibleText(tool?.label || tool?.id, "Invalid tool"))}</button>`).join("")}
+      <button type="button" data-drawing-delete aria-label="Delete selected drawing" aria-keyshortcuts="Delete Backspace" disabled>Delete</button>
+    </div>
+    <span class="chart-drawing-status" data-drawing-status role="status" aria-live="polite"></span>
+  `;
+  const bindingHost = element.querySelector("[data-drawing-bindings]");
+  const status = element.querySelector("[data-drawing-status]");
+  const deleteButton = element.querySelector("[data-drawing-delete]");
+  const toolButtons = [...element.querySelectorAll("[data-drawing-tool]")];
+  const setStatus = (message = "", isError = false) => {
+    status.textContent = visibleText(message);
+    status.classList.toggle("error", !!message && isError);
+  };
+  const syncButtons = () => {
+    toolButtons.forEach((button) => {
+      const tool = toolById.get(button.dataset.drawingTool);
+      button.disabled = !tool;
+      button.setAttribute("aria-pressed", button.dataset.drawingTool === ui.toolId ? "true" : "false");
+    });
+    deleteButton.disabled = !ui.selectedVisualizerId;
+  };
+  const activeBindings = (tool) => Object.fromEntries((tool?.bindings || []).map(
+    (binding) => [binding.name, ui.bindings[binding.name] || ""],
+  ));
+  const normalizeBindings = (tool) => {
+    for (const binding of tool?.bindings || []) {
+      const candidateIds = new Set(binding.candidates.map((candidate) => candidate.visualizerId));
+      if (!candidateIds.has(ui.bindings[binding.name])) ui.bindings[binding.name] = "";
+    }
+  };
+  let applyActiveTool = () => false;
+  const renderBindings = (tool) => {
+    if (!bindingHost) return;
+    normalizeBindings(tool);
+    bindingHost.innerHTML = (tool?.bindings || []).map((binding) => `
+      <label class="chart-drawing-binding">
+        <span>${escapeHtml(visibleText(binding.label, "Drawing target"))}</span>
+        <select data-drawing-binding="${escapeHtml(binding.name)}" aria-label="${escapeHtml(visibleText(binding.label, "Drawing target"))}">
+          <option value="">Select…</option>
+          ${binding.candidates.map((candidate) => `<option value="${escapeHtml(candidate.visualizerId)}" ${candidate.visualizerId === ui.bindings[binding.name] ? "selected" : ""}>${escapeHtml(visibleText(candidate.label, "Data display"))}</option>`).join("")}
+        </select>
+      </label>
+    `).join("");
+    bindingHost.querySelectorAll("[data-drawing-binding]").forEach((select) => {
+      select.addEventListener("change", () => {
+        ui.bindings[select.dataset.drawingBinding] = select.value;
+        applyActiveTool();
+      });
+    });
+  };
+  const activate = (toolId) => {
+    const tool = toolById.get(toolId);
+    if (!tool) {
+      setStatus(`Drawing tool '${toolId || "unknown"}' has an invalid descriptor.`, true);
+      return false;
+    }
+    ui.toolId = toolId;
+    renderBindings(tool);
+    syncButtons();
+    const bindings = activeBindings(tool);
+    const missing = tool.bindings.filter((binding) => !bindings[binding.name]);
+    if (missing.length) {
+      setStatus(`Select ${missing.map((binding) => binding.label).join(", ")} to activate ${tool.label}.`);
+      return false;
+    }
+    let accepted = false;
+    try {
+      accepted = controller?.activate?.(toolId, { bindings }) === true;
+    } catch (error) {
+      setStatus(error?.message || "Drawing tool activation failed.", true);
+      return false;
+    }
+    if (!accepted) {
+      setStatus("The selected drawing tool is unavailable for these bindings.", true);
+      return false;
+    }
+    setStatus(`${tool.label} active.`);
+    return true;
+  };
+  applyActiveTool = () => activate(ui.toolId);
+  toolButtons.forEach((button) => {
+    button.addEventListener("click", () => activate(button.dataset.drawingTool));
+  });
+  deleteButton?.addEventListener("click", () => {
+    if (controller?.deleteSelected?.() !== true) setStatus("Select a drawing before deleting it.", true);
+  });
+  const unsubscribe = controller?.subscribe?.((event) => {
+    if (!event || typeof event !== "object") return;
+    if (event.type === "selection") {
+      ui.selectedVisualizerId = event.visualizerId || "";
+      syncButtons();
+      setStatus(ui.selectedVisualizerId ? "Drawing selected. Drag to move it or press Delete." : "");
+      return;
+    }
+    if (event.type === "diagnostic" || event.type === "error") {
+      setStatus(event.message || "Drawing interaction failed.", true);
+      return;
+    }
+    if (persistDrawingControllerEvent(paneIndex, event)) {
+      if (event.type === "delete") {
+        ui.selectedVisualizerId = "";
+        setStatus("Drawing deleted.");
+      } else {
+        setStatus("Drawing saved.");
+      }
+      syncButtons();
+    }
+  });
+  const onKeyDown = (event) => {
+    if (event.key === "Escape") {
+      controller?.cancel?.();
+      const fallbackTool = toolRecords.find((record) => !record.error)?.tool;
+      if (fallbackTool) activate(fallbackTool.id);
+      event.preventDefault();
+      return;
+    }
+    const editingControl = event.target?.matches?.("input, select, textarea, [contenteditable='true']");
+    if (!editingControl && (event.key === "Delete" || event.key === "Backspace") && ui.selectedVisualizerId) {
+      if (controller?.deleteSelected?.() === true) event.preventDefault();
+    }
+  };
+  element.addEventListener("keydown", onKeyDown);
+  interactionSurface?.addEventListener?.("keydown", onKeyDown);
+  if (capabilityError) setStatus(capabilityError.message || "Drawing capabilities could not be loaded.", true);
+  else if (!controller) setStatus("Drawing interaction is unavailable in this chart version.", true);
+  else if (!toolRecords.length) setStatus("No drawing tools are available.", true);
+  else {
+    if (ui.toolId) activate(ui.toolId);
+    const invalidTool = toolRecords.find((record) => record.error);
+    if (invalidTool) setStatus(invalidTool.error, true);
+  }
+  syncButtons();
+  return {
+    element,
+    cleanup() {
+      unsubscribe?.();
+      element.removeEventListener("keydown", onKeyDown);
+      interactionSurface?.removeEventListener?.("keydown", onKeyDown);
+      controller?.dispose?.();
+    },
+  };
+}
+
 function chartEntryForPane(paneIndex) {
   return state.resultCharts.find((entry) => entry.paneIndex === paneIndex) || null;
 }
@@ -6720,7 +9080,7 @@ function chartEntryForPane(paneIndex) {
 function setChartViewError(paneIndex, message = "") {
   const node = document.querySelector(`[data-chart-view-error="${paneIndex}"]`);
   if (!node) return;
-  node.textContent = message;
+  node.textContent = visibleText(message);
   node.hidden = !message;
 }
 
@@ -6782,7 +9142,9 @@ function toggleChartLogScale(paneIndex) {
   if (!entry || !pane) return;
   pane.view ||= {};
   pane.view.logScale = !pane.view.logScale;
-  entry.chart.priceScale("right").applyOptions({ mode: window.TradeChartCore.priceScaleMode(pane.view.logScale) });
+  entry.chart.priceScale("right").applyOptions({
+    mode: window.TradeChartCore.priceScaleMode(pane.view.logScale),
+  });
   entry.logButton?.classList.toggle("active", !!pane.view.logScale);
   if (entry.logButton) entry.logButton.textContent = pane.view.logScale ? "Log" : "Linear";
   persistVisualizationView(state.selectedBacktest.visualization);
@@ -6791,11 +9153,13 @@ function toggleChartLogScale(paneIndex) {
 function toggleChartControlsCollapsed(paneIndex) {
   const entry = chartEntryForPane(paneIndex);
   const pane = state.selectedBacktest?.visualization?.panes?.[paneIndex];
-  if (!entry || !pane) return;
+  if (!pane) return;
   pane.view ||= {};
   pane.view.controlsCollapsed = !pane.view.controlsCollapsed;
-  if (entry.controls) entry.controls.hidden = !!pane.view.controlsCollapsed;
-  if (entry.controlsButton) entry.controlsButton.textContent = pane.view.controlsCollapsed ? "Show Config" : "Hide Config";
+  const controls = entry?.controls || document.querySelector(`[data-chart-controls="${paneIndex}"]`);
+  const controlsButton = entry?.controlsButton || document.querySelector(`[data-toggle-chart-controls="${paneIndex}"]`);
+  if (controls) controls.hidden = !!pane.view.controlsCollapsed;
+  if (controlsButton) controlsButton.textContent = pane.view.controlsCollapsed ? "Show Config" : "Hide Config";
   persistVisualizationView(state.selectedBacktest.visualization);
 }
 
@@ -6807,7 +9171,9 @@ function addChartPane() {
   setResultsActionError("");
   const result = { dataKeys: state.selectedBacktest.dataKeys || {} };
   const spec = normalizeVisualizationSpec(result, state.selectedBacktest.visualization || {});
-  const index = spec.panes.length + 1;
+  const usedIds = new Set((spec.panes || []).map((pane) => pane?.id).filter(Boolean));
+  let index = 1;
+  while (usedIds.has(`chart-${index}`)) index += 1;
   spec.panes.push({
     id: `chart-${index}`,
     title: `Custom Chart ${index}`,
@@ -6816,7 +9182,7 @@ function addChartPane() {
     visualizers: [],
     temporaryModules: [],
   });
-  state.selectedBacktest.loadedPanes ||= {};
+  state.selectedBacktest.paneProjectionCaches ||= new Map();
   syncVisualizationSpec(spec);
 }
 
@@ -6826,9 +9192,11 @@ function removeChartPane(paneIndex) {
   const pane = spec.panes?.[paneIndex];
   spec.panes = (spec.panes || []).filter((_, index) => index !== paneIndex);
   if (pane?.id) {
-    delete state.selectedBacktest.paneResults?.[pane.id];
-    delete state.selectedBacktest.loadingPanes?.[pane.id];
-    delete state.selectedBacktest.loadedPanes?.[pane.id];
+    invalidatePaneResult(pane);
+    const ui = resultsUiState();
+    delete ui.selectedTempByPane[pane.id];
+    delete ui.selectedVisualizerByPane[pane.id];
+    delete ui.selectionHintByPane[pane.id];
   }
   syncVisualizationSpec(spec);
 }
@@ -6842,17 +9210,37 @@ function toggleChartPaneCollapsed(paneIndex) {
   syncVisualizationSpec(spec);
 }
 
+function visualizerCompatibleDataState(visualizer) {
+  const ports = Object.keys(visualizer?.inputPorts || {});
+  if (!ports.length) return { available: true, count: 0, label: "No DataKey input" };
+  const counts = ports.map((name) => visualizer?.optionMap?.[name]?.length || 0);
+  const count = Math.min(...counts);
+  return {
+    available: counts.every((value) => value > 0),
+    count,
+    label: count === 1 ? "1 compatible DataKey" : `${count} compatible DataKeys`,
+  };
+}
+
 function renderChartControls(result, spec, pane, paneIndex) {
   const scoped = paneScopedSpec(spec, pane);
+  const catalog = window.TradeChartCore.visualizerCatalog(result, scoped);
+  const visualizers = catalog.filter((definition) => !(definition.capabilities?.interactions || []).length);
   const controls = document.createElement("div");
   controls.className = "chart-controls";
+  controls.dataset.chartControls = String(paneIndex);
   const tempTags = document.createElement("section");
   tempTags.className = "chart-tag-section";
   tempTags.innerHTML = `<h4>Temporary Instance Tags</h4><div class="chart-layer-tags">${
     (pane.temporaryModules || []).length
       ? (pane.temporaryModules || []).map((module) => {
         const outputs = Object.values(module.outputs || {}).join(", ");
-        return `<button class="chart-layer-tag ${selectedTempModuleId(paneIndex) === module.instanceId ? "active" : ""}" data-select-temp-module="${module.instanceId}" data-pane-index="${paneIndex}" type="button"><span class="layer-key">${forms.humanizeName(module.moduleId)}</span><span class="layer-data-key">${outputs}</span></button><button class="tag-remove" data-remove-temp-module="${module.instanceId}" data-pane-index="${paneIndex}" type="button">Remove</button>`;
+        const definition = allResultModuleDefinitions().find((candidate) => (
+          candidate.kind === module.kind && candidate.moduleId === module.moduleId
+        ));
+        const moduleLabel = visibleResourceName(definition, `${forms.humanizeName(module.kind || "")} Module`.trim());
+        const tagTitle = [moduleLabel, outputs].filter(Boolean).join(" · ");
+        return `<span class="chart-layer-tag-group"><button class="chart-layer-tag ${selectedTempModuleId(paneIndex) === module.instanceId ? "active" : ""}" data-select-temp-module="${escapeHtml(module.instanceId)}" data-pane-index="${paneIndex}" type="button" title="${escapeHtml(tagTitle)}"><span class="layer-key">${escapeHtml(moduleLabel)}</span><span class="layer-data-key">${escapeHtml(outputs)}</span></button><button class="tag-remove" data-remove-temp-module="${escapeHtml(module.instanceId)}" data-pane-index="${paneIndex}" type="button" aria-label="Remove temporary instance tag ${escapeHtml(moduleLabel)}" title="Remove ${escapeHtml(moduleLabel)}"><span aria-hidden="true">×</span></button></span>`;
       }).join("")
       : '<span class="muted">No temporary modules</span>'
   }</div>`;
@@ -6860,12 +9248,16 @@ function renderChartControls(result, spec, pane, paneIndex) {
   visualizerTags.className = "chart-tag-section";
   visualizerTags.innerHTML = `<h4>Data Tags</h4><div class="chart-layer-tags">${
     (pane.visualizers || []).length
-      ? (pane.visualizers || []).map((visualizer) => `<button class="chart-layer-tag ${selectedVisualizerId(paneIndex) === visualizer.id ? "active" : ""}" data-select-visualizer="${visualizer.id}" data-pane-index="${paneIndex}" type="button"><span class="layer-key">${visualizerSummary(result, scoped, pane, visualizer)}</span></button><button class="tag-remove" data-remove-layer="${visualizer.id}" data-pane-index="${paneIndex}" type="button">Remove</button>`).join("")
+      ? (pane.visualizers || []).map((visualizer) => {
+        const definition = catalog.find((item) => item.id === visualizer.callback);
+        const summary = visualizerSummary(result, scoped, pane, visualizer, definition);
+        const tagLabel = visualizerTagLabel(result, scoped, visualizer, definition);
+        return `<span class="chart-layer-tag-group"><button class="chart-layer-tag ${selectedVisualizerId(paneIndex) === visualizer.id ? "active" : ""}" data-select-visualizer="${escapeHtml(visualizer.id)}" data-pane-index="${paneIndex}" type="button" title="${escapeHtml(summary)}"><span class="layer-key">${escapeHtml(tagLabel)}</span></button><button class="tag-remove" data-remove-layer="${escapeHtml(visualizer.id)}" data-pane-index="${paneIndex}" type="button" aria-label="Remove data tag ${escapeHtml(tagLabel)}" title="Remove ${escapeHtml(tagLabel)}"><span aria-hidden="true">×</span></button></span>`;
+      }).join("")
       : '<span class="muted">No visualizers</span>'
   }</div>`;
   const control = document.createElement("section");
   control.className = "chart-control-zone";
-  const visualizers = window.TradeChartCore.visualizerCatalog(result, scoped);
   const selectedTemp = selectedTempModuleId(paneIndex) ? temporaryModuleById(paneIndex, selectedTempModuleId(paneIndex)) : null;
   const selectedTempKey = resultModuleDefinitionKey(selectedTemp);
   const selectedVisualizer = selectedVisualizerId(paneIndex) ? visualizerById(paneIndex, selectedVisualizerId(paneIndex)) : null;
@@ -6885,7 +9277,12 @@ function renderChartControls(result, spec, pane, paneIndex) {
       <h4>Data Display</h4>
       <select data-visualizer-select="${paneIndex}">
         <option value=""></option>
-        ${visualizers.map((item) => `<option value="${item.id}" ${item.id === selectedVisualizer?.callback ? "selected" : ""}>${item.label}</option>`).join("")}
+        ${visualizers.map((item) => {
+          const dataState = visualizerCompatibleDataState(item);
+          const selected = item.id === selectedVisualizer?.callback;
+          const displayLabel = visibleText(item.label, "Data display");
+          return `<option value="${escapeHtml(item.id)}" data-combobox-path="${escapeHtml(displayLabel)}" data-combobox-meta="${escapeHtml(dataState.label)}" ${selected ? "selected" : ""} ${!dataState.available && !selected ? "disabled" : ""}>${escapeHtml(displayLabel)}</option>`;
+        }).join("")}
       </select>
       <div data-visualizer-fields="${paneIndex}" class="structured-fields structured-fields-inline"></div>
       <button data-add-visualizer="${paneIndex}" type="button">${applyButtonLabel("Visualizer", selectedVisualizerId(paneIndex))}</button>
@@ -6896,12 +9293,24 @@ function renderChartControls(result, spec, pane, paneIndex) {
     temporaryModuleSelect,
     resultModuleDefinitions(),
     (row) => row.key,
-    (row) => `${row.kind} / ${row.moduleId} / ${row.version}`,
+    (row) => moduleChoiceLabel(row),
     "modules",
+    (row) => moduleChoiceMetadata(row),
   );
   if (selectedTempKey) temporaryModuleSelect.value = selectedTempKey;
   temporaryModuleSelect.dataset.repositoryHierarchy = "modules";
   enhanceHierarchicalRepositorySelect(temporaryModuleSelect);
+  forms.enhanceSearchableSelect(
+    control.querySelector(`[data-visualizer-select="${paneIndex}"]`),
+    {
+      placeholder: "Search or browse Data Displays",
+      ariaLabel: "Data Display",
+      rootLabel: "Data Displays",
+      collectionLabel: "Data Displays",
+      choiceLabel: "Data Display",
+      emptyText: "No Data Display is compatible with this Result.",
+    },
+  );
   controls.appendChild(tempTags);
   controls.appendChild(visualizerTags);
   controls.appendChild(control);
@@ -6915,9 +9324,9 @@ function renderChartControls(result, spec, pane, paneIndex) {
 
 function clearResultCharts() {
   state.resultCharts.forEach(({ chart, observer, cleanups = [] }) => {
-    observer?.disconnect();
-    cleanups.forEach((cleanup) => cleanup?.());
-    chart?.remove?.();
+    try { observer?.disconnect(); } catch { /* continue cleanup */ }
+    runChartCleanups(cleanups);
+    try { chart?.remove?.(); } catch { /* continue cleanup */ }
   });
   state.resultCharts = [];
 }
@@ -6928,12 +9337,11 @@ function drawVisualization(spec) {
   area.innerHTML = "";
   area.dataset.backtestId = state.selectedBacktest?.backtestId || "";
   const library = window.LightweightCharts;
-  if (!library?.createChart) {
-    const missing = document.createElement("div");
-    missing.className = "muted";
-    missing.textContent = "Chart library failed to load.";
-    area.appendChild(missing);
-    return;
+  if (state.selectedBacktest?.discoveryError) {
+    const failure = document.createElement("div");
+    failure.className = "chart-load-error";
+    failure.innerHTML = `<span>${escapeHtml(visibleText(state.selectedBacktest.discoveryError))}</span><button type="button" data-retry-datakey-discovery>Retry Data discovery</button>`;
+    area.appendChild(failure);
   }
   const panes = spec.panes?.length ? spec.panes : [];
   panes.forEach((pane, paneIndex) => {
@@ -6944,7 +9352,7 @@ function drawVisualization(spec) {
     const title = document.createElement("div");
     title.className = "chart-title";
     title.innerHTML = `
-      <span>${escapeHtml(pane.title || pane.id || "Chart")}</span>
+      <span>${escapeHtml(semanticPaneTitle(pane, paneIndex))}</span>
       <div class="chart-actions">
         <button class="inline-action" data-toggle-chart-controls="${paneIndex}" type="button">${pane.view.controlsCollapsed ? "Show Config" : "Hide Config"}</button>
         <button class="inline-action" data-toggle-chart="${paneIndex}" type="button">${pane.collapsed ? "Expand" : "Collapse"}</button>
@@ -6955,7 +9363,9 @@ function drawVisualization(spec) {
     panel.appendChild(title);
     area.appendChild(panel);
     if (pane.collapsed) return;
-    const result = paneResult(pane);
+    let chartForCleanup = null;
+    try {
+    const result = paneResult(pane, spec);
     const scoped = paneScopedSpec(spec, pane);
     const controls = renderChartControls(result, scoped, pane, paneIndex);
     controls.hidden = !!pane.view.controlsCollapsed;
@@ -6967,20 +9377,37 @@ function drawVisualization(spec) {
       panel.appendChild(empty);
       return;
     }
-    const hasLoadedData = Object.keys(result).some((key) => key !== "dataKeys");
-    if (!hasLoadedData && !paneHasLoaded(pane, spec)) {
-      const loading = document.createElement("div");
-      loading.className = "muted";
-      loading.textContent = state.selectedBacktest?.loadingPanes?.[pane.id] ? "Loading chart data" : "Queueing chart data";
-      panel.appendChild(loading);
-      ensurePaneResultLoaded(pane, spec).catch((error) => setHealth(false, error.message));
+    const loadError = paneLoadError(pane, spec);
+    if (loadError) {
+      const failure = document.createElement("div");
+      failure.className = "chart-load-error";
+      failure.innerHTML = `<span>${escapeHtml(visibleText(loadError.message, "Chart data could not be loaded."))}</span><button type="button" data-retry-chart="${paneIndex}">Retry</button>`;
+      panel.appendChild(failure);
       return;
     }
-    if (!hasLoadedData && paneHasLoaded(pane, spec)) {
-      const empty = document.createElement("div");
-      empty.className = "muted";
-      empty.textContent = "No chart data";
-      panel.appendChild(empty);
+    const loaded = paneHasLoaded(pane, spec);
+    if (!loaded) void ensurePaneResultLoaded(pane, spec);
+    const pendingVisualizerIds = panePendingVisualizerIds(pane, spec);
+    const hasProjectedResult = Object.keys(result.instanceResults || {}).length > 0
+      || Object.keys(result.errors || {}).length > 0;
+    if (!loaded && !hasProjectedResult) {
+      const loading = document.createElement("div");
+      loading.className = "muted";
+      loading.textContent = "Loading chart data";
+      panel.appendChild(loading);
+      return;
+    }
+    if (pendingVisualizerIds.size) {
+      const loading = document.createElement("div");
+      loading.className = "muted";
+      loading.textContent = `Loading data for ${pendingVisualizerIds.size} display${pendingVisualizerIds.size === 1 ? "" : "s"}`;
+      panel.appendChild(loading);
+    }
+    if (!library?.createChart) {
+      const missing = document.createElement("div");
+      missing.className = "chart-load-error";
+      missing.textContent = "Chart library failed to load. Configuration remains available above.";
+      panel.appendChild(missing);
       return;
     }
     const timeInfo = window.TradeChartCore.paneTimeInfo(result, pane, scoped);
@@ -6997,20 +9424,37 @@ function drawVisualization(spec) {
       <button type="button" data-apply-chart-range="${paneIndex}">Apply</button>
       <button type="button" data-fit-chart="${paneIndex}">Fit</button>
       <button type="button" class="${pane.view.logScale ? "active" : ""}" data-toggle-chart-log="${paneIndex}">${pane.view.logScale ? "Log" : "Linear"}</button>
-      <span class="muted">${escapeHtml(zone.label)} · ${timeInfo.showTime ? "intraday" : "date"}</span>
+      <span class="chart-granularity">${timeInfo.showTime ? "Intraday" : "Date"}</span>
       <span class="chart-view-error" data-chart-view-error="${paneIndex}" hidden></span>
     `;
     panel.appendChild(viewToolbar);
     const container = document.createElement("div");
     container.className = "tv-chart";
     container.style.height = "460px";
+    container.tabIndex = 0;
+    container.setAttribute("aria-label", `${semanticPaneTitle(pane, paneIndex)} drawing surface`);
     panel.appendChild(container);
     const chart = window.TradeChartCore.createFinancialChart(container, {
       timeZone: zone.timeZone,
       showTime: timeInfo.showTime,
       logScale: !!pane.view.logScale,
     });
+    chartForCleanup = chart;
     const chartContext = window.TradeChartCore.drawFinancialPane(library, chart, result, pane, scoped);
+    const drawingToolbar = createDrawingToolbar(
+      paneIndex,
+      chartContext?.interactionController || null,
+      container,
+    );
+    panel.insertBefore(drawingToolbar.element, container);
+    const diagnostics = mergeChartDiagnostics(
+      timeInfo?.diagnostics,
+      chartContext?.diagnostics,
+    ).filter((item) => !(
+      item?.code === "missing-instance-result"
+      && pendingVisualizerIds.has(item?.visualizerId)
+    ));
+    renderChartDiagnostics(panel, diagnostics, paneIndex);
     const savedStart = timeInfo.start == null
       ? null
       : (typeof storedStart === "number" && Number.isFinite(storedStart) ? Math.max(storedStart, timeInfo.start) : timeInfo.start);
@@ -7031,11 +9475,28 @@ function drawVisualization(spec) {
       if (container.isConnected) chart.applyOptions({ width: container.clientWidth });
     });
     observer.observe(container);
+    let viewSaveTimer = null;
+    const visibleRangeChanged = (range) => {
+      const start = window.TradeChartCore.chartTime(range?.from);
+      const end = window.TradeChartCore.chartTime(range?.to);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) return;
+      pane.view.start = new Date(start * 1000).toISOString();
+      pane.view.end = new Date(end * 1000).toISOString();
+      clearTimeout(viewSaveTimer);
+      viewSaveTimer = setTimeout(() => {
+        if (state.selectedBacktest?.visualization === spec) persistVisualizationView(spec);
+      }, 250);
+    };
+    chart.timeScale().subscribeVisibleTimeRangeChange?.(visibleRangeChanged);
+    const viewCleanup = () => {
+      clearTimeout(viewSaveTimer);
+      chart.timeScale().unsubscribeVisibleTimeRangeChange?.(visibleRangeChanged);
+    };
     const entry = {
       paneIndex,
       chart,
       observer,
-      cleanups: chartContext?.cleanups || [],
+      cleanups: [...(chartContext?.cleanups || []), drawingToolbar.cleanup, viewCleanup],
       controls,
       controlsButton: title.querySelector(`[data-toggle-chart-controls="${paneIndex}"]`),
       rangeStartInput: viewToolbar.querySelector(`[data-chart-start="${paneIndex}"]`),
@@ -7047,13 +9508,38 @@ function drawVisualization(spec) {
     viewToolbar.querySelector(`[data-apply-chart-range="${paneIndex}"]`)?.addEventListener("click", () => applyChartTimeRange(paneIndex));
     viewToolbar.querySelector(`[data-fit-chart="${paneIndex}"]`)?.addEventListener("click", () => fitChartPane(paneIndex));
     entry.logButton?.addEventListener("click", () => toggleChartLogScale(paneIndex));
-    entry.controlsButton?.addEventListener("click", () => toggleChartControlsCollapsed(paneIndex));
+    } catch (error) {
+      try { chartForCleanup?.remove?.(); } catch { /* preserve the pane failure */ }
+      const failure = document.createElement("div");
+      failure.className = "chart-load-error";
+      failure.textContent = visibleText(`Chart could not be drawn: ${error?.message || "unknown renderer error"}`);
+      panel.appendChild(failure);
+    }
   });
   area.querySelectorAll("[data-open-chart]").forEach((button) => {
     button.addEventListener("click", () => {
       const backtestId = currentResultBacktestId();
-      window.open(`/chart.html?backtestId=${encodeURIComponent(backtestId)}&pane=${button.dataset.openChart}`, "_blank", "noopener,noreferrer");
+      const pane = spec.panes?.[Number(button.dataset.openChart)];
+      const paneId = pane?.id ? `&paneId=${encodeURIComponent(pane.id)}` : `&pane=${button.dataset.openChart}`;
+      window.open(`/chart.html?backtestId=${encodeURIComponent(backtestId)}${paneId}`, "_blank", "noopener,noreferrer");
     });
+  });
+  area.querySelectorAll("[data-toggle-chart-controls]").forEach((button) => {
+    button.addEventListener("click", () => {
+      toggleChartControlsCollapsed(Number(button.dataset.toggleChartControls));
+    });
+  });
+  area.querySelectorAll("[data-retry-chart]").forEach((button) => {
+    button.addEventListener("click", () => retryPaneResult(Number(button.dataset.retryChart)));
+  });
+  area.querySelectorAll("[data-retry-chart-instance]").forEach((button) => {
+    button.addEventListener("click", () => retryPaneResult(
+      Number(button.dataset.retryChartInstance),
+      button.dataset.visualizerId || "",
+    ));
+  });
+  area.querySelector("[data-retry-datakey-discovery]")?.addEventListener("click", () => {
+    void retryResultDataKeyDiscovery();
   });
   area.querySelectorAll("[data-toggle-chart]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -7112,7 +9598,9 @@ function drawVisualization(spec) {
       setPaneSelectionHint(paneIndex, "");
       setSelectedTempModuleId(paneIndex, button.dataset.selectTempModule);
       const module = temporaryModuleById(paneIndex, button.dataset.selectTempModule);
-      const definition = resultModuleDefinitions().find((row) => row.kind === module?.kind && row.moduleId === module?.moduleId && row.version === module?.version);
+      const definition = resultModuleDefinitions().find((row) => (
+        row.kind === module?.kind && row.moduleId === module?.moduleId
+      ));
       const select = area.querySelector(`[data-temp-module-select="${paneIndex}"]`);
       if (definition && select) select.value = definition.key;
       fillTemporaryModuleDraft(paneIndex);
@@ -7224,8 +9712,11 @@ function renderEnvironmentDetails() {
   syncEnvironmentBlueprintRoute();
   const key = environmentEditorState.environmentKey;
   const draft = environmentEditorState.draftsByEnvironment[key] ||= {
-    environmentId: environment.builtin ? "" : (environment.environmentId || ""),
-    name: environment.builtin ? `${environment.name || "Environment"} Copy` : (environment.name || environment.environmentId || ""),
+    environmentId: environment.builtin
+      ? opaqueClientId("environment")
+      : (environment.environmentId || ""),
+    name: visibleText(environment.name, "Environment"),
+    protocolId: environment.protocolId || "",
     instances: structuredClone(environment.instances || {}),
     graph: structuredClone(environment.graph || { nodes: [], inputs: {}, outputs: {} }),
   };
@@ -7234,17 +9725,22 @@ function renderEnvironmentDetails() {
   const root = $("environmentGraphBuilder");
   root?.__flushPendingEmit?.();
   root?.__moduleGraphCleanup?.();
-  const modules = Object.entries(state.environmentModules || {})
+  const moduleDefinitions = Object.entries(state.environmentModules || {})
     .filter(([, definition]) => definition.status === "archived")
     .map(([moduleKey, definition]) => ({
       key: moduleKey,
       ...definition,
       folderPath: repositoryPlacement("environment-modules", moduleKey).folderPath,
     }));
+  const modules = window.TradeVersionSelection.currentRows(
+    moduleDefinitions,
+    ["kind", "moduleId"],
+  );
   const environmentVersions = state.environments.filter((row) => row.environmentId === environment.environmentId);
   window.ModuleGraphLiteGraph?.mount({
     root,
-    modules,
+    modules: moduleDefinitions,
+    moduleChoices: modules,
     moduleKind: "Environment",
     graphLabel: "Environment Graph",
     contextLabel: "Environment",
@@ -7254,18 +9750,11 @@ function renderEnvironmentDetails() {
     loadedVersion: environment.version,
     instances: draft.instances,
     alphaGraph: draft.graph,
-    meta: { contextId: key, name: environment.name || environment.environmentId || "Environment" },
+    meta: { contextId: key, name: visibleText(environment.name, "Environment") },
     resourceEditor: {
       title: "Environment Details",
-      description: "Identity and name for the next saved Version",
+      description: "Human-readable name and optional protocol for the next saved Version",
       fields: [
-        {
-          key: "environmentId",
-          label: "Environment ID",
-          value: draft.environmentId,
-          placeholder: "environment-id",
-          required: true,
-        },
         {
           key: "name",
           label: "Name",
@@ -7273,11 +9762,17 @@ function renderEnvironmentDetails() {
           placeholder: "Environment name",
           required: true,
         },
+        {
+          key: "protocolId",
+          label: "Protocol ID",
+          value: draft.protocolId,
+          placeholder: "Optional",
+        },
       ],
       contextName: (values) => values.name,
       onChange: (values) => {
-        draft.environmentId = values.environmentId;
         draft.name = values.name;
+        draft.protocolId = values.protocolId;
       },
     },
     actions: {
@@ -7292,6 +9787,7 @@ function renderEnvironmentDetails() {
           schemaVersion: 2,
           environmentId: draft.environmentId.trim(),
           name: draft.name.trim(),
+          ...optionalProtocolId(draft.protocolId),
           description: environment.description || "",
           instances: draft.instances,
           graph: draft.graph,
@@ -7306,6 +9802,7 @@ function renderEnvironmentDetails() {
           schemaVersion: 2,
           environmentId,
           name,
+          ...optionalProtocolId(draft.protocolId),
           description: environment.description || "",
           instances: draft.instances,
           graph: draft.graph,
@@ -7581,6 +10078,50 @@ async function loadResults(force = false) {
   await refreshSelectedBacktest();
 }
 
+async function discoverResultDataKeys(selected, selectionSeq) {
+  const paths = window.TradeChartCore.discoverySourcePaths(
+    { dataKeys: selected?.dataKeys || {} },
+    {},
+  );
+  selected.discoveryPaths = paths;
+  if (!paths.length) return;
+  resultDiscoveryRequest?.controller?.abort();
+  const request = { selected, controller: new AbortController() };
+  resultDiscoveryRequest = request;
+  try {
+    const response = await postResultJson(
+      `/api/backtests/${encodeURIComponent(selected.backtestId)}/result`,
+      { paths, temporaryModules: [] },
+      request.controller,
+      "DataKey discovery timed out. Retry when the Result service is available.",
+    );
+    if (selectionSeq !== resultSelectionSeq || state.selectedBacktest !== selected) return;
+    selected.dataKeys = window.TradeChartCore.dataKeyDeclarations({
+      ...(response.result || {}),
+      dataKeys: selected.dataKeys || {},
+    }, {});
+    selected.discoveryError = "";
+  } catch (error) {
+    if (
+      resultDiscoveryRequest !== request
+      || selectionSeq !== resultSelectionSeq
+      || state.selectedBacktest !== selected
+    ) return;
+    selected.discoveryError = error?.message || "Dynamic DataKeys could not be discovered";
+  } finally {
+    if (resultDiscoveryRequest === request) resultDiscoveryRequest = null;
+  }
+}
+
+async function retryResultDataKeyDiscovery() {
+  const selected = state.selectedBacktest;
+  if (!selected) return;
+  selected.discoveryError = "";
+  renderResults();
+  await discoverResultDataKeys(selected, resultSelectionSeq);
+  if (state.selectedBacktest === selected) renderResults();
+}
+
 async function refreshOverview() {
   serviceRuntimeState = { ...serviceRuntimeState, loading: true };
   renderOverview();
@@ -7615,8 +10156,6 @@ async function ensureViewData(viewId, force = false) {
     await loadModules(force);
   } else if (viewId === "data") {
     await loadData(force);
-  } else if (viewId === "mining-kline") {
-    await miningKLine?.load(force);
   } else if (viewId === "backtests") {
     await loadBacktests(force);
   } else if (viewId === "results") {
@@ -7629,21 +10168,55 @@ async function ensureViewData(viewId, force = false) {
 async function refreshSelectedBacktest() {
   const backtestId = state.resultBacktestId;
   if (!backtestId) return;
+  const previousSelected = state.selectedBacktest?.backtestId === backtestId
+    ? state.selectedBacktest
+    : null;
   const selectionSeq = ++resultSelectionSeq;
+  ++visualizationSaveEpoch;
+  resultDiscoveryRequest?.controller?.abort();
+  resultDiscoveryRequest = null;
+  for (const cache of state.selectedBacktest?.paneProjectionCaches?.values?.() || []) {
+    for (const [visualizerId, entry] of cache.entries || []) {
+      if (entry?.status !== "loading") continue;
+      abortVisualizerProjection(entry);
+      cache.entries.delete(visualizerId);
+    }
+  }
   ++visualizationSaveSeq;
   clearTimeout(visualizationSaveTimer);
   visualizationSaveTimer = null;
+  state.resultViewError = null;
   state.selectedBacktest = null;
   clearResultCharts();
-  $("metricStrip").innerHTML = "";
+  renderResultContext(null);
   $("chartArea").dataset.backtestId = "";
   $("chartArea").innerHTML = '<div class="muted">Loading selected backtest</div>';
-  const selected = await getJson(`/api/backtests/${encodeURIComponent(backtestId)}/view`);
+  syncResultsActionState();
+  let selected;
+  try {
+    const [view, visualizations] = await Promise.all([
+      getJson(`/api/backtests/${encodeURIComponent(backtestId)}/view`),
+      getJson(`/api/visualizations?backtestId=${encodeURIComponent(backtestId)}`),
+    ]);
+    selected = view;
+    applyCurrentVisualizationRecord(selected, visualizations);
+  } catch (error) {
+    if (selectionSeq !== resultSelectionSeq || state.resultBacktestId !== backtestId) return;
+    state.selectedBacktest = previousSelected;
+    state.resultViewError = {
+      backtestId,
+      message: error?.message || "The Result view is unavailable.",
+    };
+    renderResults();
+    throw error;
+  }
   if (selectionSeq !== resultSelectionSeq || state.resultBacktestId !== backtestId) return;
-  selected.paneResults = {};
-  selected.loadingPanes = {};
-  selected.loadedPanes = {};
+  state.resultViewError = null;
+  selected.paneProjectionCaches = new Map();
   state.selectedBacktest = selected;
+  renderResults();
+  await discoverResultDataKeys(selected, selectionSeq);
+  if (selectionSeq !== resultSelectionSeq || state.selectedBacktest !== selected) return;
   renderResults();
 }
 
@@ -7697,7 +10270,7 @@ $("repositoryFolderForm")?.addEventListener("submit", async (event) => {
     renderEmbeddedRepositoryBrowser(repository);
     refreshHierarchicalRepositorySelects();
   } catch (error) {
-    $("repositoryFolderDialogError").textContent = error.message;
+    $("repositoryFolderDialogError").textContent = visibleText(error.message);
     $("repositoryFolderDialogError").hidden = false;
   } finally {
     $("confirmRepositoryFolderBtn").disabled = false;
@@ -7765,6 +10338,7 @@ $("backToPipelineListBtn")?.addEventListener("click", () => {
 $("addPipelineBtn")?.addEventListener("click", () => {
   if ($("addPipelineBtn")?.disabled) return;
   $("createPipelineName").value = "";
+  $("createPipelineProtocolId").value = "";
   setCreatePipelineError("");
   $("createPipelineDialog").showModal();
   requestAnimationFrame(() => $("createPipelineName").focus());
@@ -7777,8 +10351,8 @@ $("showInactivePipelinesBtn")?.addEventListener("click", async () => {
 $("clonePipelineBtn")?.addEventListener("click", () => {
   const pipeline = selectedPipelineRecord();
   if (!pipeline || $("clonePipelineBtn")?.disabled) return;
-  $("clonePipelineSource").textContent = `Source: ${pipeline.name || pipeline.pipelineId}`;
-  $("clonePipelineName").value = `${pipeline.name || pipeline.pipelineId} Copy`;
+  $("clonePipelineSource").textContent = `Source: ${visibleResourceName(pipeline, "Pipeline")}`;
+  $("clonePipelineName").value = `${visibleResourceName(pipeline, "Pipeline")} Copy`;
   setClonePipelineError("");
   $("clonePipelineDialog").showModal();
   requestAnimationFrame(() => $("clonePipelineName").select());
@@ -7814,7 +10388,7 @@ $("clonePipelineForm")?.addEventListener("submit", async (event) => {
 $("disablePipelineBtn")?.addEventListener("click", () => {
   const pipeline = selectedPipelineRecord();
   if (!pipeline || $("disablePipelineBtn")?.disabled) return;
-  $("disablePipelineText").textContent = `Disable ${pipeline.name || pipeline.pipelineId}? Archived versions remain immutable and available for inspection.`;
+  $("disablePipelineText").textContent = `Disable ${visibleResourceName(pipeline, "Pipeline")}? Archived versions remain immutable and available for inspection.`;
   $("disablePipelineReason").value = "";
   setArchivePipelineError("");
   $("disablePipelineDialog").showModal();
@@ -7893,6 +10467,7 @@ $("moduleUploadForm")?.addEventListener("submit", async (event) => {
       kind,
       moduleId: $("moduleUploadId").value.trim(),
       name: $("moduleUploadName").value.trim(),
+      ...optionalProtocolId($("moduleUploadProtocolId").value),
       activationMode: manifest.activationMode || "PythonModule",
       parameters: manifest.activationMode === "ProcessRunner"
         ? manifest.parameters
@@ -7902,7 +10477,7 @@ $("moduleUploadForm")?.addEventListener("submit", async (event) => {
         inputs: parseModuleJsonField("moduleUploadInputs", "Input ports"),
         outputs: parseModuleJsonField("moduleUploadOutputs", "Output ports"),
       },
-      description: $("moduleUploadDescription").value.trim(),
+      description: moduleUploadPresentationValue($("moduleUploadDescription").value.trim(), true),
       files,
     };
     const repositoryEndpoint = `/api/${state.selectedModuleRepository}`;
@@ -7915,7 +10490,9 @@ $("moduleUploadForm")?.addEventListener("submit", async (event) => {
     button.disabled = false;
   }
 });
-$("createPipelineName")?.addEventListener("input", () => setCreatePipelineError(""));
+["createPipelineName", "createPipelineProtocolId"].forEach((id) => {
+  $(id)?.addEventListener("input", () => setCreatePipelineError(""));
+});
 $("createPipelineForm")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const name = $("createPipelineName").value.trim();
@@ -7927,7 +10504,10 @@ $("createPipelineForm")?.addEventListener("submit", async (event) => {
   confirm.disabled = true;
   setCreatePipelineError("");
   try {
-    const response = await postJson("/api/pipelines", { name });
+    const response = await postJson("/api/pipelines", {
+      name,
+      ...optionalProtocolId($("createPipelineProtocolId").value),
+    });
     $("createPipelineDialog").close();
     loadedViews.delete("pipeline-browser");
     delete state.repositoryCatalogs.pipelines;
@@ -8198,13 +10778,9 @@ async function submitPreparedBacktest() {
         ];
         publishBacktestOperations([response.job]);
       }
-      $("backtestStatus").textContent = response.job?.jobId
-        ? `Submitted ${response.job.jobId}`
-        : "Backtest submitted";
+      $("backtestStatus").textContent = "Backtest submitted";
       backtestEntryState.compositionValidation = "submitted";
-      backtestEntryState.compositionMessage = response.job?.jobId
-        ? `Backtest queued · ${response.job.jobId} · Build remains cached`
-        : "Backtest queued · Build remains cached";
+      backtestEntryState.compositionMessage = "Backtest queued · Build remains cached";
       renderBacktestCompositionStatus();
       renderBacktestJobs();
       scheduleBacktestJobPoll(250);
@@ -8241,24 +10817,6 @@ $("runBacktestBtn").addEventListener("click", () => {
   }
   buildBacktestSubmission();
 });
-$("resultTimezoneBtn")?.addEventListener("click", () => {
-  const spec = state.selectedBacktest?.visualization;
-  if (!spec) return;
-  const current = currentResultTimeZone(spec);
-  const candidate = window.prompt("IANA time zone", current.timeZone);
-  if (candidate === null) return;
-  const timeZone = candidate.trim();
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone }).format(0);
-  } catch {
-    setVisualizationSpecError("Enter a valid IANA time zone, for example UTC or Europe/London.");
-    return;
-  }
-  spec.timeZone = timeZone;
-  persistVisualizationView(spec);
-  syncResultTimezoneButton(spec);
-  drawVisualization(spec);
-});
 $("chainDataset").addEventListener("click", () => {
   switchView("data");
   requestAnimationFrame(() => $("dataRepositoryBrowser")?.scrollIntoView({ behavior: "smooth", block: "center" }));
@@ -8290,6 +10848,7 @@ $("chainAnalysisDetails")?.addEventListener("click", () => {
 $("backFromResultBtn")?.addEventListener("click", () => {
   state.resultBacktestId = "";
   state.selectedBacktest = null;
+  state.resultViewError = null;
   switchView("backtests");
 });
 $("backtestArrangeBtn")?.addEventListener("click", arrangeBacktestGraph);
@@ -8315,6 +10874,7 @@ $("backtestPipelineSelect")?.addEventListener("change", (event) => {
   const [pipelineId = "", version = ""] = (event.target.value || "").split("::");
   backtestEntryState.pipelineId = pipelineId;
   backtestEntryState.pipelineVersion = version;
+  renderBacktestPipelineParameters();
   invalidateBacktestBuild("Pipeline changed · Build again before running");
   renderBacktestChain();
 });
@@ -8329,36 +10889,90 @@ $("backtestEnvironmentSelect")?.addEventListener("change", () => {
   renderBacktestChain();
 });
 $("backtestAnalysisSelect")?.addEventListener("change", () => {
-  const analysis = selectedBacktestAnalysis();
-  backtestEntryState.analysisKey = analysis ? `${analysis.analysisId}::${analysis.version}` : "";
+  renderBacktestAnalysisParameters();
   invalidateBacktestBuild("Analysis changed · Build again before running");
   renderBacktestChain();
 });
 $("configureBacktestEnvironment")?.addEventListener("click", () => {
-  const environment = selectedBacktestEnvironment();
-  environmentEditorState.environmentKey = environment
-    ? `${environment.environmentId}::${environment.version}`
-    : "";
-  switchBacktestSection("environment");
+  void openBacktestConfig("environment");
 });
-$("configureBacktestSampler")?.addEventListener("click", openBacktestSamplerConfig);
+$("configureBacktestSampler")?.addEventListener("click", () => void openBacktestConfig("sampler"));
+$("configureBacktestPipeline")?.addEventListener("click", () => void openBacktestConfig("pipeline"));
+$("configureBacktestAnalysis")?.addEventListener("click", () => void openBacktestConfig("analysis"));
 $("cancelBacktestSamplerConfigBtn")?.addEventListener("click", () => {
   $("backtestSamplerConfigDialog").close();
 });
+$("backtestConfigInstanceList")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-backtest-config-instance]");
+  if (!button || (
+    button.dataset.backtestConfigInstance === activeBacktestConfigInstanceId
+      && button.dataset.backtestConfigScope === activeBacktestConfigScope
+  )) return;
+  try {
+    if (activeBacktestConfigJsonDirty) readBacktestConfigJsonDraft();
+    else commitBacktestConfigFields();
+    activeBacktestConfigInstanceId = button.dataset.backtestConfigInstance || "";
+    activeBacktestConfigScope = button.dataset.backtestConfigScope || "";
+    renderBacktestConfigInstanceList();
+    renderBacktestConfigFields();
+    setBacktestConfigError("");
+  } catch (error) {
+    setBacktestConfigError(error?.message || "Invalid Module configuration");
+  }
+});
+$("backtestConfigInstanceSearch")?.addEventListener("input", renderBacktestConfigInstanceList);
+$("backtestConfigJson")?.addEventListener("input", () => {
+  activeBacktestConfigJsonDirty = true;
+  setBacktestConfigError("");
+});
+$("syncBacktestConfigJsonBtn")?.addEventListener("click", () => {
+  try {
+    readBacktestConfigJsonDraft();
+    setBacktestConfigError("");
+  } catch (error) {
+    setBacktestConfigError(error?.message || "Invalid JSON configuration");
+  }
+});
+$("resetBacktestConfigBtn")?.addEventListener("click", () => {
+  const descriptor = backtestConfigDescriptors()[0];
+  activeBacktestConfigDraft = activeBacktestConfigResource === "sampler"
+    ? structuredClone(descriptor?.config || {})
+    : {
+      ...(activeBacktestConfigResource === "pipeline" ? { configOverride: {} } : {}),
+      moduleConfigOverrides: {},
+    };
+  activeBacktestConfigInstanceId = descriptor?.instanceId || "";
+  activeBacktestConfigScope = descriptor?.scope || "";
+  syncBacktestConfigJsonFromDraft();
+  renderBacktestConfigWorkbench();
+  setBacktestConfigError("");
+});
 $("applyBacktestSamplerConfigBtn")?.addEventListener("click", () => {
   try {
-    backtestEntryState.samplerParameters = forms.readSchemaFields(
-      $("backtestSamplerConfigFields"),
-      selectedSamplerParameterSchema(),
-    );
-    setBacktestSamplerConfigError("");
+    if (activeBacktestConfigJsonDirty) readBacktestConfigJsonDraft();
+    else commitBacktestConfigFields();
+    const value = structuredClone(activeBacktestConfigDraft);
+    validateBacktestConfigDraft(activeBacktestConfigResource, value);
+    setBacktestConfigValue(activeBacktestConfigResource, value);
+    setBacktestConfigError("");
     $("backtestSamplerConfigDialog").close();
     renderBacktestSamplerParameters();
-    invalidateBacktestBuild("Sampler configuration changed · Build again before running");
+    renderBacktestPipelineParameters();
+    renderBacktestEnvironmentParameters();
+    renderBacktestAnalysisParameters();
+    invalidateBacktestBuild("Configuration changed · Build again before running");
     renderBacktestChain();
   } catch (error) {
-    setBacktestSamplerConfigError(error?.message || "Invalid Sampler parameters");
+    setBacktestConfigError(error?.message || "Invalid JSON configuration");
   }
+});
+$("backtestSamplerConfigDialog")?.addEventListener("close", () => {
+  activeBacktestConfigResource = "";
+  activeBacktestConfigInstanceId = "";
+  activeBacktestConfigScope = "";
+  activeBacktestConfigDraft = {};
+  activeBacktestConfigJsonDirty = false;
+  activeBacktestConfigPresentationAliases = new Map();
 });
 $("showArchivedBacktestsBtn")?.addEventListener("click", () => {
   showArchivedBacktests = !showArchivedBacktests;
@@ -8382,18 +10996,28 @@ $("saveVisualizationBtn").addEventListener("click", () => {
       return;
     }
     setVisualizationSpecError("");
-    await postJson("/api/visualizations", {
-      backtestId,
-      name: "current",
-      visualizationId: `${backtestId}-current`,
-      spec,
-    });
+    ++visualizationSaveSeq;
+    clearTimeout(visualizationSaveTimer);
+    visualizationSaveTimer = null;
+    await enqueueVisualizationSave(backtestId, spec);
     state.selectedBacktest.visualization = spec;
     renderResults();
     setHealth(true, "Online");
   });
 });
 $("cancelUnloadBtn").addEventListener("click", () => $("unloadDialog").close());
+$("removeConfiguredModuleBtn").addEventListener("click", () => {
+  if (pipelineBlueprintBusyMessage() || pendingModuleLoad?.mode !== "edit") return;
+  const pending = pendingModuleLoad;
+  const instanceId = pending.target.instanceId;
+  const stage = pending.target.stage;
+  const label = visibleResourceName(pending.module, `${forms.humanizeName(pending.kind || "")} Module`.trim());
+  pendingModuleLoad = null;
+  $("moduleLoadDialog").oninput = null;
+  $("moduleLoadDialog").onchange = null;
+  $("moduleLoadDialog").close();
+  openUnloadDialog(pending.kind, label, () => unloadStageInstance(stage, instanceId));
+});
 $("cancelModuleLoadBtn").addEventListener("click", () => {
   pendingModuleLoad = null;
   setModuleLoadDialogError("");
@@ -8403,7 +11027,10 @@ $("cancelModuleLoadBtn").addEventListener("click", () => {
 });
 $("confirmModuleLoadBtn").addEventListener("click", () => {
   if ($("confirmModuleLoadBtn")?.disabled) return;
-  runUiAction("Loading module", async () => confirmModuleLoad());
+  const actionLabel = pendingModuleLoad?.mode === "edit"
+    ? "Applying Module configuration"
+    : "Loading module";
+  runUiAction(actionLabel, async () => confirmModuleLoad());
 });
 
 $("accountMenuBtn").addEventListener("click", () => {
@@ -8457,6 +11084,20 @@ $("logoutBtn").addEventListener("click", () => {
 
 async function initializeAuthenticatedApplication() {
   await loadBrowserSession();
+  try {
+    await loadSubsystemNavigation();
+  } catch (error) {
+    const group = $("subsystemNavGroup");
+    const root = $("subsystemNavLinks");
+    if (group && root) {
+      const diagnostic = document.createElement("span");
+      diagnostic.className = "nav-btn";
+      diagnostic.textContent = "Subsystems unavailable";
+      diagnostic.title = visibleText(error?.message, "Subsystem catalog is unavailable.");
+      root.replaceChildren(diagnostic);
+      group.hidden = false;
+    }
+  }
   await window.TradeUiSync?.start();
   initializeBacktestGraph();
   currentView = normalizedViewFromPath(location.pathname);

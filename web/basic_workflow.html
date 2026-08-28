@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Basic · Trade Engine</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/basic_workflow.css" />
+  </head>
+  <body class="basic-home-route">
+    <header class="topbar">
+      <div>
+        <h1>Trade Engine</h1>
+        <p class="muted">Basic · Stock research</p>
+      </div>
+      <div class="toolbar">
+        <a class="bw-header-link" href="/overview" aria-label="Back to Trade Engine overview">Back</a>
+      </div>
+    </header>
+
+    <main class="bw-home">
+      <section class="panel bw-market-panel" aria-labelledby="bwMarketTitle">
+        <div class="panel-head bw-market-heading">
+          <div>
+            <h2 id="bwMarketTitle">Stock catalog</h2>
+            <span id="bwSnapshotMeta" class="muted">Loading the latest saved stock list.</span>
+            <span class="muted bw-catalog-note">Price data is downloaded when a workspace opens.</span>
+            <span id="bwStatus" class="bw-plain-status" role="status" aria-live="polite">Loading stock catalog…</span>
+          </div>
+          <div class="bw-catalog-actions">
+            <strong id="bwSnapshotTitle">Loading…</strong>
+            <button id="bwSyncMarket" type="button" aria-label="Refresh the complete stock list">Refresh stock list</button>
+          </div>
+        </div>
+
+        <div class="bw-market-controls">
+          <nav class="bw-market-tabs" aria-label="Stock lists" role="tablist">
+            <button id="bwWatchlistTab" class="active" data-market-tab="watchlist" type="button" role="tab" aria-selected="true" aria-controls="bwMarketTabPanel">Watchlist</button>
+            <button id="bwAllStocksTab" data-market-tab="all" type="button" role="tab" aria-selected="false" aria-controls="bwMarketTabPanel" tabindex="-1">All stocks</button>
+          </nav>
+          <label class="bw-search" for="bwInstrumentSearch">
+            <span>Search</span>
+            <input id="bwInstrumentSearch" class="filter" type="search" autocomplete="off" placeholder="Symbol, company, or exchange" />
+          </label>
+          <span id="bwListCount" class="muted">0 shown</span>
+        </div>
+
+        <div id="bwMarketTabPanel" role="tabpanel" aria-labelledby="bwWatchlistTab">
+          <div class="bw-market-columns" aria-hidden="true">
+            <span>Symbol</span><span>Company</span><span>Exchange / currency</span><span>Data as of</span><span>Action</span><span>Watch</span>
+          </div>
+          <div id="bwInstrumentList" class="bw-instrument-list" role="list" aria-live="polite"></div>
+          <footer class="bw-pagination" aria-label="Stock list pagination">
+            <span id="bwPageRange" class="muted">0–0 of 0</span>
+            <div>
+              <button id="bwPreviousPage" type="button" disabled>Previous</button>
+              <button id="bwNextPage" type="button" disabled>Next</button>
+            </div>
+          </footer>
+        </div>
+      </section>
+    </main>
+
+    <script src="/basic_workflow.js"></script>
+  </body>
+</html>

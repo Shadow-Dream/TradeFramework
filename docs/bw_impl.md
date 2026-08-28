@@ -35,7 +35,7 @@ TradeEngine 已公开的 Dataset、Sampler、Module、Graph、Backtest 和 Resul
 
 | 资源 ID | 类型 | 版本 | contentDigest |
 |---|---|---:|---|
-| `basic-price-map-sampler` | Sampler | 1 | `sha256:bf5b04f5ceb218673c9aebdcd7346f951a3fd56d19948c4cb1065315af19dd97` |
+| `basic-price-map-sampler` | Sampler | 1 | `sha256:a0889fe8ea07903affe35b1ca31dd436e73bf7cf1fb73352e509103815c63f60` |
 | `basic-price-map-universe` | Universe Module | 1 | `sha256:3187ab94eeb0df9b317741b1b3a87e5242ccffe638bba67483cf7c518e391d33` |
 | `basic-neutral-score-map` | Signal Module | 1 | `sha256:9b3aa826ac3885d6d1e69cb51ebad08572410b0aea3e7e4225b72506bfbe4d10` |
 | `basic-score-map-position-target` | Target Module | 1 | `sha256:9b925ce6db74146ddd0d56ef26be65850a99ec36fe4a72d4ac156251dbadba43` |

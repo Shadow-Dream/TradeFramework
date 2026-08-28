@@ -10,6 +10,7 @@ import unittest
 import json
 import subprocess
 import sys
+from concurrent.futures import Future
 from pathlib import Path
 from unittest import mock
 
@@ -373,6 +374,116 @@ class BacktestJobManagerTests(unittest.TestCase):
             self.assertEqual(failed_job["phase"], "failed")
             self.assertIn("invalid strategy output", failed_job["error"])
             self.assertEqual(completed_job["completedCycles"], 2)
+        finally:
+            manager.shutdown()
+
+    def test_starved_single_worker_dispatch_is_recovered_without_new_job(self):
+        class StarvedExecutor:
+            def __init__(self):
+                self.future = Future()
+                self.shutdown_calls = []
+
+            def submit(self, *_args, **_kwargs):
+                return self.future
+
+            def shutdown(self, *, wait, cancel_futures):
+                self.shutdown_calls.append((wait, cancel_futures))
+
+        evidence = {}
+
+        def fake_run(
+            _config, _request, *, backtest_id, progress_callback,
+            execution_root, should_stop,
+        ):
+            del execution_root, should_stop
+            progress_callback(1, 1, "running")
+            evidence[backtest_id] = (engine_clock.utc_now(), 1)
+
+        events = []
+        manager = BacktestJobManager(
+            self.config,
+            self.job_services(),
+            max_workers=1,
+            runtime_launcher=fake_run,
+            event_callback=lambda event_type, payload: events.append(
+                (event_type, payload)
+            ),
+        )
+        manager._completed_evidence = (
+            lambda _job_id, backtest_id: evidence.get(backtest_id)
+        )
+        original = manager._executor
+        original.shutdown(wait=True, cancel_futures=True)
+        starved = StarvedExecutor()
+        manager._executor = starved
+        try:
+            with mock.patch(
+                "engine.jobs.manager._QUEUED_DISPATCH_TIMEOUT_SECONDS",
+                0.02,
+            ):
+                submitted = manager.submit(self.request("starved-dispatch"))
+                completed = self.wait_for(
+                    manager,
+                    submitted["jobId"],
+                    {"completed"},
+                )
+            self.assertEqual(completed["backtestId"], submitted["backtestId"])
+            self.assertEqual(completed["completedCycles"], 1)
+            self.assertTrue(starved.future.cancelled())
+            self.assertIn((False, True), starved.shutdown_calls)
+            recovered = [
+                payload for event_type, payload in events
+                if event_type == "backtest.job.dispatch.recovered"
+            ]
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(recovered[0]["jobId"], submitted["jobId"])
+        finally:
+            manager.shutdown()
+
+    def test_permanently_starved_dispatch_fails_instead_of_staying_queued(self):
+        class StarvedExecutor:
+            def __init__(self):
+                self.future = Future()
+                self.shutdown_calls = []
+
+            def submit(self, *_args, **_kwargs):
+                return self.future
+
+            def shutdown(self, *, wait, cancel_futures):
+                self.shutdown_calls.append((wait, cancel_futures))
+
+        manager = BacktestJobManager(
+            self.config,
+            self.job_services(),
+            max_workers=1,
+        )
+        original = manager._executor
+        original.shutdown(wait=True, cancel_futures=True)
+        first = StarvedExecutor()
+        second = StarvedExecutor()
+        manager._executor = first
+        try:
+            with (
+                mock.patch(
+                    "engine.jobs.manager._QUEUED_DISPATCH_TIMEOUT_SECONDS",
+                    0.02,
+                ),
+                mock.patch.object(manager, "_new_executor", return_value=second),
+            ):
+                submitted = manager.submit(self.request("permanent-starvation"))
+                failed = self.wait_for(
+                    manager,
+                    submitted["jobId"],
+                    {"failed"},
+                )
+            self.assertEqual(failed["backtestId"], submitted["backtestId"])
+            self.assertEqual(
+                failed["error"],
+                "Backtest dispatcher remained queued after one recovery attempt.",
+            )
+            self.assertTrue(first.future.cancelled())
+            self.assertTrue(second.future.cancelled())
+            self.assertIn((False, True), first.shutdown_calls)
         finally:
             manager.shutdown()
 

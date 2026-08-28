@@ -755,6 +755,9 @@ def _backtest_row(row, include_visualization=False, include_data_keys=False):
         "visualizable": True,
         "visualizationIssue": "",
     }
+    protocol_id = backtest_result_views.backtest_request_protocol_id(raw_request)
+    if protocol_id is not None:
+        item["protocolId"] = protocol_id
     if include_visualization:
         item["visualization"] = visualization_contracts.require_spec(
             raw_visualization

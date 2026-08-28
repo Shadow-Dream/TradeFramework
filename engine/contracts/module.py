@@ -11,6 +11,7 @@ from engine.contracts.archive import (
 )
 from engine.contracts.data_model import normalize_data_key_schema
 from engine.contracts.json_schema import normalize_module_config_schema
+from engine.contracts.protocol import normalize_protocol_id
 
 
 PROTOCOL_VERSION = "pipeline-data-v5"
@@ -36,7 +37,7 @@ ACTIVATION_MODES = frozenset({"PythonModule", "ProcessRunner"})
 
 MODULE_DRAFT_FIELDS = frozenset({
     "kind", "moduleId", "name", "activationMode", "parameters",
-    "configSchema", "ports", "description", "files",
+    "configSchema", "ports", "description", "files", "protocolId",
 })
 MODULE_DEFINITION_FIELDS = (MODULE_DRAFT_FIELDS - {"files"}) | frozenset({
     "version", "builtin", "status", "contentDigest", "createdAt", "archive",
@@ -245,6 +246,11 @@ def validate_module_definition(definition):
         raise ValueError(f"Module '{module_id}' name is required.")
     if not isinstance(definition["builtin"], bool):
         raise ValueError(f"Module '{module_id}' builtin must be a boolean.")
+    if "protocolId" in definition:
+        normalize_protocol_id(
+            definition["protocolId"],
+            label=f"Module '{module_id}' protocolId",
+        )
     activation = definition["activationMode"]
     if activation not in ACTIVATION_MODES:
         raise ValueError(

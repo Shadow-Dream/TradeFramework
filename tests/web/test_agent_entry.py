@@ -18,7 +18,7 @@ class AgentEntryTests(unittest.TestCase):
 
     def test_agent_entry_is_the_last_sidebar_group(self):
         sidebar = HTML_SOURCE.split('<nav class="side"', 1)[1].split("</nav>", 1)[0]
-        self.assertGreater(sidebar.index('>Agent</h2>'), sidebar.index('>Mining</h2>'))
+        self.assertNotIn('>Mining</h2>', sidebar)
         self.assertEqual(sidebar.count('class="side-nav-group side-nav-agent"'), 1)
 
     def test_removed_selection_handoff_has_no_frontend_state_or_request(self):

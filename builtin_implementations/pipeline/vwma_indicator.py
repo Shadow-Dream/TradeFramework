@@ -8,7 +8,14 @@ class VwmaIndicator(SignalModule):
         volume = number(volume)
         if price is None or volume is None:
             return {"vwma": None}
+        if volume < 0:
+            raise ValueError("VWMA received negative volume.")
         size = period(self.config)
         price_volume = push_window(self.state, "priceVolume", price * volume, size)
         volumes = push_window(self.state, "volume", volume, size)
-        return {"vwma": sum(price_volume) / sum(volumes) if len(volumes) == size and sum(volumes) else None}
+        total_volume = sum(volumes)
+        return {
+            "vwma": sum(price_volume) / total_volume
+            if len(volumes) == size and total_volume
+            else None
+        }

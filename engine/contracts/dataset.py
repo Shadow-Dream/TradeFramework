@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 from engine.contracts.data_model import validate_normalized_json_value
 from engine.contracts.exact_fields import require_exact_fields
+from engine.contracts.protocol import PROTOCOL_ID_FIELD, normalize_protocol_id
 from engine.core import resource_ids
 
 
@@ -37,7 +38,7 @@ def normalize_dataset_source(source):
 def normalize_dataset_descriptor(dataset):
     require_exact_fields(
         dataset,
-        allowed={"datasetId", "name", "source", "metadata"},
+        allowed={"datasetId", "name", "source", "metadata", PROTOCOL_ID_FIELD},
         required={"datasetId", "name", "source", "metadata"},
         label="Dataset publication",
     )
@@ -49,12 +50,18 @@ def normalize_dataset_descriptor(dataset):
     if not isinstance(dataset["metadata"], dict):
         raise ValueError("Dataset publication metadata must be an object.")
     validate_normalized_json_value(dataset["metadata"], {}, path="Dataset.metadata")
-    return {
+    normalized = {
         "datasetId": dataset_id,
         "name": dataset["name"].strip(),
         "source": normalize_dataset_source(dataset["source"]),
         "metadata": copy.deepcopy(dataset["metadata"]),
     }
+    if PROTOCOL_ID_FIELD in dataset:
+        normalized[PROTOCOL_ID_FIELD] = normalize_protocol_id(
+            dataset[PROTOCOL_ID_FIELD],
+            label="Dataset publication protocolId",
+        )
+    return normalized
 
 
 def parse_record_instant(value, *, label):

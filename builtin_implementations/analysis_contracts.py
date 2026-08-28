@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 
+from application_protocols.basic_workflow.manifest import PROTOCOL_ID
 from engine.contracts.data_model import normalize_data_key_schema
 
 
@@ -29,6 +30,7 @@ def _definition(module_id, name, description, *, inputs=None, outputs=None, conf
             "inputs": copy.deepcopy(inputs or {}),
             "outputs": copy.deepcopy(outputs or {}),
         },
+        "protocolId": PROTOCOL_ID,
     }
 
 
@@ -50,42 +52,6 @@ ANALYSIS_MODULES = [
         outputs={
             "change": _port({"type": ["number", "null"]}),
             "return": _port({"type": ["number", "null"]}),
-        },
-    ),
-    _definition(
-        "performance-metrics-analyzer",
-        "Performance Metrics",
-        "Tracks total and annualized return, annualized volatility, Sharpe ratio and maximum drawdown.",
-        inputs={
-            "equity": _port({"type": "number"}, required=False),
-            "time": _port({"type": "string"}),
-        },
-        outputs={"performance": _port({
-            "type": "object",
-            "properties": {
-                "observationCount": {"type": "integer"},
-                "returnCount": {"type": "integer"},
-                "startEquity": {"type": ["number", "null"]},
-                "endEquity": {"type": ["number", "null"]},
-                "totalReturn": {"type": ["number", "null"]},
-                "annualizedReturn": {"type": ["number", "null"]},
-                "annualizedVolatility": {"type": ["number", "null"]},
-                "sharpeRatio": {"type": ["number", "null"]},
-                "maxDrawdown": {"type": ["number", "null"]},
-                "firstTime": {"type": ["string", "null"]},
-                "lastTime": {"type": ["string", "null"]},
-                "observationsPerYear": {"type": ["number", "null"]},
-            },
-            "required": [
-                "observationCount", "returnCount", "startEquity", "endEquity",
-                "totalReturn", "annualizedReturn", "annualizedVolatility",
-                "sharpeRatio", "maxDrawdown", "firstTime", "lastTime",
-                "observationsPerYear",
-            ],
-            "additionalProperties": False,
-        })},
-        config={
-            "riskFreeRate": {"type": "number", "exclusiveMinimum": -1.0, "default": 0.0},
         },
     ),
 ]

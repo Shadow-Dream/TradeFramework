@@ -1,114 +1,40 @@
-"""Exact application registry entries for installed Basic Workflow resources."""
+"""Passive discovery of resources that declare Basic Workflow ownership."""
 
 from __future__ import annotations
 
 import copy
-import re
 
-from .manifest import PROFILE_ID, PROTOCOL_ID, PROTOCOL_VERSION
+from engine.contracts.protocol import normalize_protocol_id
+
+from .manifest import PROTOCOL_ID
 
 
-_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
-
-RESOURCE_ROLES = {
-    ("sampler", "basic-price-map-sampler"): (
-        "sampler.price-map",
-        (),
-        ("time", "price"),
-    ),
-    ("environment", "basic-multi-asset-paper-environment"): (
-        "environment.paper-multi-asset",
-        (
-            "time",
-            "price",
-            "last.intent.approved",
-        ),
-        (
-            "time",
-            "price",
-            "portfolio.account",
-            "execution.orders",
-        ),
-    ),
-    ("module", "basic-price-map-universe"): (
-        "pipeline.universe.price-map",
-        ("price.<period>",),
-        ("universe.selected",),
-    ),
-    ("module", "basic-neutral-score-map"): (
-        "pipeline.signal.neutral-score-map",
-        ("universe.selected",),
-        ("signal.scores",),
-    ),
-    ("module", "basic-score-map-position-target"): (
-        "pipeline.target.score-map-to-position",
-        ("universe.selected", "signal.scores"),
-        ("intent.requested",),
-    ),
-    ("module", "basic-absolute-position-map-constraint"): (
-        "pipeline.constraint.absolute-position-map",
-        ("intent.requested",),
-        ("intent.approved",),
-    ),
-}
-
-MODULE_KINDS = {
-    "basic-price-map-universe": "Universe",
-    "basic-neutral-score-map": "Signal",
-    "basic-score-map-position-target": "Target",
-    "basic-absolute-position-map-constraint": "Constraint",
-}
+_IDENTITIES = (
+    ("module", "moduleId"),
+    ("sampler", "samplerId"),
+    ("pipeline", "pipelineId"),
+    ("environment", "environmentId"),
+    ("analysis", "analysisId"),
+    ("dataset", "datasetVersionId"),
+    ("visualizer", "id"),
+)
 
 
 def _resource_identity(record):
     if type(record) is not dict:
         raise ValueError("Protocol registry resource must be an object.")
-    if "moduleId" in record:
-        resource_type = "module"
-        resource_id = record["moduleId"]
-        kind = record.get("kind")
-    elif "samplerId" in record:
-        resource_type = "sampler"
-        resource_id = record["samplerId"]
-        kind = None
-    elif "environmentId" in record:
-        resource_type = "environment"
-        resource_id = record["environmentId"]
-        kind = None
-    elif "analysisId" in record:
-        resource_type = "analysis"
-        resource_id = record["analysisId"]
-        kind = None
-    else:
-        return None
-    return resource_type, resource_id, kind
-
-
-def _exact_archived_identity(record, resource_type, resource_id, kind):
-    version = record.get("version")
-    digest = record.get("contentDigest")
-    if (
-        type(resource_id) is not str
-        or not resource_id
-        or type(version) is not str
-        or not version.isascii()
-        or not version.isdecimal()
-        or version != str(int(version))
-        or int(version) < 1
-        or type(digest) is not str
-        or not _SHA256.fullmatch(digest)
-    ):
-        raise ValueError("Protocol registry resources require exact version and digest.")
-    if record.get("builtin") is not True:
-        raise ValueError("Protocol registry BuiltIn resources must be Engine-owned.")
-    return resource_type, resource_id, kind, version, digest
+    for resource_type, identity_field in _IDENTITIES:
+        resource_id = record.get(identity_field)
+        if isinstance(resource_id, str) and resource_id:
+            return resource_type, identity_field, resource_id
+    raise ValueError("Declared protocol resource has no supported identity.")
 
 
 def build_registry(records):
-    """Build a deterministic registry from exact archived BuiltIn records.
+    """Return a deterministic projection of exact self-declared resources.
 
-    Unknown BuiltIns are ignored.  Known protocol identities must occur exactly
-    once and are never resolved through a symbolic ``latest`` reference.
+    The registry does not infer roles, inspect ports, or claim conformance.  The
+    normal Trade Engine repositories remain authoritative for each record.
     """
 
     if type(records) not in {list, tuple}:
@@ -116,51 +42,56 @@ def build_registry(records):
     entries = []
     seen = set()
     for record in records:
-        identity = _resource_identity(record)
-        if identity is None:
+        if type(record) is not dict:
+            raise ValueError("Protocol registry resource must be an object.")
+        declared = record.get("protocolId")
+        if declared is None:
             continue
-        resource_type, resource_id, kind = identity
-        contract = RESOURCE_ROLES.get((resource_type, resource_id))
-        if contract is None:
-            continue
-        resource_type, resource_id, kind, version, digest = _exact_archived_identity(
-            record, resource_type, resource_id, kind
+        declared = normalize_protocol_id(
+            declared,
+            label="Protocol registry resource protocolId",
         )
-        key = (resource_type, resource_id)
+        if declared != PROTOCOL_ID:
+            continue
+        resource_type, _identity_field, resource_id = _resource_identity(record)
+        version = record.get("version", "")
+        if version is not None and not isinstance(version, str):
+            raise ValueError("Protocol registry resource version must be a string.")
+        key = (resource_type, resource_id, version or "")
         if key in seen:
-            raise ValueError(f"Duplicate protocol registry resource: {resource_id}")
+            raise ValueError(
+                "Duplicate protocol registry resource: "
+                f"{resource_type}/{resource_id}@{version or '-'}"
+            )
         seen.add(key)
-        role, requires, provides = contract
-        if resource_type == "module":
-            expected_kind = MODULE_KINDS[resource_id]
-            if kind != expected_kind:
-                raise ValueError(
-                    f"Protocol registry Module '{resource_id}' must have kind "
-                    f"'{expected_kind}'."
-                )
         resource = {
             "type": resource_type,
-            **({"kind": kind} if kind is not None else {}),
             "id": resource_id,
-            "version": version,
-            "contentDigest": digest,
+            **(
+                {"kind": record["kind"]}
+                if resource_type == "module" and isinstance(record.get("kind"), str)
+                else {}
+            ),
+            **({"version": version} if version else {}),
+            **(
+                {"contentDigest": record["contentDigest"]}
+                if isinstance(record.get("contentDigest"), str)
+                else {}
+            ),
         }
-        entries.append(
-            {
-                "protocolId": PROTOCOL_ID,
-                "protocolVersion": PROTOCOL_VERSION,
-                "profile": PROFILE_ID,
-                "role": role,
-                "resource": resource,
-                "requires": list(requires),
-                "provides": list(provides),
-            }
-        )
-    return sorted(entries, key=lambda item: item["role"])
+        entries.append({"protocolId": PROTOCOL_ID, "resource": resource})
+    return sorted(
+        entries,
+        key=lambda item: (
+            item["resource"]["type"],
+            item["resource"]["id"],
+            item["resource"].get("version", ""),
+        ),
+    )
 
 
 def registry_copy(entries):
     return copy.deepcopy(entries)
 
 
-__all__ = ("RESOURCE_ROLES", "build_registry", "registry_copy")
+__all__ = ("build_registry", "registry_copy")

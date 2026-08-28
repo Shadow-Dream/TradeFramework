@@ -12,6 +12,7 @@ from engine.compiler import environment as environment_compiler
 from engine.compiler import pipeline_manifest as pipeline_manifest_compiler
 from engine.composition import backtest as backtest_composition
 from engine.contracts import backtest as backtest_contracts
+from engine.contracts import config_override as config_override_contracts
 from engine.contracts import pipeline as pipeline_contracts
 from engine.contracts import strict_json
 from engine.contracts.contract_expansion import (
@@ -113,11 +114,36 @@ def resolve_backtest_composition(config, request):
     pipeline_modules, pipeline_module_authorities = (
         _pipeline_definitions_for_manifest(pipeline_definition, manifest)
     )
-    pipeline_contract_template = (
+    base_pipeline_contract_template = (
         pipeline_authority.pipeline_contract_template_from_verified_authorities(
             manifest,
             pipeline_modules,
             pipeline_module_authorities,
+        )
+    )
+    effective_pipeline_definition = (
+        config_override_contracts.apply_pipeline_config_override(
+            pipeline_definition,
+            pipeline_ref.get("configOverride", {}),
+            label="Pipeline",
+        )
+    )
+    effective_pipeline_definition = (
+        config_override_contracts.apply_module_config_overrides(
+            effective_pipeline_definition,
+            pipeline_ref.get("moduleConfigOverrides", {}),
+            label="Pipeline",
+        )
+    )
+    effective_manifest = config_override_contracts.apply_pipeline_manifest_overrides(
+        pipeline_definition,
+        manifest,
+        effective_pipeline_definition,
+    )
+    pipeline_contract_template = (
+        pipeline_authority.configure_pipeline_contract_template(
+            base_pipeline_contract_template,
+            effective_manifest,
         )
     )
 
@@ -223,15 +249,29 @@ def resolve_backtest_composition(config, request):
         analysis_repository_authorities,
         label="Analysis Graph",
     )
-    environment_definition = (
-        environment_compiler.validate_environment_definition_authority(
+    effective_environment_definition = (
+        config_override_contracts.apply_module_config_overrides(
             environment_definition,
+            environment_ref.get("moduleConfigOverrides", {}),
+            label="Environment",
+        )
+    )
+    effective_analysis_definition = (
+        config_override_contracts.apply_module_config_overrides(
+            analysis_definition,
+            analysis_ref.get("moduleConfigOverrides", {}),
+            label="Analysis",
+        )
+    )
+    effective_environment_definition = (
+        environment_compiler.validate_environment_definition_authority(
+            effective_environment_definition,
             environment_module_authorities,
         )
     )
-    analysis_definition = (
+    effective_analysis_definition = (
         analysis_compiler.validate_analysis_definition_authority(
-            analysis_definition,
+            effective_analysis_definition,
             analysis_module_authorities,
         )
     )
@@ -239,23 +279,75 @@ def resolve_backtest_composition(config, request):
         pipeline_contract_template=pipeline_contract_template,
         sampler_contracts=sampler_contracts,
         sampler_required_roots=sampler_required_roots,
-        environment_definition=environment_definition,
+        environment_definition=effective_environment_definition,
         environment_module_authorities=environment_module_authorities,
-        analysis_definition=analysis_definition,
+        analysis_definition=effective_analysis_definition,
         analysis_module_authorities=analysis_module_authorities,
     )
     return {
         "request": request,
         "pipelineDefinition": pipeline_definition,
         "pipelineManifest": manifest,
+        "effectivePipelineDefinition": effective_pipeline_definition,
+        "effectivePipelineManifest": effective_manifest,
         "pipelineModuleDefinitions": pipeline_modules,
         "datasetName": dataset["name"],
         "datasetVersion": dataset_version,
         "samplerDefinition": sampler_definition,
         "environmentDefinition": environment_definition,
+        "effectiveEnvironmentDefinition": effective_environment_definition,
         "environmentModuleDefinitions": environment_modules,
         "analysisDefinition": analysis_definition,
+        "effectiveAnalysisDefinition": effective_analysis_definition,
         "analysisModuleDefinitions": analysis_modules,
+        "configuration": {
+            "sampler": {
+                "override": copy.deepcopy(sampler_ref["parameters"]),
+                "effective": {
+                    **copy.deepcopy(sampler_definition["config"]),
+                    **copy.deepcopy(sampler_ref["parameters"]),
+                },
+            },
+            "pipeline": {
+                "configOverride": copy.deepcopy(
+                    pipeline_ref.get("configOverride", {})
+                ),
+                "moduleConfigOverrides": copy.deepcopy(
+                    pipeline_ref.get("moduleConfigOverrides", {})
+                ),
+                "effectiveConfig": copy.deepcopy(
+                    effective_pipeline_definition["config"]
+                ),
+                "effectiveModuleConfigs": (
+                    config_override_contracts.effective_module_configs(
+                        effective_pipeline_definition,
+                        label="Pipeline",
+                    )
+                ),
+            },
+            "environment": {
+                "moduleConfigOverrides": copy.deepcopy(
+                    environment_ref.get("moduleConfigOverrides", {})
+                ),
+                "effectiveModuleConfigs": (
+                    config_override_contracts.effective_module_configs(
+                        effective_environment_definition,
+                        label="Environment",
+                    )
+                ),
+            },
+            "analysis": {
+                "moduleConfigOverrides": copy.deepcopy(
+                    analysis_ref.get("moduleConfigOverrides", {})
+                ),
+                "effectiveModuleConfigs": (
+                    config_override_contracts.effective_module_configs(
+                        effective_analysis_definition,
+                        label="Analysis",
+                    )
+                ),
+            },
+        },
         **plans,
     }
 

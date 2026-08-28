@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Basic Workspace · Trade Engine</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/basic_workflow.css" />
+  </head>
+  <body class="basic-workspace-route">
+    <header class="topbar">
+      <div>
+        <h1>Trade Engine</h1>
+        <p class="muted">Basic · Stock workspace</p>
+      </div>
+      <div class="toolbar">
+        <a class="bw-header-link" href="/basic-workflow" aria-label="Back to the Basic stock catalog">Back</a>
+      </div>
+    </header>
+
+    <main class="bw-workspace-page">
+      <section class="panel bw-chart-panel" aria-label="Basic stock analysis workspace">
+        <div class="panel-head bw-workspace-heading">
+          <div>
+            <h2 id="bwInstrumentTitle">Loading workspace…</h2>
+            <p id="bwInstrumentMeta" class="muted">Validating the selected stock catalog entry.</p>
+          </div>
+          <div class="bw-workspace-actions">
+            <span id="bwStatus" class="bw-plain-status" role="status" aria-live="polite">Preparing workspace…</span>
+            <button id="bwFavoriteInstrument" type="button" disabled aria-label="Add selected stock to watchlist">☆</button>
+            <span class="bw-period">1D</span>
+          </div>
+        </div>
+        <div class="bw-indicator-bar" aria-label="Technical indicators">
+          <button id="bwOpenIndicators" class="bw-indicator-open" type="button" aria-haspopup="dialog" aria-controls="bwIndicatorDialog" aria-keyshortcuts="/" disabled>
+            Indicators
+          </button>
+          <div id="bwActiveIndicators" class="bw-active-indicators" aria-label="Active indicators" aria-live="polite"></div>
+          <span id="bwIndicatorStatus" class="bw-indicator-status" role="status" aria-live="polite">Indicators become available after the Result is ready.</span>
+        </div>
+        <section id="bwIndicatorDialog" class="bw-indicator-dialog" role="dialog" aria-modal="true" aria-labelledby="bwIndicatorTitle" hidden>
+          <div class="bw-indicator-dialog-head">
+            <h2 id="bwIndicatorTitle">Indicators</h2>
+            <button id="bwCloseIndicators" class="bw-dialog-close" type="button" aria-label="Close indicators">×</button>
+          </div>
+          <div class="bw-indicator-dialog-body">
+            <nav id="bwIndicatorTabs" class="bw-indicator-tabs" aria-label="Indicator categories">
+              <button id="bwIndicatorFavorites" type="button" role="tab" aria-selected="false">Favorites</button>
+              <button id="bwIndicatorTechnicals" type="button" role="tab" aria-selected="true">Technicals</button>
+            </nav>
+            <div class="bw-indicator-browser">
+              <label class="bw-indicator-search-label" for="bwIndicatorSearch">Search indicators</label>
+              <input id="bwIndicatorSearch" type="search" autocomplete="off" placeholder="Search indicators" />
+              <div id="bwIndicatorCatalog" class="bw-indicator-catalog" role="list" aria-label="Available indicators"></div>
+            </div>
+            <form id="bwIndicatorForm" class="bw-indicator-editor" hidden>
+              <h3 id="bwIndicatorFormTitle">Add indicator</h3>
+              <div id="bwIndicatorFields" class="bw-indicator-fields"></div>
+              <div class="bw-indicator-form-actions">
+                <button id="bwIndicatorSubmit" type="submit">Add</button>
+                <button id="bwIndicatorCancel" type="button">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </section>
+        <div class="bw-chart-workspace">
+          <aside class="bw-drawing-sidebar" aria-label="Chart drawing controls">
+            <nav id="bwDrawingTools" class="bw-drawing-rail" role="toolbar" aria-label="Chart drawing tools"></nav>
+            <p id="bwDrawingStatus" class="bw-drawing-status" role="status" aria-live="polite">Choose a drawing tool. Select a drawing to move or delete it.</p>
+          </aside>
+          <div class="bw-chart-stage">
+            <div id="bwChart" class="bw-chart" tabindex="0" aria-label="Basic Workflow financial chart" aria-keyshortcuts="Delete Backspace" aria-busy="false"></div>
+            <div id="bwChartState" class="bw-chart-state">
+              <strong>Preparing the Trade Engine result…</strong>
+              <span>The chart appears only after Dataset, Pipeline, Backtest and Result materialization completes.</span>
+            </div>
+          </div>
+        </div>
+        <p id="bwOpenStatus" class="bw-open-status muted" role="status" aria-live="polite"></p>
+      </section>
+
+      <section class="panel bw-provenance-panel" aria-label="Trade Engine materialization">
+        <div class="panel-head">
+          <h2>Workspace details</h2>
+          <a id="bwOpenResult" href="/backtests" hidden>Open full Result</a>
+        </div>
+        <div class="bw-provenance">
+          <div><span>Market data</span><strong id="bwChartDataset">Waiting for data</strong></div>
+          <div><span>Analysis setup</span><strong id="bwChartPipeline">Preparing</strong></div>
+          <div><span>Run status</span><strong id="bwChartBacktest">Not started</strong></div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/vendor/lightweight-charts/lightweight-charts.standalone.production.js"></script>
+    <script src="/module_forms.js"></script>
+    <script src="/chart_core.js"></script>
+    <script src="/basic_workflow_workspace.js"></script>
+  </body>
+</html>

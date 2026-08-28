@@ -72,6 +72,10 @@ from builtin_implementations.visualizer_contracts import (
     visualizer_definition_map,
     visualizer_definitions,
 )
+from application_subsystems import (
+    SubsystemContext,
+    build_builtin_subsystem_registry,
+)
 from engine.contracts import strict_json
 
 
@@ -91,13 +95,25 @@ SPA_ROUTES = {
     "/signal-blueprint",
     "/modules",
     "/data",
-    "/mining/k-line",
     "/backtests",
     "/result",
     "/agent",
     "/manifest",
 }
-PROTECTED_PAGE_PATHS = SPA_ROUTES | {"/index.html", "/chart.html"}
+SUBSYSTEM_REGISTRY = build_builtin_subsystem_registry().validate_host(
+    WEB_ROOT,
+    reserved_page_paths=SPA_ROUTES | {"/login", "/index.html", "/chart.html"},
+    reserved_page_files={"index.html", "chart.html", "login.html"},
+)
+PROTECTED_PAGE_PATHS = (
+    SPA_ROUTES
+    | set(SUBSYSTEM_REGISTRY.page_paths)
+    | {
+        "/index.html",
+        "/chart.html",
+        *(f"/{name}" for name in SUBSYSTEM_REGISTRY.page_files),
+    }
+)
 
 
 def normalize_public_origin(value, label):
@@ -250,7 +266,6 @@ def validate_graph_draft(config, payload):
             "valid": True,
             "scope": "complete",
             "topology": manifest["topology"],
-            "outputContracts": manifest["signalGraph"]["outputContracts"],
         }
     if resource_type == "environment":
         authorities = module_definition_authorities(
@@ -596,7 +611,7 @@ def repository_items(config, repository):
             items[result_id] = {
                 **item,
                 "itemId": result_id,
-                "label": f"{item.get('name') or source_item_id} Result",
+                "label": item.get("name") or source_item_id,
                 "kind": "Visualization Result",
                 "resourceType": "Result",
                 "sourceRepository": "results",
@@ -812,7 +827,6 @@ class EngineServiceHandler(BaseHTTPRequestHandler):
     stopping = threading.Event()
     agent_tool_grant_store = None
     agent_bridge_token = ""
-    mining_api = None
 
     def require_agent_bridge(self):
         expected = self.agent_bridge_token
@@ -1101,7 +1115,25 @@ class EngineServiceHandler(BaseHTTPRequestHandler):
             ],
         )
 
+    def dispatch_subsystem_api(self, route, payload=None):
+        response = SUBSYSTEM_REGISTRY.invoke(
+            route,
+            SubsystemContext(
+                config=self.config,
+                prepared_store=self.prepared_backtest_submissions,
+                job_manager=self.backtest_job_manager,
+                session_identity=self.auth_session["tokenHash"],
+                owner_identity=self.auth_session["user"]["userId"],
+            ),
+            payload,
+        )
+        for event in response.events:
+            self.append_event(event.event_type, event.payload)
+        response_json(self, response.status, response.payload)
+
     def do_HEAD(self):
+        if self.reject_if_stopping():
+            return
         parsed = urlparse(self.path)
         path = parsed.path
         if is_control_api_path(path) or path.startswith(workspace_contract.jupyter_base_url(self.config)):
@@ -1118,6 +1150,12 @@ class EngineServiceHandler(BaseHTTPRequestHandler):
                 response_json(self, 502, {"error": str(exc)})
             return
         if path in SPA_ROUTES or path == "/index.html":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            write_security_headers(self, no_store=True)
+            self.end_headers()
+            return
+        if SUBSYSTEM_REGISTRY.page_file(path) is not None:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             write_security_headers(self, no_store=True)
@@ -1198,17 +1236,18 @@ class EngineServiceHandler(BaseHTTPRequestHandler):
             return
         query = parse_qs(parsed.query, keep_blank_values=True)
         try:
-            if path.startswith("/api/mining/"):
-                if self.mining_api is None:
-                    from mining.api import DisabledMiningApi
-
-                    self.mining_api = DisabledMiningApi()
-                try:
-                    status, payload = self.mining_api.handle_get(path, query)
-                except ValueError as exc:
-                    response_json(self, 400, {"error": str(exc)})
-                    return
-                response_json(self, status, payload)
+            if path == "/api/subsystems":
+                require_query_fields(query, set(), "Subsystem catalog request")
+                response_json(self, 200, SUBSYSTEM_REGISTRY.catalog())
+                return
+            subsystem_route = SUBSYSTEM_REGISTRY.api_route("GET", path)
+            if subsystem_route is not None:
+                require_query_fields(
+                    query,
+                    set(),
+                    subsystem_route.label,
+                )
+                self.dispatch_subsystem_api(subsystem_route)
                 return
             if path == "/api/health":
                 require_query_fields(query, set(), "Health request")
@@ -1503,12 +1542,17 @@ class EngineServiceHandler(BaseHTTPRequestHandler):
             if path == "/api/visualizations":
                 require_query_fields(query, {"backtestId"}, "Visualization repository request")
                 backtest_id = query_value(query, "backtestId", "")
-                response_json(self, 200, {
+                result = {
                     "visualizations": visualization_service.list_visualizations(
                         self.config,
                         backtest_id,
                     ),
-                })
+                }
+                if backtest_id:
+                    result["currentVisualizationId"] = (
+                        visualization_service.current_visualization_id(backtest_id)
+                    )
+                response_json(self, 200, result)
                 return
             if path == "/api/history":
                 require_query_fields(query, {"limit", "full"}, "History request")
@@ -1530,6 +1574,17 @@ class EngineServiceHandler(BaseHTTPRequestHandler):
             if path in SPA_ROUTES or path == "/index.html":
                 response_text(self, 200, (WEB_ROOT / "index.html").read_text(encoding="utf-8"), "text/html; charset=utf-8")
                 return
+            subsystem_page_file = SUBSYSTEM_REGISTRY.page_file(path)
+            if subsystem_page_file is not None:
+                response_text(
+                    self,
+                    200,
+                    (WEB_ROOT / subsystem_page_file).read_text(
+                        encoding="utf-8"
+                    ),
+                    "text/html; charset=utf-8",
+                )
+                return
             static_path = (WEB_ROOT / path.lstrip("/")).resolve()
             if static_path.is_file() and WEB_ROOT in static_path.parents:
                 content_type = mimetypes.guess_type(static_path.name)[0] or "application/octet-stream"
@@ -1540,12 +1595,6 @@ class EngineServiceHandler(BaseHTTPRequestHandler):
             response_json(self, 400, {"error": str(exc)})
         except Exception as exc:
             response_json(self, 500, {"error": str(exc)})
-
-    def do_HEAD(self):
-        if self.reject_if_stopping():
-            return
-        self.send_response(405)
-        self.end_headers()
 
     def do_POST(self):
         if self.reject_if_stopping():
@@ -1581,22 +1630,6 @@ class EngineServiceHandler(BaseHTTPRequestHandler):
             return
         try:
             query = parse_qs(parsed.query, keep_blank_values=True)
-            if path.startswith("/api/mining/"):
-                if self.mining_api is None:
-                    from mining.api import DisabledMiningApi
-
-                    self.mining_api = DisabledMiningApi()
-                try:
-                    status, result = self.mining_api.handle_post(
-                        path,
-                        read_request_json(self),
-                        query,
-                    )
-                except ValueError as exc:
-                    response_json(self, 400, {"error": str(exc)})
-                    return
-                response_json(self, status, result)
-                return
             if path == "/api/data/upload":
                 require_query_fields(
                     query, {"datasetId", "name", "filename"}, "Dataset upload"
@@ -1635,6 +1668,16 @@ class EngineServiceHandler(BaseHTTPRequestHandler):
                 )
                 self.append_event("data.dataset.replaced", dataset)
                 response_json(self, 200, {"accepted": True, "dataset": dataset})
+                return
+            subsystem_route = SUBSYSTEM_REGISTRY.api_route("POST", path)
+            if subsystem_route is not None:
+                require_query_fields(
+                    query,
+                    set(),
+                    subsystem_route.label,
+                )
+                payload = read_request_json(self)
+                self.dispatch_subsystem_api(subsystem_route, payload)
                 return
             require_query_fields(query, set(), "Control API POST request")
             payload = read_request_json(self)
@@ -2059,6 +2102,13 @@ class EngineServiceHandler(BaseHTTPRequestHandler):
                         response_json(self, 404, {"error": "not found"})
                         return
             response_json(self, 200, result)
+        except visualization_service.VisualizationRevisionConflict as exc:
+            response_json(self, 409, {
+                "accepted": False,
+                "code": exc.code,
+                "error": str(exc),
+                "visualization": exc.current,
+            })
         except Exception as exc:
             response_json(self, 400, {"accepted": False, "error": str(exc)})
 
@@ -2309,7 +2359,6 @@ def _run_engine_service(args):
     registry_configured = False
     manager = None
     server = None
-    mining_supervisor = None
     primary_error = None
     primary_traceback = None
     try:
@@ -2361,22 +2410,6 @@ def _run_engine_service(args):
         EngineServiceHandler.agent_bridge_token = os.environ.get(
             "TRADE_AGENT_BRIDGE_TOKEN", ""
         )
-        if EngineServiceHandler.config.get("miningRoot"):
-            from mining.api import MiningApi
-
-            mining_api = MiningApi(EngineServiceHandler.config)
-            if EngineServiceHandler.config.get("miningAutoStart", False):
-                from mining.supervisor import MiningSupervisor
-
-                mining_supervisor = MiningSupervisor(EngineServiceHandler.config)
-                mining_supervisor.start()
-            mining_api.supervisor = mining_supervisor
-            EngineServiceHandler.mining_api = mining_api
-        else:
-            from mining.api import DisabledMiningApi
-
-            EngineServiceHandler.mining_api = DisabledMiningApi()
-
         EngineServiceHandler.prepared_backtest_submissions = (
             PreparedBacktestSubmissionStore()
         )
@@ -2453,9 +2486,7 @@ def _run_engine_service(args):
             manager,
             owner_lease,
             registry_configured=registry_configured,
-            application_services=(
-                () if mining_supervisor is None else (mining_supervisor,)
-            ),
+            application_services=(),
         )
     except BaseException as exc:
         cleanup_error = exc

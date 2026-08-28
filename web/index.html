@@ -5,10 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Trade Engine</title>
     <link rel="stylesheet" href="/vendor/litegraph/litegraph.css" />
-    <link rel="stylesheet" href="/vendor/x6/x6.css" />
     <link rel="stylesheet" href="/vendor/trade-resource-browser.css" />
     <link rel="stylesheet" href="/styles.css" />
-    <link rel="stylesheet" href="/mining_kline.css" />
   </head>
   <body>
     <header class="topbar">
@@ -49,13 +47,13 @@
             <button class="nav-btn" data-view="visualizers" type="button">Visualizer</button>
             <button class="nav-btn" data-view="backtests" type="button">Backtest</button>
           </section>
-          <section class="side-nav-group">
-            <h2 class="side-nav-heading">Mining</h2>
-            <button class="nav-btn" data-view="mining-kline" type="button">K Line</button>
-          </section>
           <section class="side-nav-group side-nav-agent">
             <h2 class="side-nav-heading">Agent</h2>
             <a id="agentNavLink" class="nav-btn" href="/agent">Agent</a>
+          </section>
+          <section id="subsystemNavGroup" class="side-nav-group" hidden>
+            <h2 class="side-nav-heading">SubSystem</h2>
+            <div id="subsystemNavLinks"></div>
           </section>
         </nav>
 
@@ -183,6 +181,10 @@
                       <input id="pipelineId" type="hidden" />
                       <input id="pipelineName" type="hidden" />
                       <label class="pipeline-version-picker">
+                        <span>Protocol ID</span>
+                        <input id="pipelineProtocolId" autocomplete="off" spellcheck="false" placeholder="Optional" />
+                      </label>
+                      <label class="pipeline-version-picker">
                         <span>Version</span>
                         <select id="pipelineVersionSelect"></select>
                       </label>
@@ -211,7 +213,7 @@
                     <div id="pipelineBlueprintError" class="dialog-error" hidden></div>
                     <div id="pipelineAlphaGraphError" class="dialog-error" hidden></div>
                     <div id="alphaGraphBuilder" class="alpha-graph-builder blueprint-route-graph"></div>
-                    <textarea id="pipelineAlphaGraph" class="spec-editor blueprint-raw" spellcheck="false" hidden></textarea>
+                    <input id="pipelineAlphaGraph" type="hidden" value="" />
                   </div>
                 </div>
               </section>
@@ -229,8 +231,6 @@
               <div id="dataRepositoryBrowser"></div>
             </div>
           </div>
-
-          <div id="mining-kline" class="view"></div>
 
           <div id="backtests" class="view">
             <section id="backtestEntrySection" class="backtest-section active">
@@ -308,14 +308,22 @@
                     <span class="chain-kind">Pipeline</span>
                     <select id="backtestPipelineSelect" aria-label="Backtest Pipeline"></select>
                     <span id="chainPipelineMeta" class="muted">receives only Environment Graph outputs</span>
-                    <button id="chainPipeline" class="backtest-node-action" type="button">Open Pipeline</button>
+                    <span id="chainPipelineConfigMeta" class="muted">Using versioned Module defaults</span>
+                    <div class="backtest-node-actions">
+                      <button id="configureBacktestPipeline" class="backtest-node-action" type="button">Configure</button>
+                      <button id="chainPipeline" class="backtest-node-action" type="button">Open Pipeline</button>
+                    </div>
                   </div>
                   <div class="backtest-graph-node backtest-node-analyzer" data-backtest-node="analyzer">
                     <span class="backtest-node-port port-in"></span>
                     <span class="chain-kind">Analysis</span>
                     <select id="backtestAnalysisSelect" aria-label="Backtest Analysis"></select>
                     <span id="chainAnalysisMeta" class="muted">independent input branch; outputs Result only</span>
-                    <button id="chainAnalysisDetails" class="backtest-node-action" type="button">Details</button>
+                    <span id="chainAnalysisConfigMeta" class="muted">Using versioned Module defaults</span>
+                    <div class="backtest-node-actions">
+                      <button id="configureBacktestAnalysis" class="backtest-node-action" type="button">Configure</button>
+                      <button id="chainAnalysisDetails" class="backtest-node-action" type="button">Details</button>
+                    </div>
                   </div>
                 </div>
                 <div id="backtestEntryError" class="backtest-graph-message backtest-graph-error dialog-error" role="alert" hidden></div>
@@ -425,31 +433,29 @@
             </div>
           </div>
 
-          <div id="results" class="view">
-            <div class="panel">
-              <div class="panel-head">
-                <div>
+          <div id="results" class="view result-workspace">
+            <section class="result-surface">
+              <header class="result-header">
+                <div class="result-heading">
+                  <span class="result-kicker">Backtest Result</span>
                   <h2 id="resultTitle">Result</h2>
-                  <span id="resultMeta" class="muted"></span>
                 </div>
-                <div class="toolbar">
+                <div class="toolbar result-actions">
                   <button id="backFromResultBtn" type="button">Back to Backtest</button>
-                  <button id="resultTimezoneBtn" type="button">TZ: New York</button>
-                  <button id="addChartBtn" type="button">Add Chart</button>
+                  <button id="saveVisualizationBtn" type="button">Save Layout</button>
+                  <button id="addChartBtn" class="primary-action" type="button">Add Chart</button>
                 </div>
-              </div>
+              </header>
+              <dl id="resultContextBar" class="result-context-bar" aria-label="Backtest composition"></dl>
               <div id="resultsActionError" class="dialog-error" hidden></div>
-              <div id="metricStrip" class="metric-strip"></div>
-              <div id="chartArea" class="chart-area"></div>
-            </div>
-            <div class="panel">
-              <div class="panel-head">
-                <h2>Advanced Spec</h2>
-                <button id="saveVisualizationBtn" type="button">Save Spec</button>
+              <div class="result-canvas-heading">
+                <h3>Visualization</h3>
+                <span class="muted">Charts and interactive result views</span>
               </div>
+              <div id="chartArea" class="chart-area"></div>
               <div id="visualizationSpecError" class="dialog-error" hidden></div>
-              <textarea id="visualizationSpec" class="spec-editor blueprint-raw" spellcheck="false" hidden></textarea>
-            </div>
+              <input id="visualizationSpec" type="hidden" value="" />
+            </section>
           </div>
 
         </section>
@@ -481,24 +487,6 @@
       </form>
     </dialog>
 
-    <dialog id="miningJobDialog" class="action-dialog mining-job-dialog">
-      <h2>Add Mining Job</h2>
-      <p class="muted">Provider records are stored unchanged. Continuity is an optional numeric distance in the provider's own event-time unit.</p>
-      <form id="miningJobForm" class="dialog-form">
-        <div class="mining-form-grid">
-          <label><span>Name</span><input id="miningJobName" required autocomplete="off" /></label>
-          <label><span>Job ID</span><input id="miningJobId" pattern="[a-z0-9][a-z0-9-]{2,79}" autocomplete="off" /></label>
-          <label><span>Provider</span><select id="miningJobProvider" required></select></label>
-          <label><span>Schedule seconds</span><input id="miningScheduleSeconds" type="number" min="1" max="31536000" value="60" required /></label>
-          <label><span>Overlap records</span><input id="miningOverlapRecords" type="number" min="0" max="1000000" value="2" required /></label>
-          <label><span>Continuity step (optional)</span><input id="miningContinuityStep" type="number" min="0.000001" max="1000000000000000" step="any" /></label>
-        </div>
-        <label><span>Provider config JSON</span><textarea id="miningProviderConfig" rows="11" spellcheck="false" required></textarea></label>
-        <p id="miningJobError" class="dialog-error" role="alert" hidden></p>
-        <div class="dialog-actions"><button id="cancelMiningJobBtn" type="button">Cancel</button><button id="confirmMiningJobBtn" type="submit">Create</button></div>
-      </form>
-    </dialog>
-
     <dialog id="moduleUploadDialog" class="action-dialog module-lifecycle-dialog">
       <h2 id="moduleUploadDialogTitle">Add Module</h2>
       <p id="moduleUploadSource" class="muted"></p>
@@ -518,6 +506,10 @@
           <label>
             <span>Module ID</span>
             <input id="moduleUploadId" autocomplete="off" required />
+          </label>
+          <label>
+            <span>Protocol ID (optional)</span>
+            <input id="moduleUploadProtocolId" autocomplete="off" spellcheck="false" />
           </label>
           <label>
             <span>Entry file</span>
@@ -684,6 +676,10 @@
           <span>Name</span>
           <input id="createPipelineName" maxlength="120" autocomplete="off" required />
         </label>
+        <label>
+          <span>Protocol ID (optional)</span>
+          <input id="createPipelineProtocolId" autocomplete="off" spellcheck="false" />
+        </label>
         <p id="createPipelineError" class="dialog-error" role="alert" hidden></p>
         <div class="dialog-actions">
           <button id="cancelCreatePipelineBtn" type="button">Cancel</button>
@@ -750,6 +746,7 @@
 
     <dialog id="moduleLoadDialog" class="action-dialog module-load-dialog">
       <h2 id="moduleLoadDialogTitle">Load Module</h2>
+      <p id="moduleLoadDialogMeta" class="module-load-dialog-meta muted"></p>
       <div class="dialog-form">
         <input id="moduleLoadInstanceId" type="hidden" />
         <p id="moduleLoadDialogError" class="dialog-error" hidden></p>
@@ -763,21 +760,59 @@
         </section>
         <section>
           <span class="dialog-section-label">Outputs</span>
+          <small id="moduleLoadOutputsHint" class="field-hint" hidden>Output DataKeys stay fixed while configuring an existing instance so downstream bindings cannot be broken.</small>
           <div id="moduleLoadOutputsFields" class="structured-fields"></div>
         </section>
       </div>
       <div class="dialog-actions">
+        <button id="removeConfiguredModuleBtn" class="danger module-config-remove" type="button" hidden>Remove</button>
         <button id="cancelModuleLoadBtn" type="button">Cancel</button>
         <button id="confirmModuleLoadBtn" type="button">Load</button>
       </div>
     </dialog>
 
-    <dialog id="backtestSamplerConfigDialog" class="action-dialog module-load-dialog">
-      <h2 id="backtestSamplerConfigTitle">Configure Sampler</h2>
-      <p id="backtestSamplerConfigDescription" class="muted"></p>
-      <div id="backtestSamplerConfigFields" class="structured-fields"></div>
+    <dialog id="backtestSamplerConfigDialog" class="action-dialog backtest-config-dialog">
+      <header class="backtest-config-head">
+        <div>
+          <h2 id="backtestSamplerConfigTitle">Configure Backtest resource</h2>
+          <p id="backtestSamplerConfigDescription" class="muted"></p>
+        </div>
+        <span id="backtestConfigModeBadge" class="backtest-config-mode"></span>
+      </header>
+      <div id="backtestConfigLoading" class="backtest-config-loading" hidden>Loading exact resource contracts…</div>
+      <div id="backtestConfigWorkbench" class="backtest-config-workbench">
+        <nav class="backtest-config-instances" aria-label="Configurable resource and Module settings">
+          <div class="backtest-config-pane-head">
+            <strong id="backtestConfigInstanceHeading">Module instances</strong>
+            <span id="backtestConfigInstanceCount" class="muted"></span>
+          </div>
+          <label class="backtest-config-search" for="backtestConfigInstanceSearch">
+            <span class="sr-only">Filter resource config and Module instances</span>
+            <input id="backtestConfigInstanceSearch" type="search" placeholder="Filter config or modules" autocomplete="off" />
+          </label>
+          <div id="backtestConfigInstanceList" class="backtest-config-instance-list"></div>
+        </nav>
+        <section class="backtest-config-fields-pane">
+          <header id="backtestConfigFieldsHeader" class="backtest-config-fields-head"></header>
+          <div id="backtestConfigFields" class="dialog-form backtest-config-fields"></div>
+          <details id="backtestConfigDefaultDetails" class="backtest-config-defaults">
+            <summary>Version default JSON</summary>
+            <pre id="backtestConfigDefaultJson"></pre>
+          </details>
+        </section>
+        <aside class="backtest-config-json-pane">
+          <div class="backtest-config-pane-head">
+            <strong id="backtestConfigJsonHeading">Backtest Override JSON</strong>
+            <span class="muted">Source</span>
+          </div>
+          <textarea id="backtestConfigJson" spellcheck="false" aria-label="Backtest configuration JSON">{}</textarea>
+          <button id="syncBacktestConfigJsonBtn" type="button">Load JSON into editor</button>
+          <p id="backtestConfigJsonHint" class="muted"></p>
+        </aside>
+      </div>
       <p id="backtestSamplerConfigError" class="dialog-error" role="alert" hidden></p>
       <div class="dialog-actions">
+        <button id="resetBacktestConfigBtn" type="button">Reset all</button>
         <button id="cancelBacktestSamplerConfigBtn" type="button">Cancel</button>
         <button id="applyBacktestSamplerConfigBtn" type="button">Apply</button>
       </div>
@@ -786,10 +821,10 @@
     <script src="/vendor/lightweight-charts/lightweight-charts.standalone.production.js"></script>
     <script src="/vendor/litegraph/litegraph.js"></script>
     <script src="/vendor/trade-resource-browser.js"></script>
+    <script src="/version_selection.js"></script>
     <script src="/module_forms.js"></script>
     <script src="/module_graph_litegraph.js"></script>
     <script src="/chart_core.js"></script>
-    <script src="/mining_kline.js"></script>
     <script src="/ui_sync.js"></script>
     <script src="/app.js"></script>
   </body>

@@ -6,12 +6,29 @@ import copy
 import math
 import re
 
+from .manifest import PROTOCOL_ID
+
+PRICE_UNIVERSE_MODULE_ID = "basic-price-map-universe"
+OHLCV_UNIVERSE_MODULE_ID = "basic-ohlcv-price-map-universe"
+
 MODULE_REQUIREMENTS = {
-    "universe": ("Universe", "basic-price-map-universe"),
+    "universe": ("Universe", PRICE_UNIVERSE_MODULE_ID),
     "signal": ("Signal", "basic-neutral-score-map"),
     "target": ("Target", "basic-score-map-position-target"),
     "constraint": ("Constraint", "basic-absolute-position-map-constraint"),
 }
+
+
+def module_requirements(universe_module_id=PRICE_UNIVERSE_MODULE_ID):
+    if universe_module_id not in {
+        PRICE_UNIVERSE_MODULE_ID,
+        OHLCV_UNIVERSE_MODULE_ID,
+    }:
+        raise ValueError("Pipeline scaffold Universe Module is unsupported.")
+    return {
+        **MODULE_REQUIREMENTS,
+        "universe": ("Universe", universe_module_id),
+    }
 
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -20,6 +37,7 @@ def _definition_index(definitions):
     if type(definitions) not in {list, tuple}:
         raise ValueError("Pipeline scaffold definitions must be an array.")
     indexed = {}
+    exact_identities = set()
     for definition in definitions:
         if type(definition) is not dict:
             raise ValueError("Pipeline scaffold Module definitions must be objects.")
@@ -46,10 +64,16 @@ def _definition_index(definitions):
         if definition.get("builtin") is not True:
             continue
         key = (kind, module_id)
+        exact_identity = (*key, version)
+        if exact_identity in exact_identities:
+            raise ValueError(
+                "Pipeline scaffold received duplicate exact Module: "
+                f"{kind}/{module_id}@{version}"
+            )
+        exact_identities.add(exact_identity)
         current = indexed.get(key)
-        if current is not None:
-            raise ValueError(f"Pipeline scaffold received duplicate Module: {kind}/{module_id}")
-        indexed[key] = definition
+        if current is None or int(version) > int(current["version"]):
+            indexed[key] = definition
     return indexed
 
 
@@ -73,6 +97,7 @@ def build_pipeline_scaffold(
     decision_period,
     position_scale=1.0,
     maximum_absolute_position=1.0,
+    universe_module_id=PRICE_UNIVERSE_MODULE_ID,
 ):
     """Return an ordinary Pipeline draft with a replaceable Signal Graph."""
 
@@ -99,7 +124,8 @@ def build_pipeline_scaffold(
             raise ValueError(f"Pipeline scaffold {label} cannot be negative.")
     indexed = _definition_index(definitions)
     resolved = {}
-    for role, key in MODULE_REQUIREMENTS.items():
+    requirements = module_requirements(universe_module_id)
+    for role, key in requirements.items():
         definition = indexed.get(key)
         if definition is None:
             raise ValueError(
@@ -140,6 +166,7 @@ def build_pipeline_scaffold(
     return {
         "pipelineId": pipeline_id,
         "name": name,
+        "protocolId": PROTOCOL_ID,
         "config": {
             "observationInput": {
                 "whitelist": [
@@ -175,4 +202,10 @@ def build_pipeline_scaffold(
     }
 
 
-__all__ = ("MODULE_REQUIREMENTS", "build_pipeline_scaffold")
+__all__ = (
+    "MODULE_REQUIREMENTS",
+    "OHLCV_UNIVERSE_MODULE_ID",
+    "PRICE_UNIVERSE_MODULE_ID",
+    "build_pipeline_scaffold",
+    "module_requirements",
+)

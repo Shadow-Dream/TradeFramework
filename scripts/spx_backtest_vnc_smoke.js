@@ -138,8 +138,12 @@ async function main() {
     const selected = window.__tradeState?.selectedBacktest;
     return selected?.datasetId === datasetId && selected?.metrics?.cycleCount === 20674;
   }, { timeout: 30000 }, DATASET_ID);
-  await page.waitForFunction(() => document.querySelector('#metricStrip')?.textContent.includes('Cycles20674'),
-    { timeout: 30000 });
+  await page.waitForFunction((datasetId) => {
+    const text = document.querySelector('#resultContextBar')?.textContent || '';
+    return text.includes('Backtest ID') && text.includes(datasetId)
+      && text.includes('Sampler') && text.includes('Pipeline')
+      && text.includes('Environment') && text.includes('Analyzer');
+  }, { timeout: 30000 }, DATASET_ID);
 
   const result = await page.evaluate(() => {
     const selected = window.__tradeState.selectedBacktest;
@@ -148,7 +152,9 @@ async function main() {
       datasetId: selected.datasetId,
       metrics: selected.metrics,
       dataKeys: Object.keys(selected.dataKeys || {}),
-      metricText: document.querySelector('#metricStrip')?.textContent || '',
+      contextText: document.querySelector('#resultContextBar')?.textContent || '',
+      hasMetricStrip: !!document.querySelector('#metricStrip'),
+      hasTimeZoneControl: !!document.querySelector('#resultTimezoneBtn'),
       routeBacktestId: new URLSearchParams(location.search).get('backtestId'),
     };
   });
@@ -157,7 +163,10 @@ async function main() {
   assert(result.dataKeys.includes('backtest.analysis') && !result.dataKeys.includes('backtest.transition'),
     'SPX Result does not expose the direct DataKey flow', result);
   assert(result.metrics.cycleCount > 0, 'Backtest did not record any Result cycles', result);
-  assert(!/Return|Max DD|End Value|Trades/.test(result.metricText), 'Built-in financial metrics reappeared', result);
+  assert(!result.hasMetricStrip && !result.hasTimeZoneControl,
+    'Result surface exposes specialized metrics or timezone controls', result);
+  assert(!/Annualized|Sharpe|Max Drawdown|Cycles/.test(result.contextText),
+    'Result context bar exposes inferred performance semantics', result);
   assert(pageErrors.length === 0, 'Browser page errors occurred', pageErrors);
   assert(failedResponses.length === 0, 'Browser received server errors', failedResponses);
 

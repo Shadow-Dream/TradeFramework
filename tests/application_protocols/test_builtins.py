@@ -6,9 +6,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from builtin_implementations import environment_presets
+from application_components.basic_workflow.catalog import COMPONENT_IDS
+from application_protocols.basic_workflow.manifest import PROTOCOL_ID
+from builtin_implementations import analysis_presets, environment_presets
 from builtin_implementations import resources as builtin_resources
-from builtin_implementations.basic_workflow_contracts import SAMPLER_OUTPUT_SCHEMA
+from builtin_implementations.analysis_contracts import ANALYSIS_MODULES
+from builtin_implementations.basic_workflow_contracts import (
+    OHLCV_SAMPLER_OUTPUT_SCHEMA,
+    SAMPLER_OUTPUT_SCHEMA,
+)
 from builtin_implementations.environment.basic_multi_asset_bar_account import (
     BasicMultiAssetBarAccount,
 )
@@ -18,16 +24,20 @@ from builtin_implementations.pipeline.basic_absolute_position_map_constraint imp
 )
 from builtin_implementations.pipeline.basic_neutral_score_map import BasicNeutralScoreMap
 from builtin_implementations.pipeline.basic_price_map_universe import BasicPriceMapUniverse
+from builtin_implementations.pipeline.basic_ohlcv_price_map_universe import (
+    BasicOhlcvPriceMapUniverse,
+)
 from builtin_implementations.pipeline.basic_score_map_position_target import (
     BasicScoreMapPositionTarget,
 )
 from builtin_implementations.pipeline_contracts import BUILTIN_PIPELINE_MODULES
 from engine.control import database as engine_database
-from engine.repository import graph_resources, module_definitions, samplers
+from engine.repository import folders, graph_resources, module_definitions, samplers
 
 
 PIPELINE_IDS = {
     "basic-price-map-universe",
+    "basic-ohlcv-price-map-universe",
     "basic-neutral-score-map",
     "basic-score-map-position-target",
     "basic-absolute-position-map-constraint",
@@ -63,6 +73,31 @@ class BasicWorkflowDeclarationTests(unittest.TestCase):
         }
         self.assertEqual(set(pipeline), PIPELINE_IDS)
         self.assertEqual(set(environment), {ENVIRONMENT_ID})
+        self.assertTrue(
+            all(item["protocolId"] == PROTOCOL_ID for item in pipeline.values())
+        )
+        self.assertEqual(environment[ENVIRONMENT_ID]["protocolId"], PROTOCOL_ID)
+        self.assertNotIn(
+            "protocolId",
+            next(
+                item
+                for item in BUILTIN_PIPELINE_MODULES
+                if item["moduleId"] == "sma-indicator"
+            ),
+        )
+        tagged_component_ids = {
+            item["moduleId"]
+            for item in (*ENVIRONMENT_MODULES, *ANALYSIS_MODULES)
+            if item.get("protocolId") == PROTOCOL_ID
+        }
+        self.assertEqual(
+            tagged_component_ids,
+            {
+                module_id
+                for module_ids in COMPONENT_IDS.values()
+                for module_id in module_ids
+            },
+        )
         self.assertEqual(
             {item["kind"] for item in pipeline.values()},
             {"Universe", "Signal", "Target", "Constraint"},
@@ -98,6 +133,16 @@ class BasicWorkflowDeclarationTests(unittest.TestCase):
             {"maximumAbsolutePosition": 6.0},
         )
         self.assertEqual(constraint.update(intent)["approved"], {"SPY": 5.0})
+
+    def test_ohlcv_universe_selects_the_explicit_period(self):
+        prices = {
+            "QQQ": {**_bar(20, 21), "eventTime": "2026-01-02T21:00:00Z", "volume": 2.0},
+            "SPY": {**_bar(10, 11), "eventTime": "2026-01-02T21:00:00Z", "volume": 1.0},
+        }
+        selection = _configured(
+            BasicOhlcvPriceMapUniverse(), {"decisionPeriod": "day"}
+        ).update({"day": prices})["selection"]
+        self.assertEqual(selection, {"QQQ": True, "SPY": True})
 
 
 class BasicWorkflowEnvironmentOracleTests(unittest.TestCase):
@@ -168,16 +213,51 @@ class BasicWorkflowInstallTests(unittest.TestCase):
 
             sampler = samplers.get_sampler(config, "basic-price-map-sampler", "1")
             self.assertTrue(sampler["builtin"])
+            self.assertEqual(sampler["protocolId"], PROTOCOL_ID)
+            self.assertEqual(sampler["name"], "Basic")
+            self.assertEqual(
+                sampler["parameterSchema"],
+                {
+                    "type": "object",
+                    "properties": {"decisionPeriod": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            )
+            self.assertEqual(
+                folders.item_folder(
+                    config, "samplers", "basic-price-map-sampler::1", sampler
+                )["folderPath"],
+                "/BuiltIn/Basic Workflow",
+            )
             self.assertEqual(sampler["outputSchema"], SAMPLER_OUTPUT_SCHEMA)
+            ohlcv_sampler = samplers.get_sampler(
+                config, "basic-ohlcv-map-sampler", "1"
+            )
+            self.assertTrue(ohlcv_sampler["builtin"])
+            self.assertEqual(ohlcv_sampler["protocolId"], PROTOCOL_ID)
+            self.assertEqual(
+                ohlcv_sampler["outputSchema"], OHLCV_SAMPLER_OUTPUT_SCHEMA
+            )
             self.assertEqual(
                 [item.get("samplerId") for item in second if item.get("samplerId")],
-                ["basic-price-map-sampler"],
+                ["basic-price-map-sampler", "basic-ohlcv-map-sampler"],
             )
             environments = graph_resources.load_repository(config, "environment")
             environment = environments[
                 environment_presets.BASIC_WORKFLOW_ENVIRONMENT_ID + "/1"
             ]
             self.assertTrue(environment["builtin"])
+            self.assertEqual(environment["protocolId"], PROTOCOL_ID)
+            self.assertEqual(environment["name"], "Basic")
+            self.assertEqual(
+                folders.item_folder(
+                    config,
+                    "environments",
+                    environment["environmentId"],
+                    environment,
+                )["folderPath"],
+                "/BuiltIn/Basic Workflow",
+            )
             self.assertEqual(
                 environment["graph"]["inputs"]["previous-approved-intent-input"]["dataKey"],
                 "last.intent.approved",
@@ -195,6 +275,39 @@ class BasicWorkflowInstallTests(unittest.TestCase):
                     if item["builtin"]
                 }
             )
+            basic_pipeline = [
+                item
+                for item in pipeline_definitions.values()
+                if item["moduleId"] in PIPELINE_IDS
+            ]
+            self.assertTrue(
+                all("Basic Workflow" not in item["name"] for item in basic_pipeline)
+            )
+            self.assertTrue(
+                all(item.get("protocolId") == PROTOCOL_ID for item in basic_pipeline)
+            )
+            self.assertEqual(
+                {
+                    folders.item_folder(
+                        config,
+                        "modules",
+                        f"{item['kind']}/{item['moduleId']}",
+                        item,
+                    )["folderPath"]
+                    for item in basic_pipeline
+                },
+                {
+                    f"/{item['kind']}/BuiltIn/Basic Workflow"
+                    for item in basic_pipeline
+                },
+            )
+            analyses = graph_resources.load_repository(config, "analysis")
+            basic_analysis = analyses[
+                analysis_presets.BASIC_WORKFLOW_ANALYSIS_ID + "/1"
+            ]
+            neutral_analysis = analyses[analysis_presets.NEUTRAL_ANALYSIS_ID + "/1"]
+            self.assertEqual(basic_analysis["protocolId"], PROTOCOL_ID)
+            self.assertNotIn("protocolId", neutral_analysis)
             self.assertEqual(
                 {item.get("version") for item in first if item.get("samplerId")},
                 {"1"},

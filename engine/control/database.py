@@ -19,7 +19,7 @@ from engine.control.owner import assert_control_access
 from engine.core import clock as engine_clock
 
 
-DATABASE_SCHEMA_VERSION = 19
+DATABASE_SCHEMA_VERSION = 20
 _EXPECTED_DATABASE_SCHEMA_FINGERPRINT = None
 _DATABASE_PREPARE_THREAD_LOCK = threading.Lock()
 _DATABASE_PREPARE_LOCK_NAME = ".engine-database.lock"
@@ -35,6 +35,24 @@ BEGIN
     SELECT RAISE(ABORT, 'Backtest Job backtest identity is required');
 END
 """.strip()
+_LEGACY_VISUALIZATIONS_SCHEMA_VERSION = 19
+_LEGACY_VISUALIZATIONS_TABLE_SQL = """CREATE TABLE visualizations (
+            visualization_id TEXT PRIMARY KEY,
+            backtest_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            spec_json TEXT NOT NULL,
+            FOREIGN KEY (backtest_id) REFERENCES backtests(backtest_id)
+        )"""
+_VISUALIZATIONS_TABLE_SQL = """CREATE TABLE visualizations (
+            visualization_id TEXT PRIMARY KEY,
+            backtest_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            spec_json TEXT NOT NULL,
+            FOREIGN KEY (backtest_id) REFERENCES backtests(backtest_id)
+        )"""
 
 
 def _database_path(config):
@@ -82,6 +100,66 @@ def _expected_database_schema_fingerprint():
     return _EXPECTED_DATABASE_SCHEMA_FINGERPRINT
 
 
+def _legacy_visualization_schema_fingerprint():
+    """Return the one prior physical contract eligible for in-place migration."""
+
+    expected = list(_expected_database_schema_fingerprint())
+    matches = [
+        index
+        for index, row in enumerate(expected)
+        if row[:3] == ("table", "visualizations", "visualizations")
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("Visualization database schema authority is ambiguous.")
+    expected[matches[0]] = (
+        "table",
+        "visualizations",
+        "visualizations",
+        _LEGACY_VISUALIZATIONS_TABLE_SQL,
+    )
+    return tuple(expected)
+
+
+def _migrate_visualization_revisions(connection):
+    """Migrate only an exact schema-19 database, preserving every record."""
+
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) != (
+        _LEGACY_VISUALIZATIONS_SCHEMA_VERSION
+    ):
+        return False
+    if _database_schema_fingerprint(connection) != (
+        _legacy_visualization_schema_fingerprint()
+    ):
+        return False
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "ALTER TABLE visualizations RENAME TO visualizations_schema_19"
+        )
+        connection.execute(_VISUALIZATIONS_TABLE_SQL)
+        connection.execute(
+            """
+            INSERT INTO visualizations
+            (visualization_id, backtest_id, name, created_at, revision, spec_json)
+            SELECT visualization_id, backtest_id, name, created_at, 1, spec_json
+            FROM visualizations_schema_19
+            """
+        )
+        connection.execute("DROP TABLE visualizations_schema_19")
+        connection.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
+        if _database_schema_fingerprint(connection) != (
+            _expected_database_schema_fingerprint()
+        ):
+            raise RuntimeError(
+                "Visualization revision migration did not produce the exact schema."
+            )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    return True
+
+
 def _require_database_schema(connection):
     schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if schema_version != DATABASE_SCHEMA_VERSION:
@@ -123,6 +201,15 @@ def _prepare_database_locked(config):
         has_tables = bool(probe.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1"
         ).fetchone())
+        if (
+            has_tables
+            and schema_version == _LEGACY_VISUALIZATIONS_SCHEMA_VERSION
+            and journal_mode == "wal"
+            and _migrate_visualization_revisions(probe)
+        ):
+            schema_version = int(
+                probe.execute("PRAGMA user_version").fetchone()[0]
+            )
         schema_matches = (
             has_tables
             and schema_version == DATABASE_SCHEMA_VERSION
@@ -526,6 +613,7 @@ def _initialize_database(connection):
             backtest_id TEXT NOT NULL,
             name TEXT NOT NULL,
             created_at TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK (revision >= 1),
             spec_json TEXT NOT NULL,
             FOREIGN KEY (backtest_id) REFERENCES backtests(backtest_id)
         );

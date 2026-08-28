@@ -128,6 +128,19 @@ class CurrentResultContractTests(unittest.TestCase):
                 fabricated_projection,
                 execution_snapshot=execution_snapshot,
             )
+        fabricated_configuration = copy.deepcopy(current)
+        fabricated_configuration["executionChain"]["configuration"][
+            "pipeline"
+        ]["effectiveModuleConfigs"]["forged"] = {"period": 99}
+        configuration = fabricated_configuration["executionChain"]["configuration"]
+        configuration["digest"] = backtest_evidence_digest({
+            key: value for key, value in configuration.items() if key != "digest"
+        })
+        with self.assertRaisesRegex(ValueError, "stored execution snapshot"):
+            result_contracts.require_result(
+                fabricated_configuration,
+                execution_snapshot=execution_snapshot,
+            )
         numeric_snapshot = copy.deepcopy(execution_snapshot)
         artifact = numeric_snapshot["compositionArtifact"]
         artifact["pipelinePlan"]["outputContracts"]["strictNumber"] = {
@@ -178,6 +191,134 @@ class CurrentResultContractTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "array runtime type"):
             result_contracts.require_result(array_contract)
+
+    def test_snapshot_v12_configuration_is_compatible_and_tamper_evident(self):
+        completed = self.fixture.run_minimal_backtest(
+            "legacy-result-configuration"
+        )
+        result_path = (
+            backtest_result_archive.archive_root(
+                self.fixture.config["releaseRoot"]
+            )
+            / completed["backtestId"]
+            / "result.json"
+        )
+        current = json.loads(result_path.read_text(encoding="utf-8"))
+        manifest = json.loads(
+            (result_path.parent / "result-manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        current_snapshot = manifest["catalog"]["request"]["executionSnapshot"]
+        legacy_snapshot = copy.deepcopy(current_snapshot)
+        legacy_snapshot["schemaVersion"] = 12
+        identity_fields = {
+            "pipeline": "pipelineId",
+            "environment": "environmentId",
+            "analysis": "analysisId",
+        }
+        for resource, identity_field in identity_fields.items():
+            reference = legacy_snapshot["executionInputs"][resource]
+            legacy_snapshot["executionInputs"][resource] = {
+                identity_field: reference[identity_field],
+                "version": reference["version"],
+                "configOverride": {},
+            }
+        legacy_snapshot["snapshotHash"] = backtest_evidence_digest({
+            key: value
+            for key, value in legacy_snapshot.items()
+            if key != "snapshotHash"
+        })
+
+        def module_configs(definition):
+            return {
+                instance_id: copy.deepcopy(instance["config"])
+                for instance_id, instance in sorted(
+                    definition["instances"].items()
+                )
+            }
+
+        sampler_parameters = legacy_snapshot["executionInputs"]["sampler"][
+            "parameters"
+        ]
+        legacy_configuration = {
+            "sampler": {
+                "override": copy.deepcopy(sampler_parameters),
+                "effective": {
+                    **copy.deepcopy(
+                        legacy_snapshot["samplerDefinition"]["config"]
+                    ),
+                    **copy.deepcopy(sampler_parameters),
+                },
+            },
+            "pipeline": {
+                "override": {},
+                "effective": module_configs(
+                    legacy_snapshot["pipeline"]["definition"]
+                ),
+            },
+            "environment": {
+                "override": {},
+                "effective": module_configs(
+                    legacy_snapshot["environmentDefinition"]
+                ),
+            },
+            "analysis": {
+                "override": {},
+                "effective": module_configs(
+                    legacy_snapshot["analysisDefinition"]
+                ),
+            },
+        }
+        legacy_configuration["digest"] = backtest_evidence_digest(
+            legacy_configuration
+        )
+        legacy_result = copy.deepcopy(current)
+        legacy_result["executionChain"]["snapshotHash"] = legacy_snapshot[
+            "snapshotHash"
+        ]
+        legacy_result["executionChain"]["configuration"] = copy.deepcopy(
+            legacy_configuration
+        )
+        self.assertIs(
+            result_contracts.require_result(
+                legacy_result,
+                execution_snapshot=legacy_snapshot,
+            ),
+            legacy_result,
+        )
+
+        digest_tamper = copy.deepcopy(legacy_result)
+        digest_tamper["executionChain"]["configuration"]["pipeline"][
+            "effective"
+        ]["forged"] = {}
+        with self.assertRaisesRegex(ValueError, "configuration.digest"):
+            result_contracts.require_result(digest_tamper)
+
+        recomputed_tamper = copy.deepcopy(digest_tamper)
+        configuration = recomputed_tamper["executionChain"]["configuration"]
+        configuration["digest"] = backtest_evidence_digest({
+            key: value for key, value in configuration.items() if key != "digest"
+        })
+        with self.assertRaisesRegex(ValueError, "stored execution snapshot"):
+            result_contracts.require_result(
+                recomputed_tamper,
+                execution_snapshot=legacy_snapshot,
+            )
+
+        current_snapshot_legacy_shape = copy.deepcopy(current)
+        current_snapshot_legacy_shape["executionChain"]["configuration"] = (
+            copy.deepcopy(legacy_configuration)
+        )
+        self.assertIs(
+            result_contracts.require_result(current_snapshot_legacy_shape),
+            current_snapshot_legacy_shape,
+        )
+        with self.assertRaisesRegex(ValueError, "stored execution snapshot"):
+            result_contracts.require_result(
+                current_snapshot_legacy_shape,
+                execution_snapshot=current_snapshot,
+            )
 
 
 if __name__ == "__main__":

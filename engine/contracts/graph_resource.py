@@ -7,6 +7,7 @@ GRAPH_RESOURCE_COMMON_DRAFT_FIELDS = frozenset({
     "description",
     "instances",
     "graph",
+    "protocolId",
 })
 GRAPH_RESOURCE_ARCHIVE_FIELDS = frozenset({
     "version",

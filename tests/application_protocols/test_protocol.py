@@ -18,6 +18,7 @@ from application_protocols.basic_workflow.registry import build_registry
 from application_protocols.basic_workflow.scaffolds import (
     MODULE_REQUIREMENTS,
     build_pipeline_scaffold,
+    module_requirements,
 )
 from application_protocols.basic_workflow.visualization_presets import (
     build_visualization_preset,
@@ -36,7 +37,10 @@ def _digest(number):
 
 
 def _module_records():
-    required = set(MODULE_REQUIREMENTS.values())
+    required = {
+        *MODULE_REQUIREMENTS.values(),
+        *module_requirements("basic-ohlcv-price-map-universe").values(),
+    }
     result = []
     for index, source in enumerate(BUILTIN_PIPELINE_MODULES, start=1):
         if (source["kind"], source["moduleId"]) not in required:
@@ -84,67 +88,89 @@ class BasicWorkflowManifestTests(unittest.TestCase):
 
 
 class BasicWorkflowRegistryTests(unittest.TestCase):
-    def test_registry_pins_only_protocol_owned_v2_resources(self):
-        identities = (
-            ("samplerId", "basic-price-map-sampler", None),
-            ("environmentId", "basic-multi-asset-paper-environment", None),
-            ("moduleId", "basic-price-map-universe", "Universe"),
-            ("moduleId", "basic-neutral-score-map", "Signal"),
-            ("moduleId", "basic-score-map-position-target", "Target"),
-            ("moduleId", "basic-absolute-position-map-constraint", "Constraint"),
-        )
-        records = []
-        for index, (field, resource_id, kind) in enumerate(identities, start=1):
-            record = {
-                field: resource_id,
-                "version": str(index),
-                "contentDigest": _digest(index),
-                "builtin": True,
-            }
-            if kind:
-                record["kind"] = kind
-            records.append(record)
-        records.append(
+    def test_registry_includes_any_basic_declaration_and_ignores_outside_records(self):
+        records = [
             {
-                "analysisId": "basic-workflow-performance-analysis",
+                "moduleId": "user-defined-basic-signal",
+                "kind": "Signal",
+                "version": "7",
+                "contentDigest": _digest(1),
+                "protocolId": PROTOCOL_ID,
+            },
+            {
+                "analysisId": "user-defined-basic-analysis",
+                "version": "3",
+                "protocolId": PROTOCOL_ID,
+            },
+            {
+                "pipelineId": "unbound-pipeline",
                 "version": "1",
-                "contentDigest": _digest(100),
-                "builtin": True,
-            }
-        )
+            },
+            {
+                "environmentId": "other-protocol-environment",
+                "version": "1",
+                "protocolId": "vendor.other-workflow",
+            },
+        ]
         registry = build_registry(records)
-        self.assertEqual(len(registry), len(identities))
         self.assertEqual(
-            [entry["role"] for entry in registry],
-            sorted(entry["role"] for entry in registry),
+            {
+                (entry["resource"]["type"], entry["resource"]["id"])
+                for entry in registry
+            },
+            {
+                ("analysis", "user-defined-basic-analysis"),
+                ("module", "user-defined-basic-signal"),
+            },
         )
-        self.assertNotIn(
-            "basic-workflow-performance-analysis",
-            {entry["resource"]["id"] for entry in registry},
-        )
+        self.assertTrue(all(entry["protocolId"] == PROTOCOL_ID for entry in registry))
+        self.assertTrue(all(set(entry) == {"protocolId", "resource"} for entry in registry))
 
-    def test_registry_rejects_symbolic_or_unowned_known_identity(self):
+    def test_registry_rejects_duplicate_exact_resource_but_allows_versions(self):
         base = {
-            "moduleId": "basic-neutral-score-map",
+            "moduleId": "user-defined-basic-signal",
             "kind": "Signal",
             "version": "1",
             "contentDigest": _digest(1),
-            "builtin": True,
+            "protocolId": PROTOCOL_ID,
         }
-        for changes in (
-            {"version": "latest"},
-            {"version": "01"},
-            {"contentDigest": "not-evidence"},
-            {"kind": "Analyzer"},
-            {"builtin": False},
-        ):
-            with self.subTest(changes=changes), self.assertRaises(ValueError):
-                build_registry([{**base, **changes}])
         with self.assertRaisesRegex(ValueError, "Duplicate"):
             build_registry([base, copy.deepcopy(base)])
+        registry = build_registry([base, {**base, "version": "2"}])
+        self.assertEqual(
+            [entry["resource"]["version"] for entry in registry],
+            ["1", "2"],
+        )
 
 
 class BasicWorkflowPipelineScaffoldTests(unittest.TestCase):
+    def test_scaffold_selects_latest_module_version_and_rejects_exact_duplicates(self):
+        records = _module_records()
+        universe = next(
+            item for item in records
+            if item["moduleId"] == "basic-price-map-universe"
+        )
+        newer = {
+            **copy.deepcopy(universe),
+            "version": "2",
+            "contentDigest": _digest(202),
+        }
+        scaffold = build_pipeline_scaffold(
+            "latest-module",
+            "Latest Module",
+            [newer, *records],
+            decision_period="day",
+        )
+        self.assertEqual(scaffold["instances"]["universe"]["version"], "2")
+
+        with self.assertRaisesRegex(ValueError, "duplicate exact Module"):
+            build_pipeline_scaffold(
+                "duplicate-exact",
+                "Duplicate Exact",
+                [*records, copy.deepcopy(universe)],
+                decision_period="day",
+            )
+
     def test_scaffold_compiles_against_recursive_price_map(self):
         records = _module_records()
         scaffold = build_pipeline_scaffold(
@@ -156,7 +182,7 @@ class BasicWorkflowPipelineScaffoldTests(unittest.TestCase):
             maximum_absolute_position=3.0,
         )
         self.assertNotIn("builtin", scaffold)
-        self.assertNotIn("protocolId", scaffold)
+        self.assertEqual(scaffold["protocolId"], PROTOCOL_ID)
         self.assertEqual(
             scaffold["instances"]["universe"]["inputs"]["price"],
             "price",
@@ -170,9 +196,19 @@ class BasicWorkflowPipelineScaffoldTests(unittest.TestCase):
                 scaffold,
                 _definition_map(records),
             )
+            definition_map = _definition_map(records)
+            manifest_definitions = {
+                definition_key(module["kind"], module["moduleId"], module["version"]):
+                    definition_map[
+                        definition_key(
+                            module["kind"], module["moduleId"], module["version"]
+                        )
+                    ]
+                for module in manifest["modules"]
+            }
             template = pipeline_compiler.compile_pipeline_contract_template(
                 manifest,
-                _definition_map(records),
+                manifest_definitions,
             )
             plan = pipeline_compiler.bind_pipeline_contract_plan(
                 template,
@@ -183,10 +219,61 @@ class BasicWorkflowPipelineScaffoldTests(unittest.TestCase):
                     "execution.orders": schemas.EXECUTION_ORDERS_SCHEMA,
                 },
             )
+        self.assertNotIn("protocolId", manifest)
+        self.assertTrue(
+            all("protocolId" not in module for module in manifest["modules"])
+        )
         self.assertEqual(
             manifest["topology"],
             ["universe", "signal", "target", "constraint"],
         )
+        material = pipeline_authority.bound_pipeline_contract_plan_material(plan)[0]
+        self.assertEqual(
+            material["outputContracts"]["intent.approved"],
+            schemas.APPROVED_INTENT_SCHEMA,
+        )
+
+    def test_ohlcv_scaffold_uses_exact_ohlcv_universe_contract(self):
+        records = _module_records()
+        scaffold = build_pipeline_scaffold(
+            "ohlcv-pipeline",
+            "OHLCV Pipeline",
+            records,
+            decision_period="day",
+            universe_module_id="basic-ohlcv-price-map-universe",
+        )
+        self.assertEqual(
+            scaffold["instances"]["universe"]["moduleId"],
+            "basic-ohlcv-price-map-universe",
+        )
+        with mock.patch("engine.archive.version.verify_record"):
+            manifest = pipeline_manifest_compiler.compile_pipeline_manifest_from_definitions(
+                scaffold,
+                _definition_map(records),
+            )
+            definition_map = _definition_map(records)
+            manifest_definitions = {
+                definition_key(module["kind"], module["moduleId"], module["version"]):
+                    definition_map[
+                        definition_key(
+                            module["kind"], module["moduleId"], module["version"]
+                        )
+                    ]
+                for module in manifest["modules"]
+            }
+            template = pipeline_compiler.compile_pipeline_contract_template(
+                manifest,
+                manifest_definitions,
+            )
+            plan = pipeline_compiler.bind_pipeline_contract_plan(
+                template,
+                {
+                    "time": {"type": "string"},
+                    "price": schemas.OHLCV_PRICE_SCHEMA,
+                    "portfolio.account": schemas.PORTFOLIO_ACCOUNT_SCHEMA,
+                    "execution.orders": schemas.EXECUTION_ORDERS_SCHEMA,
+                },
+            )
         material = pipeline_authority.bound_pipeline_contract_plan_material(plan)[0]
         self.assertEqual(
             material["outputContracts"]["intent.approved"],
@@ -258,6 +345,7 @@ class BasicWorkflowPipelineScaffoldTests(unittest.TestCase):
 class BasicWorkflowVisualizationPresetTests(unittest.TestCase):
     def test_preset_uses_only_explicit_period_instrument_and_declared_keys(self):
         data_keys = {
+            "time": {"schema": {"type": "string"}, "required": True},
             "price.day.SPX.close": {"schema": {"type": "number"}, "required": True},
             "portfolio.account.equity": {
                 "schema": {"type": "number"},

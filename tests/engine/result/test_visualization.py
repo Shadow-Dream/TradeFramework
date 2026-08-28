@@ -101,6 +101,7 @@ class ResultVisualizationIntegrationTests(BacktestIntegrationTestCase):
             self.config,
             {
                 "backtestId": backtest_id,
+                "expectedRevision": 0,
                 "visualizationId": f"{backtest_id}-current",
                 "name": "Current",
                 "spec": saved_spec,
@@ -116,6 +117,7 @@ class ResultVisualizationIntegrationTests(BacktestIntegrationTestCase):
         manifest_after = manifest_path.read_bytes()
         current = result_repository.get_backtest_meta(self.config, backtest_id)
         self.assertEqual(response["visualization"]["spec"], saved_spec)
+        self.assertEqual(response["visualization"]["revision"], 1)
         self.assertEqual(current["visualization"], saved_spec)
         self.assertEqual(manifest_after, manifest_before)
         self.assertEqual(

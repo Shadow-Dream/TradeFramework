@@ -7,7 +7,7 @@ import logging
 import shutil
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +25,7 @@ from engine.worker.backtest_supervisor import (
 LOGGER = logging.getLogger(__name__)
 _PREPARED_SUBMISSION_OMITTED = object()
 _DURABLE_PROGRESS_INTERVAL_SECONDS = 1.0
+_QUEUED_DISPATCH_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,11 @@ class BacktestJobManager:
         self._stopping = threading.Event()
         self._retained_execution_roots = {}
         self._retained_execution_roots_lock = threading.Lock()
+        self._dispatch_lock = threading.RLock()
+        self._dispatch_futures = {}
+        self._dispatch_timers = {}
+        self._dispatch_recoveries = {}
+        self._retired_executors = []
         self._executor = ThreadPoolExecutor(
             max_workers=self.max_workers,
             thread_name_prefix="backtest-job",
@@ -130,6 +136,150 @@ class BacktestJobManager:
         self.repository.prepare()
         self.services.reconcile_result_staging(self.config)
         self._fail_interrupted_jobs()
+
+    def _new_executor(self):
+        return ThreadPoolExecutor(
+            max_workers=self.max_workers,
+            thread_name_prefix="backtest-job",
+        )
+
+    def _track_execution(self, job_id, backtest_id, request):
+        with self._dispatch_lock:
+            future = self._executor.submit(
+                self._execute,
+                job_id,
+                backtest_id,
+                copy.deepcopy(request),
+            )
+            timer = threading.Timer(
+                _QUEUED_DISPATCH_TIMEOUT_SECONDS,
+                self._recover_starved_dispatch,
+                args=(job_id, backtest_id, copy.deepcopy(request), future),
+            )
+            timer.daemon = True
+            self._dispatch_futures[job_id] = future
+            self._dispatch_timers[job_id] = timer
+            future.add_done_callback(
+                lambda completed, identity=job_id: self._execution_finished(
+                    identity,
+                    completed,
+                )
+            )
+            if self._dispatch_futures.get(job_id) is future:
+                timer.start()
+            return future
+
+    def _execution_finished(self, job_id, future):
+        with self._dispatch_lock:
+            if self._dispatch_futures.get(job_id) is future:
+                self._dispatch_futures.pop(job_id, None)
+                timer = self._dispatch_timers.pop(job_id, None)
+                self._dispatch_recoveries.pop(job_id, None)
+            else:
+                timer = None
+        if timer is not None:
+            timer.cancel()
+        try:
+            exception = future.exception()
+        except CancelledError:
+            return
+        if exception is None:
+            return
+        try:
+            self._fail_job(
+                job_id,
+                "Backtest dispatcher failed before terminalizing the Job: "
+                + (str(exception) or exception.__class__.__name__),
+            )
+        except BaseException:
+            LOGGER.exception(
+                "Backtest dispatcher could not terminalize Job %s",
+                job_id,
+            )
+
+    def _reschedule_dispatch_watchdog(
+        self,
+        job_id,
+        backtest_id,
+        request,
+        future,
+    ):
+        timer = threading.Timer(
+            _QUEUED_DISPATCH_TIMEOUT_SECONDS,
+            self._recover_starved_dispatch,
+            args=(job_id, backtest_id, copy.deepcopy(request), future),
+        )
+        timer.daemon = True
+        with self._dispatch_lock:
+            if (
+                self._stopping.is_set()
+                or self._dispatch_futures.get(job_id) is not future
+                or future.done()
+            ):
+                return
+            self._dispatch_timers[job_id] = timer
+        timer.start()
+
+    def _recover_starved_dispatch(
+        self,
+        job_id,
+        backtest_id,
+        request,
+        future,
+    ):
+        with self._dispatch_lock:
+            if (
+                self._stopping.is_set()
+                or self._dispatch_futures.get(job_id) is not future
+                or future.done()
+            ):
+                return
+            other_running = sum(
+                candidate.running()
+                for identity, candidate in self._dispatch_futures.items()
+                if identity != job_id
+            )
+        running_jobs = sum(
+            status == "running"
+            for _job_id, _backtest_id, status in self.repository.active_references()
+        )
+        if future.running() or max(other_running, running_jobs) >= self.max_workers:
+            self._reschedule_dispatch_watchdog(
+                job_id,
+                backtest_id,
+                request,
+                future,
+            )
+            return
+        with self._dispatch_lock:
+            if (
+                self._stopping.is_set()
+                or self._dispatch_futures.get(job_id) is not future
+            ):
+                return
+            recovery_exhausted = self._dispatch_recoveries.get(job_id, 0) >= 1
+            if not future.cancel():
+                return
+            if not recovery_exhausted:
+                old_executor = self._executor
+                old_executor.shutdown(wait=False, cancel_futures=True)
+                self._retired_executors.append(old_executor)
+                self._executor = self._new_executor()
+                self._dispatch_recoveries[job_id] = 1
+        if recovery_exhausted:
+            self._fail_job(
+                job_id,
+                "Backtest dispatcher remained queued after one recovery attempt.",
+            )
+            return
+        self._emit(
+            "backtest.job.dispatch.recovered",
+            {
+                **self.repository.get(job_id),
+                "reason": "queued Job had no running executor capacity",
+            },
+        )
+        self._track_execution(job_id, backtest_id, request)
 
     def _completed_evidence(self, job_id, backtest_id):
         expected_request = self.repository.active_request_for_job(
@@ -283,12 +433,7 @@ class BacktestJobManager:
         job = self.repository.get(job_id)
         self._emit("backtest.job.submitted", job)
         try:
-            self._executor.submit(
-                self._execute,
-                job_id,
-                backtest_id,
-                copy.deepcopy(request),
-            )
+            self._track_execution(job_id, backtest_id, request)
         except BaseException as exc:
             self._fail_job(job_id, str(exc) or exc.__class__.__name__)
             raise
@@ -441,6 +586,11 @@ class BacktestJobManager:
 
     def shutdown(self):
         self._stopping.set()
+        with self._dispatch_lock:
+            timers = tuple(self._dispatch_timers.values())
+            self._dispatch_timers.clear()
+        for timer in timers:
+            timer.cancel()
         first_error = None
         try:
             self._executor.shutdown(wait=True, cancel_futures=True)
@@ -450,6 +600,11 @@ class BacktestJobManager:
                 self._executor.shutdown(wait=True, cancel_futures=True)
             except BaseException as retry_error:
                 first_error = first_error or retry_error
+        for executor in self._retired_executors:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except BaseException as exc:
+                first_error = first_error or exc
         execution_parent = Path(self.config["controlRoot"]) / "backtest-runs"
         try:
             shutdown_backtest_runtimes(execution_parent)

@@ -6,9 +6,23 @@ from unittest import mock
 from builtin_implementations.visualizer_contracts import visualizer_definition_map
 from engine.contracts import visualization as visualization_contracts
 from engine.service import visualizations as visualization_service
+from tests.support.pipeline_contract import (
+    definition as module_definition,
+    instance as module_instance,
+)
 
 
 class VisualizationServiceTests(unittest.TestCase):
+    def test_current_visualization_id_is_server_canonical_for_uppercase_backtest(self):
+        self.assertEqual(
+            visualization_service.current_visualization_id(
+                "bt_01M0Z2D7FZACAARVSZPZH34P63"
+            ),
+            "bt_01m0z2d7fzacaarvszpzh34p63-current",
+        )
+        with self.assertRaisesRegex(ValueError, "non-empty string"):
+            visualization_service.current_visualization_id("")
+
     def setUp(self):
         self.config = {
             "controlRoot": "/unused/control",
@@ -18,6 +32,7 @@ class VisualizationServiceTests(unittest.TestCase):
         self.spec = visualization_contracts.default_spec("prices", "UTC")
         self.request = {
             "backtestId": "bt_01K00000000000000000000000",
+            "expectedRevision": 0,
             "visualizationId": " Current View ",
             "name": " Current chart ",
             "spec": self.spec,
@@ -90,12 +105,78 @@ class VisualizationServiceTests(unittest.TestCase):
                 )
         save.assert_not_called()
 
+    def test_ambiguous_root_and_pane_temporary_scope_is_not_persisted(self):
+        definition = module_definition(
+            "producer",
+            outputs={"value": {"schema": {"type": "number"}}},
+        )
+        spec = visualization_contracts.default_spec("prices", "UTC")
+        spec["temporaryModules"] = [module_instance(
+            "shared", "producer", outputs={"value": "root.value"},
+        )]
+        spec["panes"].append({
+            "id": "price",
+            "title": "Price",
+            "role": "financial",
+            "view": {
+                "start": None,
+                "end": None,
+                "logScale": False,
+                "controlsCollapsed": False,
+            },
+            "visualizers": [],
+            "temporaryModules": [module_instance(
+                "shared", "producer", outputs={"value": "pane.value"},
+            )],
+        })
+        request = {**self.request, "spec": spec}
+        backtest = {
+            **self.backtest,
+            "dataKeys": {
+                "price.close": {
+                    "schema": {"type": "number"},
+                    "required": False,
+                },
+            },
+        }
+        with (
+            mock.patch.object(
+                visualization_service.result_repository,
+                "get_backtest_meta",
+                return_value=backtest,
+            ),
+            mock.patch.object(
+                visualization_service.module_repository,
+                "load_pipeline_definitions",
+                return_value={"Signal/producer/1": definition},
+            ),
+            mock.patch(
+                "engine.archive.version.verify_record",
+                side_effect=lambda record: record,
+            ),
+            mock.patch.object(
+                visualization_service.visualization_repository,
+                "save_visualization",
+            ) as save,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "instanceId 'shared' conflicts with root temporaryModules",
+            ):
+                visualization_service.save_visualization(
+                    self.config,
+                    request,
+                    self.visualizer_definitions,
+                )
+        save.assert_not_called()
+
     def test_success_preserves_caller_id_normalization_and_trimmed_name(self):
         expected_record = {
             "visualizationId": "current-view",
             "backtestId": self.request["backtestId"],
             "name": "Current chart",
             "createdAt": "2026-08-11T12:00:00Z",
+            "revision": 1,
             "spec": self.spec,
         }
         with (
@@ -136,7 +217,9 @@ class VisualizationServiceTests(unittest.TestCase):
             {},
             self.visualizer_definitions,
         )
-        save.assert_called_once_with(self.config, expected_record)
+        save.assert_called_once_with(
+            self.config, expected_record, expected_revision=0
+        )
         self.assertEqual(
             response,
             {"accepted": True, "visualization": expected_record},

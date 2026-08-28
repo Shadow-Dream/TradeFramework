@@ -32,6 +32,7 @@ def _object_map(value_schema):
 
 BAR_SCHEMA = _closed_object(
     {
+        "eventTime": STRING,
         "open": NUMBER,
         "close": NUMBER,
         "high": NUMBER,
@@ -39,8 +40,33 @@ BAR_SCHEMA = _closed_object(
     }
 )
 
+OHLCV_BAR_SCHEMA = _closed_object({
+    "eventTime": STRING, "open": NUMBER, "close": NUMBER,
+    "high": NUMBER, "low": NUMBER, "volume": NUMBER,
+})
+
+BAR_WITH_OPTIONAL_VOLUME_SCHEMA = _closed_object(
+    {
+        "eventTime": STRING,
+        "open": NUMBER,
+        "close": NUMBER,
+        "high": NUMBER,
+        "low": NUMBER,
+        "volume": NUMBER,
+    },
+    required=("eventTime", "open", "close", "high", "low"),
+)
+
 INSTRUMENT_PRICE_MAP_SCHEMA = _object_map(BAR_SCHEMA)
 PRICE_SCHEMA = _object_map(INSTRUMENT_PRICE_MAP_SCHEMA)
+OHLCV_INSTRUMENT_PRICE_MAP_SCHEMA = _object_map(OHLCV_BAR_SCHEMA)
+OHLCV_PRICE_SCHEMA = _object_map(OHLCV_INSTRUMENT_PRICE_MAP_SCHEMA)
+INSTRUMENT_PRICE_WITH_OPTIONAL_VOLUME_SCHEMA = _object_map(
+    BAR_WITH_OPTIONAL_VOLUME_SCHEMA
+)
+PRICE_WITH_OPTIONAL_VOLUME_SCHEMA = _object_map(
+    INSTRUMENT_PRICE_WITH_OPTIONAL_VOLUME_SCHEMA
+)
 
 POSITION_MAP_SCHEMA = _object_map(NUMBER)
 PORTFOLIO_ACCOUNT_SCHEMA = _closed_object(
@@ -72,8 +98,13 @@ SAMPLER_OUTPUT_SCHEMA = {
     "time": STRING,
     "price": PRICE_SCHEMA,
 }
+OHLCV_SAMPLER_OUTPUT_SCHEMA = {
+    "time": STRING,
+    "price": OHLCV_PRICE_SCHEMA,
+}
 
 CSV_FIELDS = ("time", "open", "close", "high", "low")
+CSV_FIELDS_V3 = ("time", "eventTime", "open", "close", "high", "low", "volume")
 
 
 def schema_copy(value):
@@ -84,5 +115,5 @@ __all__ = tuple(
     name
     for name in globals()
     if name.endswith("_SCHEMA")
-    or name in {"CSV_FIELDS", "schema_copy"}
+    or name in {"CSV_FIELDS", "CSV_FIELDS_V3", "schema_copy"}
 )

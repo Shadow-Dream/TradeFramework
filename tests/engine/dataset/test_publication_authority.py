@@ -7,6 +7,7 @@ from unittest import mock
 
 from engine.archive import dataset as dataset_archive
 from engine.archive import version as version_archive
+from engine.contracts import strict_json
 from engine.control import database as engine_database
 from engine.core import clock as engine_clock
 from engine.repository import dataset_publication
@@ -73,6 +74,171 @@ class DatasetPublicationAuthorityTests(unittest.TestCase):
         self.assertEqual(list(versions_root.iterdir()), [foreign])
         with self.assertRaisesRegex(ValueError, "Unknown dataset"):
             datasets.get_dataset(self.config, "foreign")
+
+    def test_protocol_id_is_sealed_and_projected_without_semantic_validation(self):
+        dataset_id = "protocol-owned-dataset"
+        descriptor = self.descriptor(dataset_id)
+        descriptor["protocolId"] = "trade.basic-workflow"
+        staging = self.staging_with_value(self.config, dataset_id)
+
+        dataset = self.publish(
+            self.config,
+            staging,
+            dataset_id,
+            dataset=descriptor,
+        )
+        version = datasets.list_dataset_versions(self.config, dataset_id)[0]
+        summary = datasets.list_dataset_version_summaries(
+            self.config, [dataset_id]
+        )[0]
+
+        self.assertEqual(dataset["protocolId"], "trade.basic-workflow")
+        self.assertEqual(version["protocolId"], "trade.basic-workflow")
+        self.assertEqual(summary["protocolId"], "trade.basic-workflow")
+        self.assertEqual(
+            version["manifest"]["schemaVersion"],
+            dataset_archive.MANIFEST_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            version["manifest"]["dataset"]["protocolId"],
+            "trade.basic-workflow",
+        )
+
+    def test_protocol_id_is_not_inferred_from_dataset_metadata(self):
+        dataset_id = "metadata-is-not-protocol-authority"
+        descriptor = self.descriptor(dataset_id)
+        descriptor["metadata"] = {"protocolId": "trade.basic-workflow"}
+        staging = self.staging_with_value(self.config, dataset_id)
+
+        dataset = self.publish(
+            self.config,
+            staging,
+            dataset_id,
+            dataset=descriptor,
+        )
+        version = datasets.list_dataset_versions(self.config, dataset_id)[0]
+
+        self.assertNotIn("protocolId", dataset)
+        self.assertNotIn("protocolId", version)
+        self.assertNotIn("protocolId", version["manifest"]["dataset"])
+
+    def test_dataset_protocol_id_is_immutable_across_versions(self):
+        dataset_id = "protocol-immutable-dataset"
+        descriptor = self.descriptor(dataset_id)
+        descriptor["protocolId"] = "trade.basic-workflow"
+        first_staging = self.staging_with_value(self.config, dataset_id, "first")
+        self.publish(
+            self.config,
+            first_staging,
+            dataset_id,
+            dataset=descriptor,
+        )
+        conflicting = self.descriptor(dataset_id)
+        conflicting["protocolId"] = "trade.another-workflow"
+        second_staging = self.staging_with_value(self.config, dataset_id, "second")
+
+        with self.assertRaisesRegex(ValueError, "may not redefine Dataset protocolId"):
+            self.publish(
+                self.config,
+                second_staging,
+                dataset_id,
+                dataset=conflicting,
+                append=True,
+            )
+
+        self.assertEqual(
+            datasets.get_dataset(self.config, dataset_id)["protocolId"],
+            "trade.basic-workflow",
+        )
+        self.assertEqual(len(datasets.list_dataset_versions(self.config, dataset_id)), 1)
+
+    def test_invalid_dataset_protocol_id_has_no_publication_side_effect(self):
+        for index, invalid in enumerate((None, "", " basic ")):
+            dataset_id = f"invalid-protocol-{index}"
+            descriptor = self.descriptor(dataset_id)
+            descriptor["protocolId"] = invalid
+            staging = self.staging_with_value(self.config, dataset_id)
+            with self.subTest(value=invalid), self.assertRaisesRegex(
+                ValueError, "canonical non-empty string"
+            ):
+                self.publish(
+                    self.config,
+                    staging,
+                    dataset_id,
+                    dataset=descriptor,
+                )
+            self.assertEqual(datasets.count_datasets(self.config), 0)
+
+    def test_legacy_v4_dataset_manifest_remains_an_explicit_supported_shape(self):
+        dataset_id = "legacy-v4-manifest"
+        staging = self.staging_with_value(self.config, dataset_id)
+        dataset = self.publish(self.config, staging, dataset_id)
+        current = datasets.list_dataset_versions(
+            self.config, dataset["datasetId"]
+        )[0]["manifest"]
+        legacy = copy.deepcopy(current)
+        legacy["schemaVersion"] = dataset_archive.LEGACY_MANIFEST_SCHEMA_VERSION
+        legacy["dataset"].pop("protocolId", None)
+        legacy["manifestDigest"] = version_archive.content_digest({
+            key: value for key, value in legacy.items() if key != "manifestDigest"
+        })
+
+        self.assertIs(dataset_archive.validate_manifest(legacy), legacy)
+        invalid = copy.deepcopy(legacy)
+        invalid["dataset"]["protocolId"] = "trade.basic-workflow"
+        invalid["manifestDigest"] = version_archive.content_digest({
+            key: value for key, value in invalid.items() if key != "manifestDigest"
+        })
+        with self.assertRaisesRegex(ValueError, "Legacy Dataset archive"):
+            dataset_archive.validate_manifest(invalid)
+
+    def test_legacy_v4_dataset_archive_remains_verifiable_and_retryable(self):
+        dataset_id = "legacy-v4-retry"
+        published = self.publish(
+            self.config,
+            self.staging_with_value(self.config, dataset_id),
+            dataset_id,
+        )
+        version = datasets.list_dataset_versions(self.config, dataset_id)[0]
+        legacy = copy.deepcopy(version["manifest"])
+        legacy["schemaVersion"] = dataset_archive.LEGACY_MANIFEST_SCHEMA_VERSION
+        legacy["manifestDigest"] = version_archive.content_digest({
+            key: value for key, value in legacy.items() if key != "manifestDigest"
+        })
+        manifest_path = Path(version["storage"]["uri"]) / dataset_archive.MANIFEST_NAME
+        manifest_path.chmod(0o644)
+        manifest_path.write_text(
+            strict_json.dumps(legacy, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        manifest_path.chmod(0o444)
+        with engine_database.connect_database(self.config) as connection:
+            # Reconstruct an archive/index pair written by the previous schema.
+            connection.execute("DROP TRIGGER sealed_dataset_version_no_update")
+            connection.execute(
+                "UPDATE dataset_versions SET manifest_json = ?, manifest_digest = ? "
+                "WHERE version_id = ?",
+                (
+                    strict_json.dumps(legacy, sort_keys=True),
+                    legacy["manifestDigest"],
+                    version["datasetVersionId"],
+                ),
+            )
+            engine_database._initialize_database(connection)
+            connection.commit()
+
+        verified = datasets.verify_dataset_version_id(
+            self.config, version["datasetVersionId"]
+        )
+        repeated = self.publish(
+            self.config,
+            self.staging_with_value(self.config, dataset_id),
+            dataset_id,
+        )
+
+        self.assertEqual(verified["manifest"]["schemaVersion"], 4)
+        self.assertEqual(repeated["latestVersionId"], published["latestVersionId"])
+        self.assertEqual(len(datasets.list_dataset_versions(self.config, dataset_id)), 1)
 
     def test_post_commit_close_error_is_reported_and_exact_retry_is_idempotent(self):
         staging = self.staging_with_value(self.config, "close-retry")

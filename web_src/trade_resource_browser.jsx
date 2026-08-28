@@ -41,7 +41,7 @@ function resourceTypeKey(value) {
 }
 
 function titleCaseResourceType(value) {
-  const spaced = String(value || "Resource")
+  const spaced = String(userFacingText(value, "Resource"))
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/[_-]+/g, " ")
     .trim();
@@ -66,6 +66,165 @@ function resourceTypePresentation(record, repository = "") {
   const [color, background] = RESOURCE_COLORS[Math.abs(hash) % RESOURCE_COLORS.length];
   const label = titleCaseResourceType(value);
   return { key, label, icon: label.slice(0, 2).toLocaleUpperCase(), color, background };
+}
+
+const RESOURCE_ID_LABELS = Object.freeze({
+  ds: "Dataset",
+  mod: "Module",
+  pipe: "Pipeline",
+  ws: "Workspace",
+  script: "Script",
+  sampler: "Sampler",
+  env: "Environment",
+  bt: "Backtest",
+  job: "Backtest job",
+  viz: "Visualization",
+});
+const RESOURCE_ID_SOURCE = "(?:ds|mod|pipe|ws|script|sampler|env|bt|job|viz)_[0-9A-Z]{26}";
+const RESOURCE_ID_PATTERN = new RegExp(`^(${RESOURCE_ID_SOURCE})$`, "i");
+const RESOURCE_ID_EMBEDDED_PATTERN = new RegExp(`\\b(${RESOURCE_ID_SOURCE})\\b`, "gi");
+const RESOURCE_COMPOSITE_PATTERN = new RegExp(`^(${RESOURCE_ID_SOURCE})(?:@(?:sha256:)?[a-f0-9]{64}|-current)?$`, "i");
+const RESOURCE_COMPOSITE_EMBEDDED_PATTERN = new RegExp(`\\b(${RESOURCE_ID_SOURCE})(?:@(?:sha256:)?[a-f0-9]{64}|-current)\\b`, "gi");
+const ULID_SOURCE = "[0-9A-HJKMNP-TV-Z]{26}";
+const ULID_PATTERN = new RegExp(`^${ULID_SOURCE}$`, "i");
+const ULID_EMBEDDED_PATTERN = new RegExp(`\\b${ULID_SOURCE}\\b`, "gi");
+const DIGEST_SOURCE = "(?:sha256:)?[a-f0-9]{64}";
+const DIGEST_PATTERN = new RegExp(`^${DIGEST_SOURCE}$`, "i");
+const DIGEST_EMBEDDED_PATTERN = new RegExp(`\\b${DIGEST_SOURCE}\\b`, "gi");
+const UUID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
+const UUID_EMBEDDED_PATTERN = /\b[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}\b/gi;
+const RANDOM_INSTANCE_PATTERN = /^(?:inst[_-]|(?:module|node|input|output|instance)[_-])[a-f0-9]{16,}$/i;
+const RANDOM_INSTANCE_EMBEDDED_PATTERN = /\b(?:inst[_-]|(?:module|node|input|output|instance)[_-])[a-f0-9]{16,}\b/gi;
+const SNAPSHOT_ID_PATTERN = /^(?=.*snapshot)(?:[a-z0-9]+[-_.:]*){2,}(?:[a-f0-9]{16,}|[0-9a-z]{24,})$/i;
+const SNAPSHOT_ID_EMBEDDED_PATTERN = /\b(?:[a-z0-9]+[-_.:]*)*snapshot(?:[-_.:][a-z0-9]+)*(?:[-_.:](?:[a-f0-9]{16,}|[0-9a-z]{24,}))\b/gi;
+const FOLDER_ID_PATTERN = /^folder[_-](?:[0-9a-hjkmnp-tv-z]{26}|[a-f0-9]{16,})$/i;
+const FOLDER_ID_EMBEDDED_PATTERN = /\bfolder[_-](?:[0-9a-hjkmnp-tv-z]{26}|[a-f0-9]{16,})\b/gi;
+const CONTENT_ADDRESSED_ID_PATTERN = /^[a-z][a-z0-9]*(?:[-_.][a-z0-9]+)+[-_.][a-f0-9]{24,}$/i;
+const CONTENT_ADDRESSED_ID_EMBEDDED_PATTERN = /\b[a-z][a-z0-9]*(?:[-_.][a-z0-9]+)+[-_.][a-f0-9]{24,}\b/gi;
+const RANDOM_VISUALIZER_ID_PATTERN = /^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+\.(?=[a-z0-9]{8,12}$)(?=[a-z0-9]*\d)[a-z0-9]+$/i;
+const RANDOM_VISUALIZER_ID_EMBEDDED_PATTERN = /\b[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+\.(?=[a-z0-9]{8,12}\b)(?=[a-z0-9]*\d)[a-z0-9]+\b/gi;
+
+function resourceIdentityLabel(value) {
+  const match = String(value || "").match(RESOURCE_ID_PATTERN);
+  if (!match) return "";
+  return RESOURCE_ID_LABELS[match[1].split("_")[0].toLowerCase()] || "Resource";
+}
+
+function opaqueMachineIdentityKind(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  const composite = text.match(RESOURCE_COMPOSITE_PATTERN);
+  if (composite) return `${resourceIdentityLabel(composite[1]) || "Resource"}${text.includes("@") ? " version" : ""}`;
+  const resourceLabel = resourceIdentityLabel(text);
+  if (resourceLabel) return resourceLabel;
+  if (DIGEST_PATTERN.test(text)) return "Content fingerprint";
+  if (UUID_PATTERN.test(text) || RANDOM_INSTANCE_PATTERN.test(text)) return "Resource instance";
+  if (FOLDER_ID_PATTERN.test(text)) return "Folder";
+  if (SNAPSHOT_ID_PATTERN.test(text)) return "Snapshot";
+  if (CONTENT_ADDRESSED_ID_PATTERN.test(text)) return "Resource snapshot";
+  if (RANDOM_VISUALIZER_ID_PATTERN.test(text)) return "Visualizer instance";
+  if (ULID_PATTERN.test(text)) return "Resource identity";
+  return "";
+}
+
+function userFacingText(value, fallback = "") {
+  const original = String(value ?? "");
+  const exactKind = opaqueMachineIdentityKind(original);
+  if (exactKind) return exactKind;
+  const redacted = original
+    .replace(RESOURCE_COMPOSITE_EMBEDDED_PATTERN, (identity, resourceId) => (
+      `${resourceIdentityLabel(resourceId) || "Resource"}${identity.includes("@") ? " version" : ""}`
+    ))
+    .replace(RESOURCE_ID_EMBEDDED_PATTERN, (identity) => resourceIdentityLabel(identity) || "Resource")
+    .replace(DIGEST_EMBEDDED_PATTERN, "content fingerprint")
+    .replace(UUID_EMBEDDED_PATTERN, "resource instance")
+    .replace(RANDOM_INSTANCE_EMBEDDED_PATTERN, "resource instance")
+    .replace(FOLDER_ID_EMBEDDED_PATTERN, "folder")
+    .replace(SNAPSHOT_ID_EMBEDDED_PATTERN, "snapshot")
+    .replace(CONTENT_ADDRESSED_ID_EMBEDDED_PATTERN, "resource snapshot")
+    .replace(RANDOM_VISUALIZER_ID_EMBEDDED_PATTERN, "visualizer instance")
+    .replace(ULID_EMBEDDED_PATTERN, "resource identity");
+  return redacted.trim() || String(fallback || "");
+}
+
+function isOpaqueMachineIdentity(value) {
+  return Boolean(opaqueMachineIdentityKind(value));
+}
+
+function isMachineIdentityField(key) {
+  const name = String(key || "");
+  if (name === "protocolId") return false;
+  return name === "id"
+    || /(?:Id|ID|Digest|Hash)$/.test(name)
+    || /(?:^|_)(?:id|digest|hash)$/i.test(name);
+}
+
+function recordIdentityValues(record = {}) {
+  return Object.entries(record)
+    .filter(([key, value]) => isMachineIdentityField(key) && ["string", "number"].includes(typeof value))
+    .map(([, value]) => String(value || ""))
+    .filter(Boolean);
+}
+
+function statusLabel(value) {
+  const raw = userFacingText(value);
+  return raw ? titleCaseResourceType(raw) : "";
+}
+
+function resourceDisplayName(record = {}, repository = "") {
+  const presentation = resourceTypePresentation(record, repository);
+  const identities = new Set(recordIdentityValues(record));
+  const candidate = [record.displayName, record.label, record.name]
+    .map((value) => String(value || "").trim())
+    .find((value) => value && !identities.has(value) && !isOpaqueMachineIdentity(value));
+  if (candidate) {
+    let display = userFacingText(candidate, presentation.label);
+    [...identities]
+      .filter((identity) => identity.length >= 3)
+      .sort((left, right) => right.length - left.length)
+      .forEach((identity) => {
+        display = display.split(identity).join(presentation.label);
+      });
+    return userFacingText(display, presentation.label);
+  }
+  const status = statusLabel(record.status);
+  const version = !isOpaqueMachineIdentity(record.version) ? userFacingText(record.version) : "";
+  return `${presentation.label} · ${status || (version ? `v${version}` : "Available")}`;
+}
+
+function presentationValue(value, seen = new WeakSet()) {
+  if (value == null) return value;
+  if (["string", "number", "boolean"].includes(typeof value)) return userFacingText(value);
+  if (Array.isArray(value)) return value.map((entry) => presentationValue(entry, seen));
+  if (typeof value !== "object") return userFacingText(value);
+  if (seen.has(value)) return "Structured value";
+  seen.add(value);
+  let ordinal = 0;
+  const projected = {};
+  Object.entries(value).forEach(([key, entry]) => {
+    if (isMachineIdentityField(key)) return;
+    ordinal += 1;
+    const displayKey = isOpaqueMachineIdentity(key) ? `Entry ${ordinal}` : userFacingText(key, `Entry ${ordinal}`);
+    projected[displayKey] = presentationValue(entry, seen);
+  });
+  seen.delete(value);
+  return projected;
+}
+
+function resourceBrowserError(problem, catalog, repository) {
+  let message = userFacingText(problem?.message || problem, "Repository action failed");
+  const records = [...(catalog?.items || []), ...(catalog?.folders || [])];
+  const replacements = records.flatMap((record) => {
+    const label = resourceDisplayName(record, repository);
+    return recordIdentityValues(record).map((identity) => [identity, label]);
+  });
+  replacements
+    .filter(([identity]) => identity.length >= 3)
+    .sort((left, right) => right[0].length - left[0].length)
+    .forEach(([identity, label]) => {
+      message = message.split(identity).join(label);
+    });
+  return userFacingText(message, "Repository action failed");
 }
 
 function normalizedSourceRepository(record, repository) {
@@ -123,6 +282,51 @@ function itemPath(folderPath, name) {
 function parentPath(path) {
   const parts = String(path || "").split("/").filter(Boolean);
   return parts.length > 1 ? `/${parts.slice(0, -1).join("/")}` : "";
+}
+
+function lastPathSegment(path) {
+  const parts = String(path || "").split("/").filter(Boolean);
+  return parts[parts.length - 1] || "";
+}
+
+function fallbackPresentationPath(path) {
+  const parts = String(path || "").split("/").filter(Boolean);
+  return parts.length
+    ? `/${parts.map((part) => safeResourceName(userFacingText(part, "Folder"))).join("/")}`
+    : "";
+}
+
+function catalogFolderPresentation(catalog) {
+  const toDisplay = new Map([["", ""], ["/", ""]]);
+  const toCanonical = new Map([["", ""], ["/", "/"]]);
+  const namesByParent = new Map();
+  const folders = (catalog?.folders || []).map((folder, index) => ({ folder, index }));
+  folders.sort((left, right) => {
+    const leftDepth = String(left.folder.path || "").split("/").filter(Boolean).length;
+    const rightDepth = String(right.folder.path || "").split("/").filter(Boolean).length;
+    return leftDepth - rightDepth || left.index - right.index;
+  });
+  folders.forEach(({ folder }) => {
+    const canonical = String(folder.path || "");
+    const canonicalParent = parentPath(canonical);
+    const displayParent = toDisplay.get(canonicalParent) ?? fallbackPresentationPath(canonicalParent);
+    const fallbackName = lastPathSegment(canonical) || "Folder";
+    const base = safeResourceName(userFacingText(folder.name || fallbackName, "Folder"));
+    const siblingKey = displayParent || "/";
+    const siblingNames = namesByParent.get(siblingKey) || new Set();
+    let ordinal = 1;
+    let name = base;
+    while (siblingNames.has(name.toLocaleLowerCase())) {
+      ordinal += 1;
+      name = `${base} · ${ordinal}`;
+    }
+    siblingNames.add(name.toLocaleLowerCase());
+    namesByParent.set(siblingKey, siblingNames);
+    const display = itemPath(displayParent || "/", name);
+    toDisplay.set(canonical, display);
+    toCanonical.set(display, canonical);
+  });
+  return { toDisplay, toCanonical };
 }
 
 function normalizedSearchText(value) {
@@ -203,7 +407,7 @@ function ResourceSearchCombobox({ repository, catalog, query, onQueryChange, onS
   }, [open]);
 
   const choose = (item) => {
-    onQueryChange(item.label || item.itemId || "");
+    onQueryChange(resourceDisplayName(item, repository));
     setOpen(false);
     onSelect(item);
   };
@@ -218,12 +422,12 @@ function ResourceSearchCombobox({ repository, catalog, query, onQueryChange, onS
       onClick={() => choose(item)}
     >
       <span className="trade-resource-search-icon" aria-hidden="true">{presentation.icon}</span>
-      <span><strong>{item.label || item.itemId}</strong><small>{item.folderPath || "/"}{normalizedSourceRepository(item, repository) !== "datasets" && item.version ? ` · ${item.version}` : ""}</small></span>
+      <span><strong>{resourceDisplayName(item, repository)}</strong><small>{userFacingText(item.folderPath || "/")}{normalizedSourceRepository(item, repository) !== "datasets" && item.version ? ` · ${isOpaqueMachineIdentity(item.version) ? "Current Version" : `v${userFacingText(item.version)}`}` : ""}</small></span>
       <em>{presentation.label}</em>
     </button>;
   };
   const renderNode = (node, depth = 0) => <details className="trade-resource-search-folder" key={node.path} open={depth === 0}>
-    <summary style={{ "--hierarchy-depth": depth }}>{node.name}</summary>
+    <summary style={{ "--hierarchy-depth": depth }}>{userFacingText(node.name, "Folder")}</summary>
     {node.items.slice().sort((left, right) => String(left.label).localeCompare(String(right.label))).map((item) => renderItem(item, depth + 1))}
     {[...node.children.values()].sort((left, right) => left.name.localeCompare(right.name)).map((child) => renderNode(child, depth + 1))}
   </details>;
@@ -250,25 +454,35 @@ function ResourceSearchCombobox({ repository, catalog, query, onQueryChange, onS
   </div>;
 }
 
-function catalogFiles(catalog) {
-  const folders = (catalog?.folders || []).map((folder) => ({
-    name: folder.name,
+function catalogFiles(catalog, repository = "", folderPresentation = catalogFolderPresentation(catalog)) {
+  const folders = (catalog?.folders || []).map((folder) => {
+    const displayPath = folderPresentation.toDisplay.get(folder.path) ?? fallbackPresentationPath(folder.path);
+    return {
+    name: lastPathSegment(displayPath) || "Folder",
     isDirectory: true,
-    path: folder.path,
+    path: displayPath,
     updatedAt: folder.updatedAt || "",
     tradeKind: "folder",
     tradeFolderId: folder.folderId,
+    tradeCanonicalPath: folder.path,
     tradeFixed: Boolean(folder.fixed),
     tradeRecord: folder,
-  }));
+  };
+  });
   const names = new Set();
+  const ordinals = new Map();
   const items = (catalog?.items || []).map((item) => {
-    const parent = item.folderPath || "/";
-    const base = safeResourceName(item.label || item.itemId);
-    let name = base;
-    if (names.has(`${parent}\0${name.toLocaleLowerCase()}`)) {
-      name = `${base} · ${String(item.itemId).slice(-10)}`;
+    const canonicalParent = item.folderPath || "/";
+    const parent = folderPresentation.toDisplay.get(canonicalParent) ?? fallbackPresentationPath(canonicalParent);
+    const base = safeResourceName(resourceDisplayName(item, repository));
+    const ordinalKey = `${parent}\0${base.toLocaleLowerCase()}`;
+    let ordinal = (ordinals.get(ordinalKey) || 0) + 1;
+    let name = ordinal === 1 ? base : `${base} · ${ordinal}`;
+    while (names.has(`${parent}\0${name.toLocaleLowerCase()}`)) {
+      ordinal += 1;
+      name = `${base} · ${ordinal}`;
     }
+    ordinals.set(ordinalKey, ordinal);
     names.add(`${parent}\0${name.toLocaleLowerCase()}`);
     return {
       name,
@@ -278,6 +492,7 @@ function catalogFiles(catalog) {
       size: item.size || undefined,
       tradeKind: "item",
       tradeItemId: item.itemId,
+      tradeCanonicalPath: itemPath(canonicalParent, String(item.itemId || "resource")),
       tradeRecord: item,
     };
   });
@@ -299,9 +514,20 @@ function storedResourceLayout(repository) {
 
 function displayValue(value) {
   if (value == null || value === "") return "—";
-  if (Array.isArray(value)) return value.map((entry) => entry?.alias || entry?.name || entry).join(", ");
-  if (typeof value === "object") return JSON.stringify(value);
-  return String(value);
+  if (Array.isArray(value)) {
+    return value.map((entry) => {
+      if (entry && typeof entry === "object") {
+        const name = entry.alias || entry.name;
+        return name ? userFacingText(name) : JSON.stringify(presentationValue(entry));
+      }
+      return userFacingText(entry);
+    }).join(", ");
+  }
+  if (typeof value === "object") {
+    const projected = presentationValue(value);
+    return Object.keys(projected || {}).length ? JSON.stringify(projected) : "Structured value";
+  }
+  return userFacingText(value);
 }
 
 function ResourceInspector({ repository, selection, busy, openingPath, onOpen, onAction, onFolderAction, readOnly }) {
@@ -312,13 +538,40 @@ function ResourceInspector({ repository, selection, busy, openingPath, onOpen, o
   useEffect(() => {
     setEditingFolder(false);
     setConfirmDelete(false);
-    setFolderName(selected?.tradeRecord?.name || selected?.name || "");
+    const nextName = selected?.tradeRecord?.name || selected?.name || "";
+    setFolderName(isOpaqueMachineIdentity(nextName) ? "" : nextName);
   }, [selected?.path]);
   if (!selection.length) {
     return <aside className="trade-resource-inspector"><div className="trade-resource-inspector-empty"><span>ⓘ</span><strong>Details</strong><p>Select a folder or resource to inspect it.</p></div></aside>;
   }
   if (!selected) {
-    return <aside className="trade-resource-inspector"><h3>{selection.length} selected</h3><p className="muted">Drag the selection onto a folder to classify these resources together.</p></aside>;
+    const resources = selection.filter((entry) => !entry.isDirectory);
+    const sourceRepositories = resources.map((entry) => (
+      normalizedSourceRepository(entry.tradeRecord, repository)
+    ));
+    const allBacktests = resources.length === selection.length
+      && sourceRepositories.every((source) => ["backtests", "results"].includes(source));
+    const allDatasets = resources.length === selection.length
+      && sourceRepositories.every((source) => source === "datasets");
+    const archivable = resources.filter(
+      (entry) => entry.tradeRecord?.status !== "archived"
+    );
+    const canArchive = archivable.length > 0 && (allBacktests || allDatasets);
+    return <aside className="trade-resource-inspector">
+      <h3>{selection.length} selected</h3>
+      <p className="muted">Move the selection together or run one action on every selected resource.</p>
+      {canArchive && <div className="trade-resource-inspector-actions">
+        <button
+          className="danger"
+          type="button"
+          disabled={busy}
+          onClick={() => onAction("archive", {
+            tradeBatch: true,
+            tradeRecords: archivable.map((entry) => entry.tradeRecord),
+          })}
+        >Archive {archivable.length} {allBacktests ? "Backtests" : "Datasets"}</button>
+      </div>}
+    </aside>;
   }
   const record = selected.tradeRecord || {};
   const isFolder = selected.isDirectory;
@@ -327,8 +580,8 @@ function ResourceInspector({ repository, selection, busy, openingPath, onOpen, o
   const openCapability = resourceOpenCapability(repository, record);
   const visualizerRows = repository === "visualizers" && !isFolder
     ? [
-        ["Input contract", Object.entries(record.inputPorts || {}).map(([name, port]) => `${name}: ${JSON.stringify(port?.schema || {})}`)],
-        ["Configuration", (record.params || []).map((parameter) => `${parameter.label || parameter.name} (${parameter.type || "value"})${parameter.required ? " · required" : ""}${parameter.default !== undefined ? ` · default ${displayValue(parameter.default)}` : ""}`)],
+        ["Input contract", Object.entries(record.inputPorts || {}).map(([name, port]) => `${userFacingText(name, "Input")}: ${displayValue(port?.schema || {})}`)],
+        ["Configuration", (record.params || []).map((parameter) => `${userFacingText(parameter.label || parameter.name, "Parameter")} (${userFacingText(parameter.type || "value")})${parameter.required ? " · required" : ""}${parameter.default !== undefined ? ` · default ${displayValue(parameter.default)}` : ""}`)],
       ]
     : [];
   const rows = isFolder
@@ -336,14 +589,15 @@ function ResourceInspector({ repository, selection, busy, openingPath, onOpen, o
     : [
         ["Type", presentation.label],
         ["Source", sourceRepository],
-        ["ID", record.itemId],
         ["Folder", record.folderPath || "/"],
         ["Status", record.status],
-        ...(sourceRepository === "datasets" ? [] : [["Version", record.version || record.versionId || record.latestVersionId]]),
+        ...(sourceRepository === "datasets" || record.version == null ? [] : [["Version", isOpaqueMachineIdentity(record.version) ? "Current Version" : record.version]]),
         ["Created", record.createdAt || record.completedAt],
         ...visualizerRows,
       ].filter(([, value]) => value != null && value !== "");
-  const title = record.label || record.name || selected.name;
+  const title = isFolder
+    ? userFacingText(record.name || selected.name, "Folder")
+    : resourceDisplayName(record, repository);
   return (
     <aside className="trade-resource-inspector">
       <div className="trade-resource-inspector-heading">
@@ -356,7 +610,7 @@ function ResourceInspector({ repository, selection, busy, openingPath, onOpen, o
       <dl>{rows.map(([label, value]) => <React.Fragment key={label}><dt>{label}</dt><dd title={displayValue(value)}>{displayValue(value)}</dd></React.Fragment>)}</dl>
       <div className="trade-resource-inspector-actions">
         {isFolder && !readOnly && !record.fixed && !editingFolder && <button type="button" disabled={busy} onClick={() => setEditingFolder(true)}>Rename Folder</button>}
-        {isFolder && !readOnly && !record.fixed && editingFolder && <form className="trade-resource-folder-form" onSubmit={async (event) => { event.preventDefault(); await onFolderAction("rename", selected, folderName); setEditingFolder(false); }}><input value={folderName} maxLength={80} autoFocus onChange={(event) => setFolderName(event.target.value)} /><div><button type="button" onClick={() => setEditingFolder(false)}>Cancel</button><button type="submit" disabled={busy || !folderName.trim()}>Apply</button></div></form>}
+        {isFolder && !readOnly && !record.fixed && editingFolder && <form className="trade-resource-folder-form" onSubmit={async (event) => { event.preventDefault(); await onFolderAction("rename", selected, folderName); setEditingFolder(false); }}><input value={folderName} placeholder="Enter a display name" maxLength={80} autoFocus onChange={(event) => setFolderName(event.target.value)} /><div><button type="button" onClick={() => setEditingFolder(false)}>Cancel</button><button type="submit" disabled={busy || !folderName.trim()}>Apply</button></div></form>}
         {isFolder && !readOnly && !record.fixed && <button className={confirmDelete ? "danger" : ""} type="button" disabled={busy} onClick={async () => { if (!confirmDelete) { setConfirmDelete(true); return; } await onFolderAction("delete", selected); }}>{confirmDelete ? "Confirm Delete Empty Folder" : "Delete Empty Folder"}</button>}
         {!isFolder && openCapability.visible !== false && <button
           type="button"
@@ -365,6 +619,11 @@ function ResourceInspector({ repository, selection, busy, openingPath, onOpen, o
           title={openCapability.title}
           onClick={() => onOpen(selected)}
         >{openingPath === selected.path ? "Opening…" : openCapability.label}</button>}
+        {!isFolder && ["environments", "analyses"].includes(repository) && <button
+          type="button"
+          disabled={busy}
+          onClick={() => onAction("rename", selected)}
+        >{record.builtin ? "Rename Copy…" : "Rename…"}</button>}
         {!isFolder && sourceRepository === "datasets" && record.status !== "archived" && <button className="danger" type="button" disabled={busy} onClick={() => onAction("archive", selected)}>Archive + Downstream</button>}
         {!isFolder && ["backtests", "results"].includes(sourceRepository) && record.status !== "archived" && <button className="danger" type="button" disabled={busy} onClick={() => onAction("archive", selected)}>Archive</button>}
         {!isFolder && sourceRepository === "workspaces" && <button type="button" disabled={busy} onClick={() => onAction("jupyter", selected)}>Open Jupyter</button>}
@@ -428,7 +687,11 @@ function TradeResourceBrowser(props) {
   const [openingPath, setOpeningPath] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
-  const [currentPath, setCurrentPath] = useState(props.initialPath || "");
+  const [currentPath, setCurrentPath] = useState(() => {
+    const presentation = catalogFolderPresentation(catalog);
+    return presentation.toDisplay.get(props.initialPath || "")
+      ?? fallbackPresentationPath(props.initialPath || "");
+  });
   const [contextMenu, setContextMenu] = useState(null);
   const [resourceTypeFilter, setResourceTypeFilter] = useState("");
   const [resourceQuery, setResourceQuery] = useState("");
@@ -461,8 +724,15 @@ function TradeResourceBrowser(props) {
       && (!resourceQuery || fuzzySearchScore(resourceQuery, resourceSearchValue(item, repository)) >= 0)
     )),
   }), [catalog, repository, resourceTypeFilter, resourceQuery]);
-  const files = useMemo(() => catalogFiles(filteredCatalog), [filteredCatalog]);
-  const foldersByPath = useMemo(() => new Map((catalog?.folders || []).map((folder) => [folder.path, folder])), [catalog]);
+  const folderPresentation = useMemo(() => catalogFolderPresentation(catalog), [catalog]);
+  const files = useMemo(
+    () => catalogFiles(filteredCatalog, repository, folderPresentation),
+    [filteredCatalog, folderPresentation, repository],
+  );
+  const foldersByPath = useMemo(() => new Map((catalog?.folders || []).map((folder) => [
+    folderPresentation.toDisplay.get(folder.path) ?? fallbackPresentationPath(folder.path),
+    folder,
+  ])), [catalog, folderPresentation]);
 
   useEffect(() => {
     setSelection((previous) => previous.filter((selected) => files.some((file) => file.path === selected.path)));
@@ -575,7 +845,7 @@ function TradeResourceBrowser(props) {
           const badge = document.createElement("span");
           badge.className = "trade-resource-type-badge";
           const badgeLabel = isModuleRepository(repository) && entry.tradeRecord?.version
-            ? `${presentation.label} · ${entry.tradeRecord.version}`
+            ? `${presentation.label} · ${isOpaqueMachineIdentity(entry.tradeRecord.version) ? "Current Version" : `v${userFacingText(entry.tradeRecord.version)}`}`
             : presentation.label;
           if (badge.textContent !== badgeLabel) badge.textContent = badgeLabel;
           badge.title = presentation.label;
@@ -583,7 +853,7 @@ function TradeResourceBrowser(props) {
         } else if (item) {
           const badge = item.querySelector(".trade-resource-type-badge");
           badge.textContent = isModuleRepository(repository) && entry.tradeRecord?.version
-            ? `${presentation.label} · ${entry.tradeRecord.version}`
+            ? `${presentation.label} · ${isOpaqueMachineIdentity(entry.tradeRecord.version) ? "Current Version" : `v${userFacingText(entry.tradeRecord.version)}`}`
             : presentation.label;
           badge.title = presentation.label;
         }
@@ -619,7 +889,7 @@ function TradeResourceBrowser(props) {
       setSelection([]);
       return true;
     } catch (cause) {
-      setError(cause?.message || String(cause));
+      setError(resourceBrowserError(cause, catalog, repository));
       return false;
     } finally {
       setBusy(false);
@@ -634,7 +904,7 @@ function TradeResourceBrowser(props) {
     try {
       await onRefresh();
     } catch (cause) {
-      setError(cause?.message || String(cause));
+      setError(resourceBrowserError(cause, catalog, repository));
     } finally {
       setRefreshing(false);
       setBusy(false);
@@ -675,7 +945,7 @@ function TradeResourceBrowser(props) {
       selectionRef.current = [];
       setBrowserEpoch((value) => value + 1);
     } catch (cause) {
-      setError(cause?.message || String(cause));
+      setError(resourceBrowserError(cause, catalog, repository));
     } finally {
       setBusy(false);
     }
@@ -740,7 +1010,7 @@ function TradeResourceBrowser(props) {
     setSelection([]);
     selectionRef.current = [];
     setCurrentPath(path);
-    props.onFolderChange?.(path);
+    props.onFolderChange?.(folderPresentation.toCanonical.get(path) ?? path);
     setBrowserEpoch((value) => value + 1);
   }
 
@@ -778,9 +1048,14 @@ function TradeResourceBrowser(props) {
     setBusy(true);
     setError("");
     try {
-      await onResourceAction(action, entry.tradeRecord);
+      await onResourceAction(
+        action,
+        entry?.tradeBatch
+          ? { items: entry.tradeRecords || [] }
+          : entry.tradeRecord,
+      );
     } catch (cause) {
-      setError(cause?.message || String(cause));
+      setError(resourceBrowserError(cause, catalog, repository));
     } finally {
       setBusy(false);
     }
@@ -802,7 +1077,7 @@ function TradeResourceBrowser(props) {
         parentFolderId: foldersByPath.get(currentPath || "/")?.folderId || "",
       });
     } catch (cause) {
-      setError(cause?.message || String(cause));
+      setError(resourceBrowserError(cause, catalog, repository));
     } finally {
       setOpeningPath("");
       setBusy(false);
@@ -817,17 +1092,29 @@ function TradeResourceBrowser(props) {
         clickedItemId ? candidate.tradeItemId === clickedItemId : candidate.path === itemPath(currentPath || "/", card.getAttribute("title"))
       ))
       : null;
-    if (repository === "data") {
-      event.preventDefault();
-      event.stopPropagation();
-      const selectedPaths = new Set(selectionRef.current.map((entry) => entry.path));
-      let entries = files.filter((entry) => selectedPaths.has(entry.path) && !entry.isDirectory);
-      if (clickedEntry && !clickedEntry.isDirectory && !selectedPaths.has(clickedEntry.path)) {
+    const selectedPaths = new Set(
+      selectionRef.current.map((entry) => entry.path)
+    );
+    const selectedResourceEntries = () => {
+      let entries = files.filter(
+        (entry) => selectedPaths.has(entry.path) && !entry.isDirectory
+      );
+      if (
+        clickedEntry
+        && !clickedEntry.isDirectory
+        && !selectedPaths.has(clickedEntry.path)
+      ) {
         entries = [clickedEntry];
         selectionRef.current = entries;
         setSelection(entries);
         props.onSelectionChange?.(entries.map(callbackRecord));
       }
+      return entries;
+    };
+    if (repository === "data") {
+      event.preventDefault();
+      event.stopPropagation();
+      const entries = selectedResourceEntries();
       setContextMenu({
         x: event.clientX,
         y: event.clientY,
@@ -857,10 +1144,11 @@ function TradeResourceBrowser(props) {
       if (!clickedEntry || clickedEntry.isDirectory) return;
       event.preventDefault();
       event.stopPropagation();
-      selectionRef.current = [clickedEntry];
-      setSelection([clickedEntry]);
-      props.onSelectionChange?.([callbackRecord(clickedEntry)]);
-      setContextMenu({ x: event.clientX, y: event.clientY, entry: clickedEntry });
+      setContextMenu({
+        x: event.clientX,
+        y: event.clientY,
+        entries: selectedResourceEntries(),
+      });
       return;
     }
     if (repository !== "pipelines") return;
@@ -875,6 +1163,17 @@ function TradeResourceBrowser(props) {
       entry: clickedEntry?.isDirectory ? null : clickedEntry,
       parentFolderId,
     });
+  }
+
+  function handleResourceClickCapture(event) {
+    if (!(event.ctrlKey || event.metaKey)) return;
+    if (event.target.closest(".selection-checkbox")) return;
+    const card = event.target.closest(".file-item-container");
+    const checkbox = card?.querySelector(".selection-checkbox");
+    if (!checkbox) return;
+    event.preventDefault();
+    event.stopPropagation();
+    checkbox.click();
   }
 
   function handleResourceDoubleClick(event) {
@@ -916,7 +1215,7 @@ function TradeResourceBrowser(props) {
     try {
       await onResourceAction(action, entry?.tradeRecord || null);
     } catch (cause) {
-      setError(cause?.message || String(cause));
+      setError(resourceBrowserError(cause, catalog, repository));
     } finally {
       setBusy(false);
     }
@@ -933,7 +1232,7 @@ function TradeResourceBrowser(props) {
     try {
       await onResourceAction("download", { sourceRepository: "datasets", datasetIds });
     } catch (cause) {
-      setError(cause?.message || String(cause));
+      setError(resourceBrowserError(cause, catalog, repository));
     } finally {
       setBusy(false);
     }
@@ -956,26 +1255,42 @@ function TradeResourceBrowser(props) {
     try {
       await onResourceAction(action, payload);
     } catch (cause) {
-      setError(cause?.message || String(cause));
+      setError(resourceBrowserError(cause, catalog, repository));
     } finally {
       setBusy(false);
     }
   }
 
   async function backtestContextAction(action) {
-    const entry = contextMenu?.entry;
+    const entries = contextMenu?.entries || [];
     setContextMenu(null);
-    if (!entry) return;
-    if (action === "open") {
-      await openEntry(entry);
+    if (!entries.length) return;
+    if (action === "open" && entries.length === 1) {
+      await openEntry(entries[0]);
       return;
     }
-    await runResourceAction(action, entry);
+    setBusy(true);
+    setError("");
+    try {
+      await onResourceAction(
+        action,
+        entries.length === 1
+          ? entries[0].tradeRecord
+          : { items: entries.map((entry) => entry.tradeRecord) },
+      );
+    } catch (cause) {
+      setError(resourceBrowserError(cause, catalog, repository));
+    } finally {
+      setBusy(false);
+    }
   }
 
   function revealSearchResult(item) {
     setResourceTypeFilter("");
-    setCurrentPath(item.folderPath === "/" ? "" : (item.folderPath || ""));
+    setCurrentPath(
+      folderPresentation.toDisplay.get(item.folderPath || "/")
+      ?? fallbackPresentationPath(item.folderPath || ""),
+    );
     setSelection([]);
     setBrowserEpoch((value) => value + 1);
   }
@@ -986,6 +1301,7 @@ function TradeResourceBrowser(props) {
       className="trade-resource-browser-shell"
       data-repository={repository}
       data-layout={layout}
+      onClickCapture={handleResourceClickCapture}
       onContextMenuCapture={openResourceContextMenu}
       onDoubleClickCapture={handleResourceDoubleClick}
       onDragStartCapture={handleResourceDragStart}
@@ -993,7 +1309,7 @@ function TradeResourceBrowser(props) {
       onDropCapture={handleNavigationDrop}
       onDragEndCapture={handleResourceDragEnd}
     >
-      {error && <div className="trade-resource-error" role="alert"><span>{error}</span><button type="button" onClick={() => setError("")}>×</button></div>}
+      {error && <div className="trade-resource-error" role="alert"><span>{resourceBrowserError(error, catalog, repository)}</span><button type="button" onClick={() => setError("")}>×</button></div>}
       <div className="trade-resource-browser-main" aria-busy={busy}>
         {showResourceTypeFilter && <div className="trade-resource-type-filter" role="group" aria-label="Filter resources by type">
           <span className="trade-resource-type-filter-label">Type</span>
@@ -1012,7 +1328,7 @@ function TradeResourceBrowser(props) {
           type="button"
           className="trade-resource-parent-folder"
           data-trade-drop-path={parentPath(currentPath)}
-          title={`Open parent folder ${parentPath(currentPath) || "/"}; drop selected resources here to move them`}
+          title={`Open parent folder ${userFacingText(parentPath(currentPath) || "/")}; drop selected resources here to move them`}
           onClick={() => openPath(parentPath(currentPath))}
         >
           <span className="trade-resource-parent-icon">▰</span>
@@ -1023,7 +1339,10 @@ function TradeResourceBrowser(props) {
           key={`${repository}:${browserEpoch}:${resourceTypeFilter}:${layout}`}
           files={files}
           initialPath={currentPath}
-          onFolderChange={(path) => { setCurrentPath(path); props.onFolderChange?.(path); }}
+          onFolderChange={(path) => {
+            setCurrentPath(path);
+            props.onFolderChange?.(folderPresentation.toCanonical.get(path) ?? path);
+          }}
           onSelectionChange={(entries) => {
             selectionRef.current = entries;
             setSelection(entries);
@@ -1035,7 +1354,7 @@ function TradeResourceBrowser(props) {
           onDelete={handleDelete}
           onPaste={handlePaste}
           onRefresh={handleRefresh}
-          onError={(problem) => setError(problem?.message || String(problem))}
+          onError={(problem) => setError(resourceBrowserError(problem, catalog, repository))}
           enableFilePreview={false}
           layout={layout}
           onLayoutChange={handleLayoutChange}
@@ -1167,12 +1486,36 @@ function TradeResourceBrowser(props) {
           {allWorkspaces && <button className="danger" type="button" onClick={() => dataContextAction("delete")}>Delete</button>}
         </div>;
       })()}
-      {repository === "backtest" && contextMenu?.entry && <div className="trade-resource-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onPointerDown={(event) => event.stopPropagation()}>
-        {["backtests", "results"].includes(normalizedSourceRepository(contextMenu.entry.tradeRecord, repository)) && <button type="button" onClick={() => backtestContextAction("rename")}>Rename…</button>}
-      </div>}
+      {repository === "backtest" && contextMenu?.entries?.length > 0 && (() => {
+        const entries = contextMenu.entries.filter((entry) => (
+          ["backtests", "results"].includes(
+            normalizedSourceRepository(entry.tradeRecord, repository)
+          )
+        ));
+        const archivable = entries.filter(
+          (entry) => entry.tradeRecord?.status !== "archived"
+        );
+        return <div className="trade-resource-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onPointerDown={(event) => event.stopPropagation()}>
+          {entries.length === 1 && <button type="button" onClick={() => backtestContextAction("open")}>Open</button>}
+          {entries.length === 1 && <button type="button" onClick={() => backtestContextAction("rename")}>Rename…</button>}
+          {archivable.length > 0 && <button className="danger" type="button" onClick={() => backtestContextAction("archive")}>{archivable.length === 1 ? "Archive" : `Archive ${archivable.length} Backtests`}</button>}
+        </div>;
+      })()}
     </div>
   );
 }
+
+window.TradeResourceBrowserPresentation = Object.freeze({
+  userFacingText,
+  opaqueMachineIdentityKind,
+  isOpaqueMachineIdentity,
+  resourceDisplayName,
+  presentationValue,
+  resourceBrowserError,
+  catalogFiles,
+  catalogFolderPresentation,
+  displayValue,
+});
 
 window.TradeResourceBrowser = {
   mount(element, props) {

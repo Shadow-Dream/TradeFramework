@@ -169,7 +169,7 @@ canonical skills 只有：
   保存其 prebuilt release artifact；
 - `trade_agent_tools/`：两个 runtime 共用的 stdio MCP client/server；
 - `deploy/user/` 与 `scripts/*agent_web.sh`：当前开发预览和热更新；
-- Mining 独立运行，不与 Agent Web 共同打包。
+- Mining 当前下线；离线参考实现不与 Engine 或 Agent Web 共同挂载、打包或启动。
 
 旧 `web/agent.js`、`web/agent.css`、Python `agent_gateway/**`、Gateway SQLite、
 `/api/agent/threads|runs|events|preferences|backends` 和

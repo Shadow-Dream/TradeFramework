@@ -119,18 +119,29 @@ def _require_dataset_publication_target(
 ):
     dataset_id = dataset["datasetId"]
     existing_row = connection.execute(
-        "SELECT * FROM datasets WHERE dataset_id = ?", (dataset_id,)
+        """
+        SELECT d.*,
+               (SELECT version_id FROM dataset_versions v
+                WHERE v.dataset_id = d.dataset_id
+                ORDER BY v.rowid DESC LIMIT 1) AS latest_version_id,
+               (SELECT manifest_json FROM dataset_versions v
+                WHERE v.dataset_id = d.dataset_id
+                ORDER BY v.rowid DESC LIMIT 1) AS latest_manifest_json
+        FROM datasets d WHERE d.dataset_id = ?
+        """,
+        (dataset_id,),
     ).fetchone()
     if not existing_row:
         if append:
             raise ValueError(f"Unknown Dataset: {dataset_id}")
         return
     if append or defer_exact_retry or allow_exact_retry:
-        existing = datasets.decode_dataset_index_row(
-            {**dict(existing_row), "latest_version_id": None}
-        )
-        for field in ("name", "source", "metadata"):
-            if existing[field] != dataset[field]:
+        existing = datasets.decode_dataset_index_row(existing_row)
+        for field in ("name", "source", "metadata", "protocolId"):
+            if (
+                (field in existing) != (field in dataset)
+                or existing.get(field) != dataset.get(field)
+            ):
                 if not append:
                     raise ValueError(
                         f"Dataset '{dataset_id}' already exists; publish with a new "
@@ -326,6 +337,13 @@ def dataset_publication_transaction(
                 )
                 expected_manifest = copy.deepcopy(manifest)
                 expected_manifest["createdAt"] = stored_manifest.get("createdAt")
+                if (
+                    stored_manifest.get("schemaVersion")
+                    == dataset_archive.LEGACY_MANIFEST_SCHEMA_VERSION
+                ):
+                    expected_manifest["schemaVersion"] = (
+                        dataset_archive.LEGACY_MANIFEST_SCHEMA_VERSION
+                    )
                 expected_manifest["manifestDigest"] = version_archive.content_digest(
                     {
                         key: value

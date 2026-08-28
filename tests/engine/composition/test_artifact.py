@@ -235,28 +235,84 @@ class BacktestArtifactIntegrationTests(BacktestIntegrationTestCase):
             "source": "",
             "entryPoint": "",
         })
-        environment = self.graph_version(
-            "environments.json", "environmentId", environment_presets.PAPER_ENVIRONMENT_ID
+        lot_size = max(
+            (
+                definition
+                for definition in module_definitions.load_environment_definitions(
+                    self.config
+                ).values()
+                if definition["moduleId"] == "lot-size-order-update-rule"
+            ),
+            key=lambda definition: int(definition["version"]),
         )
+        environment = engine_service.handle_save_environment(self.config, {
+            "schemaVersion": 2,
+            "environmentId": "configured-boundary-environment",
+            "name": "Configured boundary Environment",
+            "description": "Rounds one explicit Sample value for contract testing.",
+            "instances": {
+                "round": {
+                    "instanceId": "round",
+                    "kind": "Environment",
+                    "moduleId": lot_size["moduleId"],
+                    "version": lot_size["version"],
+                    "config": {"lotSize": 1.0},
+                    "inputs": {"target": "wire.target"},
+                    "outputs": {"target": "wire.broker"},
+                }
+            },
+            "graph": {
+                "nodes": ["round"],
+                "inputs": {
+                    "target-input": {
+                        "dataKey": "market.execution_value",
+                        "wire": "wire.target",
+                    }
+                },
+                "outputs": {
+                    "broker-output": {
+                        "dataKey": "broker",
+                        "wire": "wire.broker",
+                    }
+                },
+            },
+        })["definition"]
         analysis = self.graph_version(
-            "analyses.json", "analysisId", analysis_presets.PERFORMANCE_ANALYSIS_ID
+            "analyses.json", "analysisId", analysis_presets.NEUTRAL_ANALYSIS_ID
         )
-        result = self.execute_request(
-            self.request(pipeline["pipelineId"], sampler, environment, analysis)
+        request = self.request(
+            pipeline["pipelineId"], sampler, environment, analysis
         )
-        cycles = self.result_projection(result["backtestId"], ["cycles"])["cycles"]
+        request["environment"]["moduleConfigOverrides"] = {
+            "round": {"lotSize": 4.0}
+        }
+        result = self.execute_request(request)
+        projected = self.result_projection(
+            result["backtestId"], ["cycles", "executionChain"]
+        )
+        cycles = projected["cycles"]
         self.assertEqual(len(cycles), 3)
         self.assertIn("broker", cycles[-1]["data"])
-        self.assertIn("analysis", cycles[-1]["data"])
-        performance = cycles[-1]["data"]["analysis"]["performance"]
-        self.assertEqual(performance["observationCount"], 3)
-        self.assertEqual(
-            result["metrics"]["analysis"],
-            {"analysis": cycles[-1]["data"]["analysis"]},
-        )
+        self.assertNotIn("analysis", cycles[-1]["data"])
+        self.assertEqual(cycles[0]["data"]["broker"], 8.0)
+        self.assertEqual(cycles[-1]["data"]["broker"], 12.0)
         self.assertNotIn(
             "analysis",
             result["request"]["executionSnapshot"]["pipeline"]["definition"],
+        )
+        self.assertEqual(
+            projected["executionChain"]["configuration"]["environment"],
+            {
+                "moduleConfigOverrides": {"round": {"lotSize": 4.0}},
+                "effectiveModuleConfigs": {"round": {"lotSize": 4.0}},
+            },
+        )
+        self.assertEqual(
+            projected["executionChain"]["configuration"]["analysis"],
+            {
+                "moduleConfigOverrides": {},
+                "effectiveModuleConfigs": {},
+            },
         )
 
     def test_pipeline_cannot_read_sampler_data_not_exported_by_environment(self):

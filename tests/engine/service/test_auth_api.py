@@ -20,6 +20,7 @@ from engine.service import control_api as control
 from engine.control import auth as trade_auth
 from engine.repository import module_definitions
 from engine.repository import pipelines as pipeline_repository
+from engine.service import pipelines as pipeline_service
 
 
 def available_port():
@@ -145,6 +146,17 @@ class EngineAuthenticationAndPipelineApiTests(unittest.TestCase):
             status, body = self.request(method, path, payload)
             self.assertEqual(status, 404, (path, body))
 
+    def test_retired_mining_routes_are_not_mounted(self):
+        for method, path, payload in (
+            ("GET", "/api/mining/health", None),
+            ("GET", "/api/mining/jobs", None),
+            ("POST", "/api/mining/jobs", {}),
+        ):
+            with self.subTest(method=method, path=path):
+                status, body = self.request(method, path, payload)
+                self.assertEqual(status, 404, body)
+                self.assertEqual(body, {"error": "not found"})
+
     def signal_draft(self, pipeline_id, name="Signal Pipeline"):
         module = next(
             item
@@ -198,6 +210,7 @@ class EngineAuthenticationAndPipelineApiTests(unittest.TestCase):
         }
         request = {
             "backtestId": "bt_01K00000000000000000000000",
+            "expectedRevision": 0,
             "visualizationId": "current",
             "name": "Current",
             "spec": spec,
@@ -207,6 +220,7 @@ class EngineAuthenticationAndPipelineApiTests(unittest.TestCase):
             "backtestId": request["backtestId"],
             "name": "Current",
             "createdAt": "2026-08-11T12:00:00Z",
+            "revision": 1,
             "spec": spec,
         }
         with mock.patch.object(
@@ -227,7 +241,12 @@ class EngineAuthenticationAndPipelineApiTests(unittest.TestCase):
                 f"/api/visualizations?backtestId={request['backtestId']}",
             )
             self.assertEqual(status, 200, body)
-            self.assertEqual(body, {"visualizations": [record]})
+            self.assertEqual(body, {
+                "visualizations": [record],
+                "currentVisualizationId": (
+                    "bt_01k00000000000000000000000-current"
+                ),
+            })
             list_visualizations.assert_called_once_with(
                 self.config,
                 request["backtestId"],
@@ -270,6 +289,23 @@ class EngineAuthenticationAndPipelineApiTests(unittest.TestCase):
                 "visualization.saved",
                 record,
             )
+
+        conflict = engine_service.visualization_service.VisualizationRevisionConflict(
+            request["visualizationId"],
+            request["expectedRevision"],
+            record,
+        )
+        with mock.patch.object(
+            engine_service.visualization_service,
+            "save_visualization",
+            side_effect=conflict,
+        ):
+            status, body = self.request(
+                "POST", "/api/visualizations", request
+            )
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["code"], "visualization_revision_conflict")
+        self.assertEqual(body["visualization"], record)
 
     def test_control_api_rejects_missing_actions_unknown_fields_and_query_fields(self):
         status, body = self.request(
@@ -549,42 +585,18 @@ class EngineAuthenticationAndPipelineApiTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 control.load_config(path)
 
-    def test_config_loader_validates_mining_fields_without_coercion(self):
+    def test_config_loader_rejects_retired_mining_fields(self):
         root = Path(self.temp.name)
         path = root / "mining-config.json"
-        valid = {
+        invalid = {
             "liveRoot": str(root / "live-mining-config"),
             "releaseRoot": str(root / "release-mining-config"),
             "controlRoot": str(root / "control-mining-config"),
             "miningRoot": str(root / "mining"),
-            "miningAutoStart": False,
-            "miningExposeTestProvider": False,
-            "miningHttpTimeout": 20.5,
-            "miningMaxPageBytes": 4096,
-            "miningMaxPagesPerRun": 25,
-            "miningStandbyRetrySeconds": 15,
         }
-        path.write_text(json.dumps(valid), encoding="utf-8")
-        loaded = control.load_config(path)
-        self.assertIs(loaded["miningAutoStart"], False)
-        self.assertEqual(loaded["miningHttpTimeout"], 20.5)
-        self.assertEqual(loaded["miningMaxPagesPerRun"], 25)
-
-        for field, value in (
-            ("miningRoot", ""),
-            ("miningAutoStart", "false"),
-            ("miningExposeTestProvider", 0),
-            ("miningHttpTimeout", True),
-            ("miningHttpTimeout", float("inf")),
-            ("miningMaxPageBytes", 4096.0),
-            ("miningMaxPagesPerRun", True),
-            ("miningStandbyRetrySeconds", "15"),
-        ):
-            with self.subTest(field=field, value=value):
-                candidate = {**valid, field: value}
-                path.write_text(json.dumps(candidate), encoding="utf-8")
-                with self.assertRaises(ValueError):
-                    control.load_config(path)
+        path.write_text(json.dumps(invalid), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            control.load_config(path)
 
     def test_pipeline_versions_are_archived_and_system_assigned(self):
         created = self.create_pipeline("Versioned Pipeline")
@@ -610,6 +622,103 @@ class EngineAuthenticationAndPipelineApiTests(unittest.TestCase):
         self.assertIn("definition", version_detail)
         status, _removed = self.request("GET", f"/api/pipelines/{pipeline_id}/revisions")
         self.assertEqual(status, 404)
+
+    def test_protocol_id_round_trips_as_passive_resource_metadata(self):
+        protocol_id = "trade.basic-workflow"
+        status, created = self.request(
+            "POST",
+            "/api/pipelines",
+            {"name": "Initially Unbound Pipeline"},
+        )
+        self.assertEqual(status, 200, created)
+        pipeline_id = created["pipelineId"]
+        self.assertNotIn("protocolId", created["definition"])
+        self.assertNotIn("protocolId", created["pipeline"])
+
+        status, created_tagged = self.request(
+            "POST",
+            "/api/pipelines",
+            {"name": "Initially Bound Pipeline", "protocolId": protocol_id},
+        )
+        self.assertEqual(status, 200, created_tagged)
+        self.assertEqual(created_tagged["definition"]["protocolId"], protocol_id)
+        self.assertEqual(created_tagged["pipeline"]["protocolId"], protocol_id)
+
+        draft = {**self.signal_draft(pipeline_id), "protocolId": protocol_id}
+        plain_manifest = pipeline_service.compile_pipeline_manifest(
+            self.config,
+            {key: value for key, value in draft.items() if key != "protocolId"},
+        )
+        tagged_manifest = pipeline_service.compile_pipeline_manifest(
+            self.config,
+            draft,
+        )
+        self.assertEqual(tagged_manifest, plain_manifest)
+        self.assertNotIn("protocolId", tagged_manifest)
+
+        status, saved = self.request(
+            "POST",
+            f"/api/pipelines/{pipeline_id}/versions",
+            draft,
+        )
+        self.assertEqual(status, 200, saved)
+        self.assertEqual(saved["definition"]["protocolId"], protocol_id)
+        status, listed = self.request("GET", "/api/pipelines")
+        self.assertEqual(status, 200, listed)
+        self.assertEqual(listed["pipelines"][pipeline_id]["protocolId"], protocol_id)
+        self.assertEqual(
+            [row.get("protocolId") for row in listed["versions"] if row["pipelineId"] == pipeline_id],
+            [None, protocol_id],
+        )
+
+        for resource_type, identity_field, schema_version in (
+            ("analyses", "analysisId", 1),
+            ("environments", "environmentId", 2),
+        ):
+            identity = f"protocol-{resource_type}"
+            payload = {
+                "schemaVersion": schema_version,
+                identity_field: identity,
+                "name": identity,
+                "description": "",
+                "instances": {},
+                "graph": {"nodes": [], "inputs": {}, "outputs": {}},
+                "protocolId": protocol_id,
+            }
+            status, saved_resource = self.request(
+                "POST",
+                f"/api/{resource_type}",
+                payload,
+            )
+            self.assertEqual(status, 200, saved_resource)
+            self.assertEqual(saved_resource["definition"]["protocolId"], protocol_id)
+            status, resources = self.request("GET", f"/api/{resource_type}")
+            self.assertEqual(status, 200, resources)
+            rows = resources[resource_type]
+            self.assertEqual(
+                next(row for row in rows if row[identity_field] == identity)["protocolId"],
+                protocol_id,
+            )
+
+        for path, payload in (
+            ("/api/pipelines", {"name": "Invalid Protocol", "protocolId": None}),
+            (
+                "/api/analyses",
+                {
+                    "schemaVersion": 1,
+                    "analysisId": "invalid-protocol-analysis",
+                    "name": "Invalid Protocol",
+                    "description": "",
+                    "instances": {},
+                    "graph": {"nodes": [], "inputs": {}, "outputs": {}},
+                    "protocolId": "",
+                },
+            ),
+        ):
+            with self.subTest(path=path):
+                status, body = self.request("POST", path, payload)
+                self.assertEqual(status, 400, body)
+                self.assertIn("canonical non-empty string", body["error"])
 
     def test_removed_pipeline_lifecycle_routes_do_not_exist(self):
         status, _body = self.request("POST", "/api/pipeline-versions", {})

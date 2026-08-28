@@ -10,6 +10,7 @@ from engine.contracts.module import MODULE_INSTANCE_FIELDS
 
 VISUALIZATION_SAVE_REQUEST_FIELDS = frozenset({
     "backtestId",
+    "expectedRevision",
     "visualizationId",
     "name",
     "spec",
@@ -19,7 +20,13 @@ VISUALIZATION_RECORD_FIELDS = frozenset({
     "backtestId",
     "name",
     "createdAt",
+    "revision",
     "spec",
+})
+_UNSAFE_VISUALIZER_INSTANCE_IDS = frozenset({
+    "__proto__",
+    "constructor",
+    "prototype",
 })
 
 
@@ -41,6 +48,14 @@ def require_save_request(request):
         raise ValueError("Visualization visualizationId is required.")
     if not isinstance(request["name"], str) or not request["name"].strip():
         raise ValueError("Visualization name is required.")
+    if (
+        isinstance(request["expectedRevision"], bool)
+        or not isinstance(request["expectedRevision"], int)
+        or request["expectedRevision"] < 0
+    ):
+        raise ValueError(
+            "Visualization expectedRevision must be a non-negative integer."
+        )
     require_spec(request["spec"])
     return request
 
@@ -62,6 +77,12 @@ def require_record(record):
     ):
         if not isinstance(record[field], str) or not record[field].strip():
             raise ValueError(f"Visualization {label} must be a non-empty string.")
+    if (
+        isinstance(record["revision"], bool)
+        or not isinstance(record["revision"], int)
+        or record["revision"] < 1
+    ):
+        raise ValueError("Visualization revision must be a positive integer.")
     require_spec(record["spec"])
     return record
 
@@ -171,6 +192,11 @@ def require_spec(spec):
             ):
                 raise ValueError(
                     f"Visualization Pane '{pane_id}' Visualizer identity is invalid."
+                )
+            if visualizer["id"] in _UNSAFE_VISUALIZER_INSTANCE_IDS:
+                raise ValueError(
+                    f"Visualization Pane '{pane_id}' Visualizer identity "
+                    f"'{visualizer['id']}' is unsafe."
                 )
             if visualizer["id"] in visualizer_ids:
                 raise ValueError(

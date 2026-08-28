@@ -17,6 +17,7 @@ from engine.contracts import digest as digest_contracts
 from engine.contracts.data import compile_normalized_json_validator
 from engine.contracts.data_model import normalize_schema
 from engine.contracts.exact_fields import require_exact_fields
+from engine.contracts.protocol import PROTOCOL_ID_FIELD, normalize_protocol_id
 from engine.core import resource_ids
 
 
@@ -32,7 +33,12 @@ MANIFEST_FIELDS = frozenset({
     "dataset", "storage", "source", "capabilities", "files", "createdAt", "lineage",
     "build", "manifestDigest",
 })
-DATASET_DESCRIPTOR_FIELDS = frozenset({"datasetId", "source", "metadata"})
+LEGACY_MANIFEST_SCHEMA_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 5
+DATASET_DESCRIPTOR_REQUIRED_FIELDS = frozenset({"datasetId", "source", "metadata"})
+DATASET_DESCRIPTOR_FIELDS = DATASET_DESCRIPTOR_REQUIRED_FIELDS | frozenset({
+    PROTOCOL_ID_FIELD,
+})
 FILE_FIELDS = frozenset({"path", "size", "sha256"})
 CAPABILITY_FIELDS = frozenset({"protocol", "descriptor"})
 LINEAGE_FIELDS = frozenset({"alias", "datasetId", "datasetVersionId", "contentHash"})
@@ -103,6 +109,7 @@ def validate_sealed_version_descriptor(version):
             "manifest",
             "manifestDigest",
             "buildJobId",
+            PROTOCOL_ID_FIELD,
         },
         required={
             "datasetVersionId",
@@ -158,6 +165,20 @@ def validate_sealed_version_descriptor(version):
         raise ValueError("Dataset Version capabilities are not normalized.")
     manifest = validate_manifest(version["manifest"])
     require_manifest_build_job_id(manifest, version["buildJobId"])
+    manifest_dataset = manifest["dataset"]
+    if (PROTOCOL_ID_FIELD in version) != (PROTOCOL_ID_FIELD in manifest_dataset):
+        raise ValueError(
+            "Dataset Version protocolId presence does not match its sealed manifest."
+        )
+    if PROTOCOL_ID_FIELD in version:
+        normalize_protocol_id(
+            version[PROTOCOL_ID_FIELD],
+            label="Dataset Version protocolId",
+        )
+        if version[PROTOCOL_ID_FIELD] != manifest_dataset[PROTOCOL_ID_FIELD]:
+            raise ValueError(
+                "Dataset Version protocolId does not match its sealed manifest."
+            )
     if (
         manifest["datasetVersionId"] != version["datasetVersionId"]
         or manifest["datasetId"] != version["datasetId"]
@@ -427,10 +448,14 @@ def build_manifest(
         raise ValueError("Dataset ID must be a non-empty string.")
     if resource_ids.normalize_resource_id(dataset_id) != dataset_id:
         raise ValueError("Dataset ID must already be normalized.")
-    if not isinstance(dataset, Mapping) or set(dataset) != {
-        "datasetId", "name", "source", "metadata",
-    }:
-        raise ValueError("Dataset publication descriptor has an invalid schema.")
+    require_exact_fields(
+        dataset,
+        allowed={
+            "datasetId", "name", "source", "metadata", PROTOCOL_ID_FIELD,
+        },
+        required={"datasetId", "name", "source", "metadata"},
+        label="Dataset publication descriptor",
+    )
     dataset = dict(dataset)
     if dataset["datasetId"] != dataset_id:
         raise ValueError("Dataset publication descriptor identity is inconsistent.")
@@ -450,6 +475,11 @@ def build_manifest(
         "details": dict(dataset_source["details"]),
     }
     dataset["metadata"] = dict(dataset["metadata"])
+    if PROTOCOL_ID_FIELD in dataset:
+        dataset[PROTOCOL_ID_FIELD] = normalize_protocol_id(
+            dataset[PROTOCOL_ID_FIELD],
+            label="Dataset publication protocolId",
+        )
     dataset.pop("name")
     _require_json(dataset["source"]["details"], path="Dataset publication source.details")
     _require_json(dataset["metadata"], path="Dataset publication metadata")
@@ -477,7 +507,7 @@ def build_manifest(
     build = dict(build) if build is not None else None
     _require_json(build, path="Dataset build")
     manifest = {
-        "schemaVersion": 4,
+        "schemaVersion": MANIFEST_SCHEMA_VERSION,
         "datasetId": dataset_id,
         "datasetVersionId": version_id or f"{dataset_id}@{digest}",
         "contentHash": digest,
@@ -499,7 +529,14 @@ def build_manifest(
 def validate_manifest(manifest):
     if not isinstance(manifest, dict) or set(manifest) != MANIFEST_FIELDS:
         raise ValueError("Dataset archive manifest has an invalid schema.")
-    if manifest["schemaVersion"] != 4 or manifest["status"] != "sealed":
+    schema_version = manifest["schemaVersion"]
+    if (
+        schema_version not in {
+            LEGACY_MANIFEST_SCHEMA_VERSION,
+            MANIFEST_SCHEMA_VERSION,
+        }
+        or manifest["status"] != "sealed"
+    ):
         raise ValueError("Dataset archive manifest schemaVersion/status is invalid.")
     for field in ("datasetId", "datasetVersionId", "createdAt"):
         if not isinstance(manifest[field], str) or not manifest[field]:
@@ -518,8 +555,25 @@ def validate_manifest(manifest):
     if manifest["datasetVersionId"] != f"{manifest['datasetId']}@{manifest['contentHash']}":
         raise ValueError("Dataset archive Version ID is not content-addressed by its Dataset.")
     dataset = manifest["dataset"]
-    if not isinstance(dataset, dict) or set(dataset) != DATASET_DESCRIPTOR_FIELDS:
+    if not isinstance(dataset, dict):
         raise ValueError("Dataset archive publication descriptor has an invalid schema.")
+    descriptor_fields = set(dataset)
+    if schema_version == LEGACY_MANIFEST_SCHEMA_VERSION:
+        if descriptor_fields != DATASET_DESCRIPTOR_REQUIRED_FIELDS:
+            raise ValueError(
+                "Legacy Dataset archive publication descriptor has an invalid schema."
+            )
+    elif not (
+        DATASET_DESCRIPTOR_REQUIRED_FIELDS
+        <= descriptor_fields
+        <= DATASET_DESCRIPTOR_FIELDS
+    ):
+        raise ValueError("Dataset archive publication descriptor has an invalid schema.")
+    if PROTOCOL_ID_FIELD in dataset:
+        normalize_protocol_id(
+            dataset[PROTOCOL_ID_FIELD],
+            label="Dataset archive publication protocolId",
+        )
     if dataset["datasetId"] != manifest["datasetId"]:
         raise ValueError("Dataset archive publication descriptor identity is inconsistent.")
     dataset_source = dataset["source"]

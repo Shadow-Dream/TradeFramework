@@ -17,9 +17,15 @@ class RsiIndicator(SignalModule):
         losses = push_window(self.state, "losses", max(-delta, 0.0), size)
         if len(gains) < size:
             return {"rsi": None}
-        average_gain = sum(gains) / size
-        average_loss = sum(losses) / size
+        if "avgGain" not in self.state:
+            self.state["avgGain"] = sum(gains) / size
+            self.state["avgLoss"] = sum(losses) / size
+        else:
+            self.state["avgGain"] = (self.state["avgGain"] * (size - 1) + gains[-1]) / size
+            self.state["avgLoss"] = (self.state["avgLoss"] * (size - 1) + losses[-1]) / size
+        average_gain = self.state["avgGain"]
+        average_loss = self.state["avgLoss"]
         if average_loss == 0:
-            return {"rsi": 100.0}
+            return {"rsi": 100.0 if average_gain else 0.0}
         relative_strength = average_gain / average_loss
         return {"rsi": 100.0 - 100.0 / (1.0 + relative_strength)}

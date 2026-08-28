@@ -12,6 +12,7 @@ from engine.authority.graph import (
     require_compiled_graph_authority,
 )
 from engine.contracts import strict_json
+from engine.contracts.config_override import require_module_config_only_derivation
 from engine.contracts.graph import compiled_graph_definition
 from engine.contracts.graph_cycle import validate_cycle_graph_inputs
 from engine.contracts.module import MODULE_INSTANCE_FIELDS
@@ -21,6 +22,7 @@ __all__ = (
     "bind_compiled_cycle_graph_authority",
     "bind_verified_compiled_cycle_graph_authority",
     "compiled_cycle_graph_authority_material",
+    "configure_verified_cycle_graph_definition_authority",
     "verified_cycle_graph_definition_material",
     "verified_cycle_graph_execution_material",
     "verify_cycle_graph_definition_authority",
@@ -92,6 +94,23 @@ def verified_cycle_graph_definition_material(authority):
     if type(authority) is not _VerifiedCycleGraphDefinition:
         raise TypeError("Verified Cycle Graph Definition is Engine-owned.")
     return authority._material()
+
+
+def configure_verified_cycle_graph_definition_authority(
+    base_authority,
+    effective_definition,
+    *,
+    graph_label,
+):
+    """Derive runtime authority after proving config is the only changed field."""
+
+    base_definition = verified_cycle_graph_definition_material(base_authority)
+    require_module_config_only_derivation(
+        base_definition,
+        effective_definition,
+        label=graph_label,
+    )
+    return _verified_cycle_graph_definition_authority(effective_definition)
 
 
 def verified_cycle_graph_execution_material(authority, *, graph_label):

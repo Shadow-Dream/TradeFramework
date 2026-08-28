@@ -45,15 +45,19 @@ def build_visualization_preset(
             raise ValueError(f"Visualization preset {label} is invalid.")
 
     close_key = f"price.{period}.{instrument_id}.close"
+    time_key = "time"
     panes = []
     market = []
-    if close_key in result_data_keys:
+    if close_key in result_data_keys and time_key in result_data_keys:
         market.append(
             {
                 "id": "market-close",
                 "callback": "series.line",
                 "params": {
                     "dataKey": close_key,
+                    "timeKey": time_key,
+                    "timeDomainId": "basic-workflow.cycle",
+                    "priceScaleId": "market-price",
                     "color": "#475569",
                     "lineWidth": 1,
                 },
@@ -72,12 +76,24 @@ def build_visualization_preset(
         ),
         ("approved-position", f"intent.approved.{instrument_id}", "#7c3aed"),
     ):
-        if data_key in result_data_keys:
+        if data_key in result_data_keys and time_key in result_data_keys:
+            price_scale_id = (
+                "portfolio-equity"
+                if identifier == "account-equity"
+                else "portfolio-position"
+            )
             portfolio.append(
                 {
                     "id": identifier,
                     "callback": "series.line",
-                    "params": {"dataKey": data_key, "color": color, "lineWidth": 2},
+                    "params": {
+                        "dataKey": data_key,
+                        "timeKey": time_key,
+                        "timeDomainId": "basic-workflow.cycle",
+                        "priceScaleId": price_scale_id,
+                        "color": color,
+                        "lineWidth": 2,
+                    },
                 }
             )
     if portfolio:

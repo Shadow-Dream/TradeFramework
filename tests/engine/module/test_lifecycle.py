@@ -75,6 +75,60 @@ class ModuleLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported field"):
             self.save({**self.payload("manual-version"), "version": "9"})
 
+    def test_protocol_id_is_optional_versioned_metadata_and_workspace_preserves_it(self):
+        unbound_payload = self.payload("protocol-owned")
+        unbound = self.save(unbound_payload)
+        tagged = self.save({
+            **unbound_payload,
+            "protocolId": "trade.basic-workflow",
+        })
+        foreign = self.save({
+            **unbound_payload,
+            "protocolId": "vendor.uninstalled-protocol",
+        })
+        unbound_again = self.save(unbound_payload)
+
+        self.assertNotIn("protocolId", unbound)
+        self.assertEqual(tagged["protocolId"], "trade.basic-workflow")
+        self.assertEqual(foreign["protocolId"], "vendor.uninstalled-protocol")
+        self.assertNotIn("protocolId", unbound_again)
+        self.assertEqual(
+            [unbound["version"], tagged["version"], foreign["version"], unbound_again["version"]],
+            ["1", "2", "3", "4"],
+        )
+
+        opened = module_workspaces.open_edit_workspace(
+            self.config,
+            "Signal",
+            "protocol-owned",
+            tagged["version"],
+        )
+        draft = control_state.load_json_file(
+            Path(opened["workspacePath"]) / "module-draft.json",
+            {},
+        )
+        self.assertEqual(draft["protocolId"], "trade.basic-workflow")
+
+        definitions = module_definitions.load_pipeline_definitions(self.config)
+        self.assertEqual(
+            [
+                definitions[f"Signal/protocol-owned/{version}"].get("protocolId")
+                for version in ("1", "2", "3", "4")
+            ],
+            [None, "trade.basic-workflow", "vendor.uninstalled-protocol", None],
+        )
+
+    def test_module_protocol_id_rejects_null_empty_and_whitespace(self):
+        for index, value in enumerate((None, "", " trade.basic-workflow")):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError,
+                "canonical non-empty string",
+            ):
+                self.save({
+                    **self.payload(f"invalid-protocol-{index}"),
+                    "protocolId": value,
+                })
+
     def test_unchanged_publication_verifies_each_existing_archive_once(self):
         self.save(self.payload("single-verification"))
         with mock.patch.object(

@@ -123,7 +123,12 @@ def _execute_backtest(
         raise ValueError("Frozen Backtest datasetId must be a non-empty string.")
     pipeline_request = require_exact_fields(
         request["pipeline"],
-        allowed={"pipelineId", "version"},
+        allowed={
+            "pipelineId",
+            "version",
+            "configOverride",
+            "moduleConfigOverrides",
+        },
         required={"pipelineId", "version"},
         label="Frozen Backtest pipeline",
     )
@@ -201,6 +206,10 @@ def _execute_backtest(
     verified_composition = prepared.verified_composition
     verified_sampler_contracts = prepared.verified_sampler_contracts
     verified_sampler_required_roots = prepared.verified_sampler_required_roots
+    configuration = copy.deepcopy(prepared.configuration)
+    configuration["digest"] = (
+        "sha256:" + digest_contracts.canonical_json_digest(configuration)
+    )
     dataset_handle = _dataset_runtime.create_dataset_handle(
         prepared.dataset_storage_authority
     )
@@ -247,10 +256,24 @@ def _execute_backtest(
     request["environment"] = {
         "environmentId": environment_definition["environmentId"],
         "version": environment_definition["version"],
+        **(
+            {"moduleConfigOverrides": copy.deepcopy(
+                request["environment"]["moduleConfigOverrides"]
+            )}
+            if "moduleConfigOverrides" in request["environment"]
+            else {}
+        ),
     }
     request["analysis"] = {
         "analysisId": analysis_definition["analysisId"],
         "version": analysis_definition["version"],
+        **(
+            {"moduleConfigOverrides": copy.deepcopy(
+                request["analysis"]["moduleConfigOverrides"]
+            )}
+            if "moduleConfigOverrides" in request["analysis"]
+            else {}
+        ),
     }
     runner = backtest_contracts.BACKTEST_RUNNER
     graph_build_started = perf_counter()
@@ -437,6 +460,7 @@ def _execute_backtest(
             "environment": environment.metadata(),
             "pipeline": {**pipeline_binding, **pipeline_runtime.metadata()},
             "analysis": analysis_graph.metadata(),
+            "configuration": configuration,
             "timings": {
                 "kernelPreparationSeconds": graph_build_started - kernel_started,
                 "graphBuildSeconds": graph_build_seconds,

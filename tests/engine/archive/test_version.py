@@ -768,6 +768,64 @@ class VersionArchiveTransactionTests(unittest.TestCase):
             self.assertEqual(set(state), {"1", "2"})
             self.assertFalse((root / "resource" / "3").exists())
 
+    def test_unindexed_recovery_uses_each_archives_declared_record_shape(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = {}
+
+            def publish(value, protocol_id=None):
+                semantic = {"value": value}
+                record_fields = {"resourceId", "value"}
+                if protocol_id is not None:
+                    semantic["protocolId"] = protocol_id
+                    record_fields.add("protocolId")
+
+                def prepare(staging, _version, _destination):
+                    (staging / "payload.txt").write_text(value, encoding="utf-8")
+                    return semantic, None
+
+                def commit(record, _context):
+                    state[record["version"]] = json.loads(json.dumps(record))
+
+                return version_transaction.archive_if_changed(
+                    records=list(state.values()),
+                    identity_key="resourceId",
+                    identity="resource",
+                    resource_type="test-resource",
+                    resource_id="resource",
+                    managed_root=root,
+                    destination_for_version=lambda version: root / "resource" / version,
+                    prepare_staging=prepare,
+                    create_record=lambda _version, _context: {
+                        "resourceId": "resource",
+                        **semantic,
+                    },
+                    record_fields=record_fields,
+                    write_record=lambda _staging, _record, _context: None,
+                    commit_record=commit,
+                    read_committed_record=lambda record, _context: state.get(
+                        record["version"]
+                    ),
+                    immutable_fields=(),
+                )
+
+            first = publish("first")
+            state.clear()
+            second = publish("second", "trade.basic-workflow")
+
+            self.assertEqual(second["record"]["version"], "2")
+            self.assertNotIn("protocolId", state["1"])
+            self.assertEqual(state["2"]["protocolId"], "trade.basic-workflow")
+
+            state.clear()
+            third = publish("third")
+
+            self.assertEqual(third["record"]["version"], "3")
+            self.assertEqual(set(state), {"1", "2", "3"})
+            self.assertNotIn("protocolId", state["1"])
+            self.assertEqual(state["2"]["protocolId"], "trade.basic-workflow")
+            self.assertNotIn("protocolId", state["3"])
+
     def test_retry_preserves_and_rejects_a_corrupt_unindexed_archive(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

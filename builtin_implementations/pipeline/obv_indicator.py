@@ -7,6 +7,8 @@ class ObvIndicator(SignalModule):
         close, volume = number(close), number(volume)
         if close is None or volume is None:
             return {"obv": None}
+        if volume < 0:
+            raise ValueError("OBV received negative volume.")
         previous = self.state.get("previousClose")
         self.state["previousClose"] = close
         self.state.setdefault("obv", 0.0)

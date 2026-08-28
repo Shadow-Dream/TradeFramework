@@ -19,6 +19,7 @@ from engine.contracts.module import (
     require_exact_fields,
     validate_module_definition,
 )
+from engine.contracts.protocol import normalize_protocol_id
 from engine.repository import control_state
 from engine.repository import module_definitions
 
@@ -245,6 +246,12 @@ def _publish_module_locked(
         raise ValueError("Module name must be a non-empty string.")
     if not isinstance(request["description"], str):
         raise ValueError("Module description must be a string.")
+    protocol_fields = {}
+    if "protocolId" in request:
+        protocol_fields["protocolId"] = normalize_protocol_id(
+            request["protocolId"],
+            label=f"Module '{module_id}' protocolId",
+        )
     decoded_files = decode_bundle_files(request["files"])
     activation = request["activationMode"]
     normalized_parameters = normalize_module_parameters(
@@ -334,6 +341,7 @@ def _publish_module_locked(
             "configSchema": normalized_config_schema,
             "ports": normalized_ports,
             "description": request["description"],
+            **protocol_fields,
             "builtin": engine_owned,
             "version": version,
         }
@@ -348,6 +356,7 @@ def _publish_module_locked(
             "configSchema": definition["configSchema"],
             "ports": definition["ports"],
             "description": definition["description"],
+            **protocol_fields,
             "builtin": definition["builtin"],
             "files": version_archive.file_manifest(staging),
         }
@@ -385,7 +394,11 @@ def _publish_module_locked(
         destination_for_version=destination_for_version,
         prepare_staging=prepare_staging,
         create_record=create_record,
-        record_fields=MODULE_DEFINITION_FIELDS,
+        record_fields=(
+            MODULE_DEFINITION_FIELDS
+            if protocol_fields
+            else MODULE_DEFINITION_FIELDS - {"protocolId"}
+        ),
         write_record=write_record,
         commit_record=commit_record,
         read_committed_record=read_committed_record,

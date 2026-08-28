@@ -50,7 +50,7 @@ class RepositoryFolderTests(unittest.TestCase):
         )
         self.assertEqual(
             {item["path"] for item in environment["folders"]},
-            {"/BuiltIn"},
+            {"/BuiltIn", "/BuiltIn/Basic Workflow"},
         )
 
     def test_builtin_items_are_fixed_in_their_own_repository(self):
@@ -78,6 +78,24 @@ class RepositoryFolderTests(unittest.TestCase):
         )
         self.assertEqual(analyzer_placement["folderPath"], "/BuiltIn")
         self.assertEqual(environment_placement["folderPath"], "/BuiltIn")
+        builtin_id = repository_folders._repository_builtin_folder_id(
+            "analysis-modules"
+        )
+        category = repository_folders.create_folder(
+            self.config, "analysis-modules", "Diagnostics", builtin_id
+        )
+        categorized = repository_folders.assign_item(
+            self.config,
+            "analysis-modules",
+            analyzer_key,
+            category["folderId"],
+            module_definition=analyzer,
+        )
+        self.assertEqual(categorized["folderPath"], "/BuiltIn/Diagnostics")
+        with self.assertRaisesRegex(ValueError, "BuiltIn boundary"):
+            repository_folders.move_folder(
+                self.config, "analysis-modules", category["folderId"], ""
+            )
         with self.assertRaisesRegex(ValueError, "Built-in Modules"):
             repository_folders.assign_item(
                 self.config,
@@ -136,14 +154,12 @@ class RepositoryFolderTests(unittest.TestCase):
                 self.config, "modules", "Loose", ""
             )
 
-    def test_folder_state_corruption_is_rejected_not_normalized(self):
+    def test_folder_state_missing_assignment_target_is_rejected_not_normalized(self):
         state_path = Path(self.config["controlRoot"]) / repository_folders.STATE_FILE
         state = repository_folders.load_state(self.config)
-        state["assignments"]["analysis-modules"]["Analyzer/example"] = (
-            repository_folders._repository_builtin_folder_id("analysis-modules")
-        )
+        state["assignments"]["analysis-modules"]["Analyzer/example"] = "missing"
         state_path.write_text(json.dumps(state), encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "reserved BuiltIn"):
+        with self.assertRaisesRegex(ValueError, "references missing folder"):
             repository_folders.load_state(self.config)
 
     def test_v8_folder_state_migrates_flat_roots_and_versioned_item_ids(self):
@@ -194,8 +210,18 @@ class RepositoryFolderTests(unittest.TestCase):
         self.assertEqual(repository_folders.load_state(self.config), migrated)
 
     def test_backtest_catalog_contains_results_while_environments_are_independent(self):
-        catalog = engine_service.repository_catalog(self.config, "backtest")
+        with mock.patch.object(
+            engine_service.result_repository,
+            "list_backtests",
+            return_value=[{
+                "backtestId": "bt-nvda",
+                "name": "NVDA Check",
+                "status": "completed",
+            }],
+        ):
+            catalog = engine_service.repository_catalog(self.config, "backtest")
         sources = {item.get("sourceRepository") for item in catalog["items"]}
+        self.assertEqual(catalog["items"][0]["label"], "NVDA Check")
         self.assertNotIn("environments", sources)
         self.assertNotIn("analysis-modules", sources)
         self.assertNotIn("environment-modules", sources)

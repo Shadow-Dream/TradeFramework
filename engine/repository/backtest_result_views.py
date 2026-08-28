@@ -1,6 +1,7 @@
 """Read models for immutable Backtest Result catalog entries."""
 
 from engine.contracts import strict_json
+from engine.contracts.backtest import execution_snapshot_protocol_id
 from engine.contracts.digest import is_sha256_digest
 import engine.contracts.result_execution as result_execution_contracts
 from engine.contracts import visualization as visualization_contracts
@@ -17,6 +18,7 @@ BACKTEST_SUMMARY_SELECT = """
         b.runner,
         b.created_at,
         b.completed_at,
+        b.request_json,
         b.metrics_json,
         b.archived_at,
         b.archive_reason,
@@ -39,6 +41,7 @@ BACKTEST_RESULT_VIEW_SELECT = """
         b.runner,
         b.created_at,
         b.completed_at,
+        b.request_json,
         b.metrics_json,
         b.visualization_json,
         b.archived_at,
@@ -119,11 +122,12 @@ def backtest_summary(row):
     require_backtest_index_identity(row)
     try:
         metrics = strict_json.loads(row["metrics_json"])
+        request = strict_json.loads(row["request_json"])
     except ValueError as exc:
         raise ValueError("Backtest index contains invalid stored JSON.") from exc
-    if not isinstance(metrics, dict):
+    if not isinstance(metrics, dict) or not isinstance(request, dict):
         raise ValueError("Backtest index stored JSON has invalid types.")
-    return {
+    item = {
         "backtestId": row["backtest_id"],
         "pipelineId": row["pipeline_id"],
         "datasetId": row["dataset_id"],
@@ -141,6 +145,18 @@ def backtest_summary(row):
         "visualizable": True,
         "visualizationIssue": "",
     }
+    protocol_id = backtest_request_protocol_id(request)
+    if protocol_id is not None:
+        item["protocolId"] = protocol_id
+    return item
+
+
+def backtest_request_protocol_id(request):
+    """Return a Backtest's passive protocol projection, when fully declared."""
+
+    if not isinstance(request, dict):
+        return None
+    return execution_snapshot_protocol_id(request.get("executionSnapshot"))
 
 
 def backtest_result_view(row):
@@ -171,6 +187,18 @@ def backtest_result_view(row):
             "samplerId": execution_chain["sampler"]["samplerId"],
             "version": execution_chain["sampler"]["version"],
         },
+        "pipeline": {
+            "pipelineId": execution_chain["pipeline"]["pipelineId"],
+            "version": execution_chain["pipeline"]["version"],
+        },
+        "environment": {
+            "environmentId": execution_chain["environment"]["environmentId"],
+            "version": execution_chain["environment"]["version"],
+        },
+        "analysis": {
+            "analysisId": execution_chain["analysis"]["analysisId"],
+            "version": execution_chain["analysis"]["version"],
+        },
     }
     return item
 
@@ -179,6 +207,7 @@ __all__ = (
     "BACKTEST_RESULT_VIEW_SELECT",
     "BACKTEST_SUMMARY_SELECT",
     "backtest_result_view",
+    "backtest_request_protocol_id",
     "backtest_summary",
     "require_backtest_index_identity",
 )

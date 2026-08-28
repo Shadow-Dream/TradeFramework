@@ -10,14 +10,16 @@ from engine.contracts.archive import require_resource_path_segment
 from engine.contracts.exact_fields import require_exact_fields
 from engine.contracts.module import definition_key
 from engine.contracts.pipeline import (
+    PIPELINE_REQUIRED_VERSION_FIELDS,
     PIPELINE_VERSION_FIELDS,
     pipeline_manifest_digest,
     validate_pipeline_manifest,
 )
+from engine.contracts.protocol import normalize_protocol_id
 from engine.repository import control_state
 
 
-PIPELINE_METADATA_FIELDS = frozenset(
+PIPELINE_REQUIRED_METADATA_FIELDS = frozenset(
     {
         "schemaVersion",
         "pipelineId",
@@ -28,6 +30,7 @@ PIPELINE_METADATA_FIELDS = frozenset(
         "updatedAt",
     }
 )
+PIPELINE_METADATA_FIELDS = PIPELINE_REQUIRED_METADATA_FIELDS | {"protocolId"}
 PIPELINE_CONTROL_SNAPSHOT_FIELDS = frozenset(
     {
         "schemaVersion",
@@ -59,9 +62,14 @@ def validate_pipeline_store(config, store):
         require_exact_fields(
             record,
             allowed=PIPELINE_VERSION_FIELDS,
-            required=PIPELINE_VERSION_FIELDS,
+            required=PIPELINE_REQUIRED_VERSION_FIELDS,
             label=f"Pipeline version '{key}'",
         )
+        if "protocolId" in record:
+            normalize_protocol_id(
+                record["protocolId"],
+                label=f"Pipeline version '{key}' protocolId",
+            )
         expected_key = f"{record.get('pipelineId')}/{record.get('version')}"
         if key != expected_key:
             raise ValueError(f"Pipeline version index key mismatch: {key}")
@@ -82,10 +90,16 @@ def validate_pipeline_store(config, store):
             "Pipeline metadata and version indexes must have identical identities."
         )
     for pipeline_id, metadata in store["pipelines"].items():
-        if not isinstance(metadata, dict) or set(metadata) != PIPELINE_METADATA_FIELDS:
+        if not isinstance(metadata, dict):
             raise ValueError(
                 f"Pipeline metadata has an invalid schema: {pipeline_id}"
             )
+        require_exact_fields(
+            metadata,
+            allowed=PIPELINE_METADATA_FIELDS,
+            required=PIPELINE_REQUIRED_METADATA_FIELDS,
+            label=f"Pipeline metadata '{pipeline_id}'",
+        )
         if metadata.get("schemaVersion") != 1 or metadata.get(
             "pipelineId"
         ) != pipeline_id:
@@ -95,6 +109,15 @@ def validate_pipeline_store(config, store):
         records = versions_by_pipeline[pipeline_id]
         version_archive.verify_record_collection(records, ("pipelineId",))
         latest = max(records, key=lambda record: int(record["version"]))
+        if "protocolId" in metadata:
+            normalize_protocol_id(
+                metadata["protocolId"],
+                label=f"Pipeline metadata '{pipeline_id}' protocolId",
+            )
+        if metadata.get("protocolId") != latest.get("protocolId"):
+            raise ValueError(
+                f"Pipeline '{pipeline_id}' protocolId does not match its current version."
+            )
         if str(metadata.get("currentVersion") or "") != latest["version"]:
             raise ValueError(
                 f"Pipeline '{pipeline_id}' currentVersion must be its latest version."
@@ -171,6 +194,11 @@ def pipeline_versions(config, pipeline_id):
                 "name": record.get("name") or pipeline_id,
                 "contentDigest": record["contentDigest"],
                 "current": record["version"] == metadata.get("currentVersion"),
+                **(
+                    {"protocolId": record["protocolId"]}
+                    if "protocolId" in record
+                    else {}
+                ),
             }
         )
     return versions
@@ -198,8 +226,19 @@ def load_pipeline_execution_version(config, pipeline_id, version):
     ):
         raise ValueError("Pipeline repository has an invalid schema.")
     metadata = store["pipelines"].get(pipeline_id)
-    if not isinstance(metadata, dict) or set(metadata) != PIPELINE_METADATA_FIELDS:
+    if not isinstance(metadata, dict):
         raise ValueError(f"Unknown Pipeline: {pipeline_id}")
+    require_exact_fields(
+        metadata,
+        allowed=PIPELINE_METADATA_FIELDS,
+        required=PIPELINE_REQUIRED_METADATA_FIELDS,
+        label="Pipeline metadata",
+    )
+    if "protocolId" in metadata:
+        normalize_protocol_id(
+            metadata["protocolId"],
+            label=f"Pipeline metadata '{pipeline_id}' protocolId",
+        )
     if (
         metadata.get("schemaVersion") != 1
         or metadata.get("pipelineId") != pipeline_id
@@ -215,9 +254,14 @@ def load_pipeline_execution_version(config, pipeline_id, version):
     require_exact_fields(
         record,
         allowed=PIPELINE_VERSION_FIELDS,
-        required=PIPELINE_VERSION_FIELDS,
+        required=PIPELINE_REQUIRED_VERSION_FIELDS,
         label=f"Pipeline version '{key}'",
     )
+    if "protocolId" in record:
+        normalize_protocol_id(
+            record["protocolId"],
+            label=f"Pipeline version '{key}' protocolId",
+        )
     if record.get("pipelineId") != pipeline_id or record.get("version") != version:
         raise ValueError("Pipeline version index key does not match its record.")
     version_archive.verify_record_location(
@@ -311,6 +355,7 @@ def load_pipeline_control_snapshot(pipeline_definition, manifest):
 __all__ = (
     "PIPELINE_CONTROL_SNAPSHOT_FIELDS",
     "PIPELINE_METADATA_FIELDS",
+    "PIPELINE_REQUIRED_METADATA_FIELDS",
     "PIPELINE_STORE_FIELDS",
     "load_current_pipeline",
     "load_pipeline_control_snapshot",

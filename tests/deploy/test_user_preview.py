@@ -3,8 +3,6 @@ import unittest
 from pathlib import Path
 
 from scripts.prepare_engine_preview import (
-    PREVIEW_MINING_ROOT,
-    PROJECT,
     preview_user_id,
     sync_preview_users,
 )
@@ -38,10 +36,6 @@ class UserPreviewAccountSyncTests(unittest.TestCase):
         self.assertIn("prepare_engine_preview.py\"", reload_script)
         self.assertNotIn("preserve-existing-resources", reload_script)
         self.assertIn("build_jupyter_ui_sync.sh", reload_script)
-
-    def test_preview_mining_evidence_is_outside_the_source_repository(self):
-        self.assertNotEqual(PREVIEW_MINING_ROOT, PROJECT)
-        self.assertNotIn(PROJECT, PREVIEW_MINING_ROOT.parents)
 
     def test_sync_updates_accounts_preserves_live_sessions_and_removes_stale_users(self):
         connection = sqlite3.connect(":memory:")

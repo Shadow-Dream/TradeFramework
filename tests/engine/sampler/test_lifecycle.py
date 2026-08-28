@@ -16,6 +16,7 @@ from engine.repository import samplers
 from engine.repository import workspace_paths
 from engine.service import sampler_workspaces
 from engine.archive.sampler import sampler_runtime_bundle
+from engine.archive import version as version_archive
 from engine.authority.sampler import verify_sampler_runtime_bundle
 from strategy_devkit import sampler_sdk
 
@@ -119,6 +120,9 @@ class SamplerLifecycleTests(unittest.TestCase):
             ("source", 123, "source must be a string"),
             ("entryPoint", 123, "entryPoint must be a string"),
             ("samplerId", 123, "samplerId must be a string"),
+            ("protocolId", None, "canonical non-empty string"),
+            ("protocolId", "", "canonical non-empty string"),
+            ("protocolId", " basic ", "canonical non-empty string"),
         )
         baseline = len(samplers.list_samplers(self.config))
         for field, value, message in invalid_values:
@@ -129,6 +133,83 @@ class SamplerLifecycleTests(unittest.TestCase):
             ):
                 samplers.save_sampler(self.config, draft)
             self.assertEqual(len(samplers.list_samplers(self.config)), baseline)
+
+    def test_protocol_id_is_archived_and_preserved_by_the_edit_workspace(self):
+        draft = row_map_draft("protocol-owned-sampler")
+        draft["protocolId"] = "trade.basic-workflow"
+
+        definition = samplers.save_sampler(self.config, draft)
+        loaded = samplers.get_sampler(
+            self.config, definition["samplerId"], definition["version"]
+        )
+        archived_record = json.loads(
+            (
+                Path(definition["archive"]["root"])
+                / version_archive.RECORD_NAME
+            ).read_text(encoding="utf-8")
+        )
+        archived_manifest = json.loads(
+            (
+                Path(definition["archive"]["root"])
+                / version_archive.MANIFEST_NAME
+            ).read_text(encoding="utf-8")
+        )
+        workspace = sampler_workspaces.open_edit_workspace(
+            self.config, definition["samplerId"], definition["version"]
+        )
+        workspace_draft = json.loads(
+            (Path(workspace["workspacePath"]) / "sampler.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertEqual(loaded["protocolId"], "trade.basic-workflow")
+        self.assertEqual(archived_record["protocolId"], "trade.basic-workflow")
+        self.assertIn("protocolId", archived_manifest["recordFields"])
+        self.assertEqual(workspace_draft["protocolId"], "trade.basic-workflow")
+
+    def test_protocol_id_is_version_local_and_never_inherited(self):
+        sampler_id = "protocol-version-local"
+        unbound = samplers.save_sampler(self.config, row_map_draft(sampler_id))
+        bound_draft = row_map_draft(sampler_id)
+        bound_draft["protocolId"] = "trade.basic-workflow"
+        bound = samplers.save_sampler(self.config, bound_draft)
+        unbound_again = samplers.save_sampler(
+            self.config, row_map_draft(sampler_id)
+        )
+
+        self.assertNotIn("protocolId", unbound)
+        self.assertEqual(bound["protocolId"], "trade.basic-workflow")
+        self.assertNotIn("protocolId", unbound_again)
+        self.assertEqual(
+            [unbound["version"], bound["version"], unbound_again["version"]],
+            ["1", "2", "3"],
+        )
+        self.assertEqual(len({
+            unbound["contentDigest"],
+            bound["contentDigest"],
+            unbound_again["contentDigest"],
+        }), 2)
+
+    def test_unbound_sampler_archive_retains_the_legacy_exact_shape(self):
+        root = Path(self.definition["archive"]["root"])
+        archived_record = json.loads(
+            (root / version_archive.RECORD_NAME).read_text(encoding="utf-8")
+        )
+        archived_manifest = json.loads(
+            (root / version_archive.MANIFEST_NAME).read_text(encoding="utf-8")
+        )
+
+        self.assertNotIn("protocolId", archived_record)
+        self.assertNotIn("protocolId", archived_manifest["recordFields"])
+        self.assertNotIn(
+            "protocolId",
+            samplers.get_sampler(
+                self.config,
+                self.definition["samplerId"],
+                self.definition["version"],
+            ),
+        )
 
     def test_concurrent_identical_saves_share_one_archive_and_index_version(self):
         barrier = threading.Barrier(8)

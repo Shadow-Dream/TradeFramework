@@ -48,7 +48,9 @@ PIPELINE_DRAFT_FIELDS = frozenset({
     "instances",
     "stages",
     "signalGraph",
+    "protocolId",
 })
+PIPELINE_REQUIRED_DRAFT_FIELDS = PIPELINE_DRAFT_FIELDS - {"protocolId"}
 PIPELINE_MANIFEST_FIELDS = frozenset({
     "name",
     "config",
@@ -67,6 +69,7 @@ PIPELINE_VERSION_FIELDS = PIPELINE_DRAFT_FIELDS | frozenset({
     "createdAt",
     "archive",
 })
+PIPELINE_REQUIRED_VERSION_FIELDS = PIPELINE_VERSION_FIELDS - {"protocolId"}
 PIPELINE_CONTRACT_PLAN_FIELDS = frozenset({
     "inputContracts", "inputRequiredRoots", "outputContracts",
     "outputRequiredRoots", "allContracts", "allRequiredRoots",
@@ -454,8 +457,10 @@ __all__ = (
     "PIPELINE_DIRECT_OUTPUT_FIELDS",
     "PIPELINE_DIRECT_PLAN_FIELDS",
     "PIPELINE_DRAFT_FIELDS",
+    "PIPELINE_REQUIRED_DRAFT_FIELDS",
     "PIPELINE_MANIFEST_FIELDS",
     "PIPELINE_VERSION_FIELDS",
+    "PIPELINE_REQUIRED_VERSION_FIELDS",
     "OBSERVATION_INPUT_FIELDS",
     "STAGES",
     "STAGE_KINDS",

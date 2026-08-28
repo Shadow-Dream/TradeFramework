@@ -148,6 +148,18 @@ class BacktestResultRepositoryTests(unittest.TestCase):
             view["executionSummary"]["sampler"]["samplerId"],
             summary["executionChain"]["sampler"]["samplerId"],
         )
+        self.assertEqual(
+            view["executionSummary"]["pipeline"]["pipelineId"],
+            summary["executionChain"]["pipeline"]["pipelineId"],
+        )
+        self.assertEqual(
+            view["executionSummary"]["environment"]["environmentId"],
+            summary["executionChain"]["environment"]["environmentId"],
+        )
+        self.assertEqual(
+            view["executionSummary"]["analysis"]["analysisId"],
+            summary["executionChain"]["analysis"]["analysisId"],
+        )
         self.assertNotIn("executionChain", view)
         renamed = result_repository.rename_backtest(
             self.config, backtest_id, "Renamed Result"

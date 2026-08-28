@@ -123,6 +123,7 @@ def register_dataset(
             dataset={
                 "datasetId": dataset_id,
                 "name": name.strip(),
+                "protocolId": descriptor["protocolId"],
                 "source": {
                     "type": source["type"],
                     "details": copy.deepcopy(dict(source["details"])),

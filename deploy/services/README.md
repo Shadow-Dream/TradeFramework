@@ -1,24 +1,28 @@
-# Independent Mining service helper
+# Retired Mining service helper
 
 The old combined Agent Gateway / Engine / Mining offline installer has been
 removed. It targeted the deleted Python Agent Gateway, recreated obsolete
 SQLite/API/service contracts and is not a supported deployment path.
 
-This directory now contains only the independent Mining worker helper and its
-locked Python runtime requirements:
+The data-mining product surface is offline. These files are retained only as
+an unmounted implementation reference and must not be installed or started:
 
 - `mining_service_supervisor.py`
 - `mining-requirements.lock`
 
-Mining owns a separate `miningRoot`, process lock, provider configuration and
-worker lifecycle. It must not package, start or probe Agent Web.
-
 During development, TradeEngine and the Kanna-based Agent Web use the user-mode
 services described in [`deploy/user/README.md`](../user/README.md). Agent Web
 build/reload is handled by `scripts/build_agent_web.sh` and
-`scripts/reload_agent_web.sh`; it does not install or restart Mining.
+`scripts/reload_agent_web.sh`; neither service installs or restarts Mining.
 
-A future root deployment must package TradeEngine, Agent Web and Mining as
-independent release units. It must not restore `agent_gateway/**`,
+A future reactivation requires a new architecture review and an independent
+release decision. It must not restore `agent_gateway/**`,
 `trade-agent-gateway.service`, Gateway SQLite, or the retired
 `/api/agent/threads|runs|events|preferences|backends` routes.
+
+The legacy host unit is outside this repository. An administrator taking an
+existing installation offline must run exactly:
+
+```bash
+sudo systemctl disable --now trade-engine-mining-observation.service
+```

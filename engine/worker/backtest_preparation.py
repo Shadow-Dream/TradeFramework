@@ -10,11 +10,13 @@ from engine.authority import module_definition as module_definition_authority
 from engine.authority import pipeline as pipeline_authority
 from engine.authority import sampler as sampler_authority
 from engine.authority.graph_cycle import (
+    configure_verified_cycle_graph_definition_authority,
     verified_cycle_graph_execution_material,
     verify_managed_cycle_graph_definition_authority,
 )
 from engine.composition import backtest as backtest_composition
 from engine.contracts import backtest as backtest_contracts
+from engine.contracts import config_override as config_override_contracts
 from engine.contracts import strict_json
 from engine.contracts.exact_fields import require_exact_fields
 
@@ -25,6 +27,7 @@ class PreparedBacktest(NamedTuple):
     dataset_storage_authority: object
     dataset_version: dict
     environment_definition: dict
+    configuration: dict
     sampler_definition: dict
     sampler_parameters: dict
     sampler_runtime_authority: object
@@ -144,7 +147,7 @@ def prepare_backtest_execution(
     )
     environment_request = require_exact_fields(
         request["environment"],
-        allowed={"environmentId", "version"},
+        allowed={"environmentId", "version", "moduleConfigOverrides"},
         required={"environmentId", "version"},
         label="Frozen Backtest environment",
     )
@@ -178,6 +181,20 @@ def prepare_backtest_execution(
         environment_definition_authority,
         graph_label="Environment Graph",
     )
+    effective_environment_definition = (
+        config_override_contracts.apply_module_config_overrides(
+            authoritative_environment_definition,
+            environment_request.get("moduleConfigOverrides", {}),
+            label="Environment",
+        )
+    )
+    effective_environment_definition_authority = (
+        configure_verified_cycle_graph_definition_authority(
+            environment_definition_authority,
+            effective_environment_definition,
+            graph_label="Environment Graph",
+        )
+    )
     environment_module_definition_authorities = {}
     for key, definition in frozen_environment_modules.items():
         environment_module_definition_authorities[key] = (
@@ -187,7 +204,7 @@ def prepare_backtest_execution(
         )
     analysis_request = require_exact_fields(
         request["analysis"],
-        allowed={"analysisId", "version"},
+        allowed={"analysisId", "version", "moduleConfigOverrides"},
         required={"analysisId", "version"},
         label="Frozen Backtest analysis",
     )
@@ -221,6 +238,20 @@ def prepare_backtest_execution(
         analysis_definition_authority,
         graph_label="Analysis Graph",
     )
+    effective_analysis_definition = (
+        config_override_contracts.apply_module_config_overrides(
+            authoritative_analysis_definition,
+            analysis_request.get("moduleConfigOverrides", {}),
+            label="Analysis",
+        )
+    )
+    effective_analysis_definition_authority = (
+        configure_verified_cycle_graph_definition_authority(
+            analysis_definition_authority,
+            effective_analysis_definition,
+            graph_label="Analysis Graph",
+        )
+    )
     analysis_module_definition_authorities = {}
     for key, definition in frozen_analysis_modules.items():
         analysis_module_definition_authorities[key] = (
@@ -228,15 +259,55 @@ def prepare_backtest_execution(
                 config["releaseRoot"], definition
             )
         )
+    pipeline_request = require_exact_fields(
+        request["pipeline"],
+        allowed={
+            "pipelineId",
+            "version",
+            "configOverride",
+            "moduleConfigOverrides",
+        },
+        required={"pipelineId", "version"},
+        label="Frozen Backtest pipeline",
+    )
+    effective_pipeline_definition = (
+        config_override_contracts.apply_pipeline_config_override(
+            frozen_pipeline["definition"],
+            pipeline_request.get("configOverride", {}),
+            label="Pipeline",
+        )
+    )
+    effective_pipeline_definition = (
+        config_override_contracts.apply_module_config_overrides(
+            effective_pipeline_definition,
+            pipeline_request.get("moduleConfigOverrides", {}),
+            label="Pipeline",
+        )
+    )
+    effective_pipeline_manifest = (
+        config_override_contracts.apply_pipeline_manifest_overrides(
+            frozen_pipeline["definition"],
+            frozen_pipeline_manifest,
+            effective_pipeline_definition,
+        )
+    )
+    base_pipeline_contract_template = (
+        pipeline_authority.pipeline_contract_template_from_verified_authorities(
+            frozen_pipeline_manifest,
+            frozen_pipeline_modules,
+            frozen_pipeline_module_authorities,
+        )
+    )
     pipeline_contract_template = (
         pipeline_authority.pipeline_contract_template_from_validated_plan(
-            frozen_pipeline_manifest,
+            effective_pipeline_manifest,
             frozen_pipeline_modules,
             frozen_pipeline_module_authorities,
             backtest_composition.validated_backtest_artifact_pipeline_plan(
                 validated_composition_artifact
             ),
             label="Backtest composition artifact Pipeline plan",
+            identity_template=base_pipeline_contract_template,
         )
     )
     verified_composition = backtest_composition.bind_frozen_backtest_composition(
@@ -246,13 +317,15 @@ def prepare_backtest_execution(
         sampler_runtime_authority=sampler_runtime_authority,
         sampler_parameters=sampler_parameters,
         dataset_schema=backtest_composition.dataset_field_schema(dataset_version),
-        environment_definition=authoritative_environment_definition,
-        environment_definition_authority=environment_definition_authority,
+        environment_definition=effective_environment_definition,
+        environment_definition_authority=(
+            effective_environment_definition_authority
+        ),
         environment_module_definition_authorities=(
             environment_module_definition_authorities
         ),
-        analysis_definition=authoritative_analysis_definition,
-        analysis_definition_authority=analysis_definition_authority,
+        analysis_definition=effective_analysis_definition,
+        analysis_definition_authority=effective_analysis_definition_authority,
         analysis_module_definition_authorities=(
             analysis_module_definition_authorities
         ),
@@ -268,11 +341,59 @@ def prepare_backtest_execution(
         verified_composition
     )
     return PreparedBacktest(
-        analysis_definition=analysis_definition,
+        analysis_definition=effective_analysis_definition,
         dataset_name=dataset_name,
         dataset_storage_authority=dataset_storage_authority,
         dataset_version=dataset_version,
-        environment_definition=environment_definition,
+        environment_definition=effective_environment_definition,
+        configuration={
+            "sampler": {
+                "override": copy.deepcopy(sampler_parameters),
+                "effective": {
+                    **copy.deepcopy(sampler_definition["config"]),
+                    **copy.deepcopy(sampler_parameters),
+                },
+            },
+            "pipeline": {
+                "configOverride": copy.deepcopy(
+                    pipeline_request.get("configOverride", {})
+                ),
+                "moduleConfigOverrides": copy.deepcopy(
+                    pipeline_request.get("moduleConfigOverrides", {})
+                ),
+                "effectiveConfig": copy.deepcopy(
+                    effective_pipeline_definition["config"]
+                ),
+                "effectiveModuleConfigs": (
+                    config_override_contracts.effective_module_configs(
+                        effective_pipeline_definition,
+                        label="Pipeline",
+                    )
+                ),
+            },
+            "environment": {
+                "moduleConfigOverrides": copy.deepcopy(
+                    environment_request.get("moduleConfigOverrides", {})
+                ),
+                "effectiveModuleConfigs": (
+                    config_override_contracts.effective_module_configs(
+                        effective_environment_definition,
+                        label="Environment",
+                    )
+                ),
+            },
+            "analysis": {
+                "moduleConfigOverrides": copy.deepcopy(
+                    analysis_request.get("moduleConfigOverrides", {})
+                ),
+                "effectiveModuleConfigs": (
+                    config_override_contracts.effective_module_configs(
+                        effective_analysis_definition,
+                        label="Analysis",
+                    )
+                ),
+            },
+        },
         sampler_definition=sampler_definition,
         sampler_parameters=sampler_parameters,
         sampler_runtime_authority=sampler_runtime_authority,

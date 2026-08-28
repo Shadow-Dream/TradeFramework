@@ -172,6 +172,7 @@ class ApiBoundaryArchitectureTests(unittest.TestCase):
         self.assertEqual(set(vars(result_contracts)) & moved_symbols, set())
         for relative in (
             "engine/contracts/result.py",
+            "engine/contracts/result_config.py",
             "engine/contracts/result_execution.py",
         ):
             with self.subTest(path=relative):

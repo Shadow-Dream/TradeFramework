@@ -178,8 +178,9 @@ def archive_if_changed(
             **recovered_archive,
             "manifestDigest": sealed["manifestDigest"],
         }
+        sealed_record_fields = set(sealed["recordFields"])
         if (
-            set(recovered_record) != expected_record_fields
+            set(recovered_record) != sealed_record_fields
             or recovered_record.get(identity_key) != identity
             or recovered_record.get("version") != version
             or recovered_record.get("status") != ARCHIVED_STATUS

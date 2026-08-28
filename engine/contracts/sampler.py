@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional
 
 from engine.contracts import strict_json
+from engine.contracts.protocol import PROTOCOL_ID_FIELD
 from engine.contracts.contract_reducer import write_contract_state
 from engine.contracts.data_compatibility import schemas_compatible
 from engine.contracts.data_model import (
@@ -18,7 +19,7 @@ from engine.contracts.data_model import (
 )
 
 
-SAMPLER_DRAFT_FIELDS = frozenset({
+LEGACY_SAMPLER_DRAFT_FIELDS = frozenset({
     "samplerId",
     "name",
     "type",
@@ -28,7 +29,10 @@ SAMPLER_DRAFT_FIELDS = frozenset({
     "source",
     "entryPoint",
 })
-SAMPLER_VERSION_FIELDS = SAMPLER_DRAFT_FIELDS | frozenset({
+SAMPLER_DRAFT_FIELDS = LEGACY_SAMPLER_DRAFT_FIELDS | frozenset({
+    PROTOCOL_ID_FIELD,
+})
+LEGACY_SAMPLER_VERSION_FIELDS = LEGACY_SAMPLER_DRAFT_FIELDS | frozenset({
     "runtime",
     "builtin",
     "version",
@@ -36,6 +40,9 @@ SAMPLER_VERSION_FIELDS = SAMPLER_DRAFT_FIELDS | frozenset({
     "contentDigest",
     "createdAt",
     "archive",
+})
+SAMPLER_VERSION_FIELDS = LEGACY_SAMPLER_VERSION_FIELDS | frozenset({
+    PROTOCOL_ID_FIELD,
 })
 
 

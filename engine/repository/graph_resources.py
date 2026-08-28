@@ -220,7 +220,11 @@ def _archive_if_changed_locked(
         prepare_staging=prepare_staging,
         create_record=create_record,
         record_fields=(
-            set(spec["draftFields"])
+            (
+                set(spec["draftFields"])
+                if "protocolId" in payload
+                else set(spec["draftFields"]) - {"protocolId"}
+            )
             | {
                 "version",
                 "builtin",

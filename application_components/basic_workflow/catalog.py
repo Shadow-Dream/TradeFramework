@@ -29,7 +29,6 @@ COMPONENT_IDS = {
     "analysis": (
         "cycle-count-analyzer",
         "numeric-change-analyzer",
-        "performance-metrics-analyzer",
     ),
 }
 

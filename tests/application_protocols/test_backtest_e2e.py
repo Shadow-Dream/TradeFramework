@@ -125,15 +125,21 @@ class BasicWorkflowBacktestIntegrationTests(unittest.TestCase):
             },
         )["definition"]
 
-    def _project_result(self, backtest_id):
+    def _project_result(self, backtest_id, *, paths=None, temporary_modules=None):
+        temporary_modules = temporary_modules or []
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "projection.json"
             result_projection.write_backtest_result_slice(
                 self.config,
                 backtest_id,
-                ["cycles", "metrics", "dataKeys"],
-                [],
+                paths or ["cycles", "metrics", "dataKeys"],
+                temporary_modules,
                 destination,
+                module_definitions_loader=(
+                    lambda: module_definitions.load_pipeline_definitions(self.config)
+                    if temporary_modules
+                    else None
+                ),
             )
             return json.loads(destination.read_text(encoding="utf-8"))
 
@@ -191,7 +197,10 @@ class BasicWorkflowBacktestIntegrationTests(unittest.TestCase):
             "environmentId",
             environment_presets.BASIC_WORKFLOW_ENVIRONMENT_ID,
         )
-        analysis = self._installed("analysisId", analysis_presets.NEUTRAL_ANALYSIS_ID)
+        analysis = self._installed(
+            "analysisId",
+            analysis_presets.BASIC_WORKFLOW_ANALYSIS_ID,
+        )
         request = {
             "pipeline": {"pipelineId": pipeline["pipelineId"], "version": pipeline["version"]},
             "datasetId": dataset["datasetId"],
@@ -204,6 +213,9 @@ class BasicWorkflowBacktestIntegrationTests(unittest.TestCase):
             "environment": {
                 "environmentId": environment["environmentId"],
                 "version": environment["version"],
+                "moduleConfigOverrides": {
+                    "account": {"executionPeriod": "day"}
+                },
             },
             "analysis": {"analysisId": analysis["analysisId"], "version": analysis["version"]},
         }
@@ -213,7 +225,46 @@ class BasicWorkflowBacktestIntegrationTests(unittest.TestCase):
         self.assertEqual(completed["metrics"]["cycleCount"], 3)
 
         result = self._project_result(completed["backtestId"])
+        self.assertEqual(
+            set(result["dataKeys"]),
+            {
+                "execution",
+                "execution.orders",
+                "intent",
+                "intent.approved",
+                "intent.requested",
+                "portfolio",
+                "portfolio.account",
+                "portfolio.account.cash",
+                "portfolio.account.equity",
+                "portfolio.account.positions",
+                "price",
+                "signal",
+                "signal.scores",
+                "time",
+                "universe",
+                "universe.selected",
+            },
+        )
         first, second, third = [cycle["data"] for cycle in result["cycles"]]
+        self.assertEqual(
+            [
+                cycle["data"]["price"]["day"]["SPY"]["eventTime"]
+                for cycle in result["cycles"]
+            ],
+            [
+                "2026-01-02T21:00:00Z",
+                "2026-01-05T21:00:00Z",
+                "2026-01-06T21:00:00Z",
+            ],
+        )
+        self.assertTrue(
+            all(
+                set(cycle["data"]["price"]["day"]["SPY"])
+                == {"eventTime", "open", "close", "high", "low"}
+                for cycle in result["cycles"]
+            )
+        )
         self.assertEqual(first["execution"]["orders"], {})
         self.assertEqual(first["intent"]["approved"], {"QQQ": 2.0, "SPY": 2.0})
         self.assertEqual(
@@ -228,13 +279,57 @@ class BasicWorkflowBacktestIntegrationTests(unittest.TestCase):
         self.assertEqual(third["execution"]["orders"], {})
         self.assertEqual(third["portfolio"]["account"]["equity"], 100224.0)
         self.assertNotIn("analysis", third)
-        for data_key in (
-            "price",
-            "portfolio.account",
-            "execution.orders",
-            "intent.approved",
-        ):
-            self.assertIn(data_key, result["dataKeys"])
+
+        def latest_signal(module_id):
+            matches = [
+                definition
+                for definition in definitions
+                if definition["kind"] == "Signal"
+                and definition["moduleId"] == module_id
+            ]
+            self.assertTrue(matches)
+            return max(matches, key=lambda item: int(item["version"]))
+
+        selector = latest_signal("basic-price-close-selector")
+        sma = latest_signal("sma-indicator")
+        temporary_modules = [
+            {
+                "instanceId": "basic-indicator-price-close",
+                "kind": "Signal",
+                "moduleId": selector["moduleId"],
+                "version": selector["version"],
+                "config": {
+                    "decisionPeriod": "day",
+                    "instrumentId": "SPY",
+                },
+                "inputs": {"price": "price"},
+                "outputs": {"close": "indicator.source.close"},
+            },
+            {
+                "instanceId": "basic-indicator-sma-1",
+                "kind": "Signal",
+                "moduleId": sma["moduleId"],
+                "version": sma["version"],
+                "config": {"period": 2},
+                "inputs": {"value": "indicator.source.close"},
+                "outputs": {"sma": "indicator.basic.sma.1.sma"},
+            },
+        ]
+        indicator_result = self._project_result(
+            completed["backtestId"],
+            paths=[
+                "cycles.decisionTime",
+                "cycles.data.indicator.basic.sma.1.sma",
+            ],
+            temporary_modules=temporary_modules,
+        )
+        self.assertEqual(
+            [
+                cycle["data"]["indicator"]["basic"]["sma"]["1"]["sma"]
+                for cycle in indicator_result["cycles"]
+            ],
+            [None, 151.0, 251.0],
+        )
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from engine.contracts.pipeline import (
     PIPELINE_VERSION_FIELDS,
     pipeline_manifest_digest,
 )
+from engine.contracts.protocol import normalize_protocol_id
 from engine.core import clock as engine_clock
 from engine.core import resource_ids
 from engine.repository import control_state
@@ -163,6 +164,11 @@ def _archive_pipeline_if_changed_locked(config, request):
             "currentVersion": record["version"],
             "manifestHash": record["manifestHash"],
             "updatedAt": record["createdAt"],
+            **(
+                {"protocolId": record["protocolId"]}
+                if "protocolId" in record
+                else {}
+            ),
         }
         pipeline_repository.save_pipeline_store(config, store)
 
@@ -182,7 +188,11 @@ def _archive_pipeline_if_changed_locked(config, request):
         destination_for_version=destination_for_version,
         prepare_staging=prepare_staging,
         create_record=create_record,
-        record_fields=PIPELINE_VERSION_FIELDS,
+        record_fields=(
+            PIPELINE_VERSION_FIELDS
+            if "protocolId" in draft
+            else PIPELINE_VERSION_FIELDS - {"protocolId"}
+        ),
         write_record=write_record,
         commit_record=commit_record,
         read_committed_record=read_committed_record,
@@ -238,7 +248,7 @@ def rename_pipeline(config, pipeline_id, name):
 def create_pipeline(config, request):
     require_exact_fields(
         request,
-        allowed={"name"},
+        allowed={"name", "protocolId"},
         required={"name"},
         label="Create Pipeline request",
     )
@@ -247,6 +257,12 @@ def create_pipeline(config, request):
         raise ValueError("Pipeline name is required.")
     if len(name) > 120:
         raise ValueError("Pipeline name must be 120 characters or fewer.")
+    protocol_fields = {}
+    if "protocolId" in request:
+        protocol_fields["protocolId"] = normalize_protocol_id(
+            request["protocolId"],
+            label="Create Pipeline request protocolId",
+        )
     with control_state.control_state_lock(config):
         pipelines = pipeline_repository.load_pipelines(config)
         pipeline_id = resource_ids.new_resource_id("pipeline")
@@ -263,6 +279,7 @@ def create_pipeline(config, request):
                 "instances": {},
                 "stages": {},
                 "signalGraph": {"nodes": [], "inputs": {}, "outputs": {}},
+                **protocol_fields,
             },
         )
 

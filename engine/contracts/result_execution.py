@@ -6,6 +6,7 @@ import copy
 import math
 
 from engine.contracts import strict_json
+from engine.contracts import result_config as result_config_contracts
 from engine.contracts.backtest import (
     BACKTEST_EXECUTION_SNAPSHOT_FIELDS,
     BACKTEST_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
@@ -21,7 +22,6 @@ from engine.contracts.data_model import (
 from engine.contracts.digest import is_sha256_digest
 from engine.contracts.module import PROTOCOL_VERSION, require_exact_fields
 from engine.contracts.observation_input import normalize_pipeline_config
-
 
 def _nonnegative_number(value, label):
     if (
@@ -324,7 +324,7 @@ def require_execution_chain(execution_chain):
         execution_chain,
         allowed={
             "snapshotHash", "dataset", "sampler", "environment",
-            "pipeline", "analysis", "timings",
+            "pipeline", "analysis", "configuration", "timings",
         },
         required={
             "snapshotHash", "dataset", "sampler", "environment",
@@ -378,6 +378,8 @@ def require_execution_chain(execution_chain):
         identity_field="analysisId",
         runtime_type="AnalysisGraph",
     )
+    if "configuration" in execution_chain:
+        result_config_contracts.require_configuration(execution_chain["configuration"])
     _require_timings(execution_chain["timings"])
     return execution_chain
 
@@ -389,10 +391,14 @@ def require_snapshot_match(execution_chain, execution_snapshot):
         required=BACKTEST_EXECUTION_SNAPSHOT_FIELDS,
         label="Stored execution snapshot",
     )
+    snapshot_schema_version = execution_snapshot["schemaVersion"]
     if (
-        type(execution_snapshot["schemaVersion"]) is not int
-        or execution_snapshot["schemaVersion"]
-        != BACKTEST_EXECUTION_SNAPSHOT_SCHEMA_VERSION
+        type(snapshot_schema_version) is not int
+        or snapshot_schema_version
+        not in {
+            result_config_contracts.LEGACY_SNAPSHOT_SCHEMA_VERSION,
+            BACKTEST_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
+        }
     ):
         raise ValueError("Stored execution snapshot schemaVersion is invalid.")
     unsigned_snapshot = {
@@ -404,24 +410,35 @@ def require_snapshot_match(execution_chain, execution_snapshot):
         raise ValueError("Stored execution snapshot hash is invalid.")
     require_artifact(execution_snapshot["compositionArtifact"])
     execution_inputs = copy.deepcopy(execution_snapshot["executionInputs"])
-    require_exact_fields(
-        execution_inputs,
-        allowed={
-            "pipeline", "datasetId", "datasetVersionId", "sampler", "environment",
-            "analysis", "limit",
-        },
-        required={
-            "pipeline", "datasetId", "datasetVersionId", "sampler", "environment",
-            "analysis", "limit",
-        },
-        label="Stored execution inputs",
-    )
-    normalized_inputs = copy.deepcopy(execution_inputs)
-    if normalized_inputs["limit"] is None:
-        normalized_inputs.pop("limit")
+    if (
+        snapshot_schema_version
+        == result_config_contracts.LEGACY_SNAPSHOT_SCHEMA_VERSION
+    ):
+        expected_execution_inputs = (
+            result_config_contracts.legacy_backtest_execution_inputs(
+                execution_inputs
+            )
+        )
+    else:
+        require_exact_fields(
+            execution_inputs,
+            allowed={
+                "pipeline", "datasetId", "datasetVersionId", "sampler",
+                "environment", "analysis", "limit",
+            },
+            required={
+                "pipeline", "datasetId", "datasetVersionId", "sampler",
+                "environment", "analysis", "limit",
+            },
+            label="Stored execution inputs",
+        )
+        normalized_inputs = copy.deepcopy(execution_inputs)
+        if normalized_inputs["limit"] is None:
+            normalized_inputs.pop("limit")
+        expected_execution_inputs = backtest_execution_inputs(normalized_inputs)
     _require_snapshot_value_match(
         execution_inputs,
-        backtest_execution_inputs(normalized_inputs),
+        expected_execution_inputs,
         label="Stored execution inputs",
         message="Stored execution inputs are invalid.",
     )
@@ -449,6 +466,45 @@ def require_snapshot_match(execution_chain, execution_snapshot):
             message=(
                 "Result executionChain does not match its stored execution "
                 "snapshot."
+            ),
+        )
+    if (
+        snapshot_schema_version
+        == result_config_contracts.LEGACY_SNAPSHOT_SCHEMA_VERSION
+    ):
+        expected_configuration = (
+            result_config_contracts.snapshot_configuration_v12(
+                execution_snapshot,
+                execution_inputs,
+            )
+        )
+        has_configuration_override = any(
+            "configOverride" in execution_inputs[resource]
+            for resource in ("pipeline", "environment", "analysis")
+        )
+    else:
+        expected_configuration = result_config_contracts.snapshot_configuration_v13(
+            execution_snapshot,
+            execution_inputs,
+        )
+        has_configuration_override = (
+            "configOverride" in execution_inputs["pipeline"]
+            or any(
+                "moduleConfigOverrides" in execution_inputs[resource]
+                for resource in ("pipeline", "environment", "analysis")
+            )
+        )
+    if has_configuration_override and "configuration" not in execution_chain:
+        raise ValueError(
+            "Result executionChain is missing its frozen configuration."
+        )
+    if "configuration" in execution_chain:
+        _require_snapshot_value_match(
+            execution_chain["configuration"],
+            expected_configuration,
+            label="Result configuration",
+            message=(
+                "Result executionChain does not match its stored execution snapshot."
             ),
         )
     identity_checks = (

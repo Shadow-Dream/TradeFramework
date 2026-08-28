@@ -158,13 +158,16 @@ def _series(dataset, relative_path):
 
 def sample_basic_price_map(dataset, parameters):
     _descriptor(dataset)
-    if type(parameters) is not dict or set(parameters) != {"decisionPeriod"}:
-        raise ValueError("Basic Workflow Sampler parameters require decisionPeriod only.")
-    decision_period = parameters["decisionPeriod"]
-    if type(decision_period) is not str or not _SEGMENT.fullmatch(decision_period):
-        raise ValueError("Basic Workflow decisionPeriod is invalid.")
     files = _index(dataset)
-    if decision_period not in files:
+    if type(parameters) is not dict or not set(parameters).issubset({"decisionPeriod"}):
+        raise ValueError("Basic Workflow Sampler parameters allow decisionPeriod only.")
+    decision_period = parameters.get("decisionPeriod")
+    if decision_period is not None and (
+        type(decision_period) is not str
+        or not _SEGMENT.fullmatch(decision_period)
+    ):
+        raise ValueError("Basic Workflow decisionPeriod is invalid.")
+    if decision_period is not None and decision_period not in files:
         raise ValueError("Basic Workflow decisionPeriod is absent from the Dataset.")
 
     series = {
@@ -174,6 +177,27 @@ def sample_basic_price_map(dataset, parameters):
         }
         for period, instruments in sorted(files.items())
     }
+    if decision_period is None:
+        timeline_sizes = {
+            period: len({
+                time
+                for instrument_series in instruments.values()
+                for time, _bar, _row in instrument_series
+            })
+            for period, instruments in series.items()
+        }
+        largest_timeline = max(timeline_sizes.values())
+        candidates = sorted(
+            period
+            for period, size in timeline_sizes.items()
+            if size == largest_timeline
+        )
+        if len(candidates) != 1:
+            raise ValueError(
+                "Basic Workflow decisionPeriod cannot be inferred because the "
+                "largest Dataset timelines are tied: " + ", ".join(candidates) + "."
+            )
+        decision_period = candidates[0]
     timeline = sorted({
         time
         for instrument_series in series[decision_period].values()
@@ -204,7 +228,12 @@ def sample_basic_price_map(dataset, parameters):
                 if cursor < 0:
                     continue
                 bar_time, bar, row_number = rows[cursor]
-                period_values[instrument] = dict(bar)
+                # Observation time is part of the DataKey value.  Consumers
+                # must never infer it from the cycle's later decision clock.
+                period_values[instrument] = {
+                    "eventTime": _canonical(bar_time),
+                    **bar,
+                }
                 provenance["price." + period + "." + instrument] = {
                     "sourcePath": files[period][instrument],
                     "sourceRow": row_number,

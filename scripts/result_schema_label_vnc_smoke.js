@@ -3,11 +3,25 @@ const puppeteer = require('/root/.npm/_npx/7d92d9a2d2ccc630/node_modules/puppete
 
 const BASE = process.env.TRADE_WEB_BASE || 'http://127.0.0.1:30808';
 const DATASET_ID = process.env.TRADE_TEST_DATASET_ID || '';
+const BACKTEST_ID = process.env.TRADE_TEST_BACKTEST_ID || '';
+const EXPECTED_VISUALIZERS = [
+  'drawing.brush',
+  'drawing.horizontalLine',
+  'drawing.rectangle',
+  'drawing.text',
+  'drawing.trendLine',
+  'ohlc.candles',
+  'overlay.markers',
+  'overlay.priceLine',
+  'series.histogram',
+  'series.line',
+  'series.scatter',
+];
 
 function createSession() {
   const code = [
     'import json, secrets, time',
-    'from engine.control import api as control; from engine.control import auth as trade_auth',
+    'from engine.service import control_api as control; from engine.control import auth as trade_auth',
     'config = control.load_config(".runtime/strategy-control.json")',
     'trade_auth.ensure_default_user(config)',
     'token, csrf, now = secrets.token_urlsafe(32), secrets.token_urlsafe(32), int(time.time())',
@@ -22,7 +36,7 @@ function createSession() {
 
 function deleteSession(token) {
   const code = [
-    'from engine.control import api as control; from engine.control import auth as trade_auth; import sys',
+    'from engine.service import control_api as control; from engine.control import auth as trade_auth; import sys',
     'config = control.load_config(".runtime/strategy-control.json")',
     'with trade_auth.connect(config) as connection:',
     '    connection.execute("DELETE FROM sessions WHERE token_hash = ?", (trade_auth.opaque_token_hash(sys.argv[1]),))',
@@ -60,16 +74,20 @@ async function main() {
   });
 
   await page.goto(`${BASE}/backtests`, { waitUntil: 'networkidle2', timeout: 30000 });
-  await page.waitForFunction((datasetId) => (
+  await page.waitForFunction((selection) => (
     (window.__tradeState?.backtests || []).some((row) => (
-      row.visualizable && (!datasetId || row.datasetId === datasetId)
+      row.visualizable
+        && (!selection.backtestId || row.backtestId === selection.backtestId)
+        && (!selection.datasetId || row.datasetId === selection.datasetId)
     ))
-  ), { timeout: 30000 }, DATASET_ID);
-  const backtestId = await page.evaluate((datasetId) => (
+  ), { timeout: 30000 }, { backtestId: BACKTEST_ID, datasetId: DATASET_ID });
+  const backtestId = await page.evaluate((selection) => (
     (window.__tradeState?.backtests || []).find((row) => (
-      row.visualizable && (!datasetId || row.datasetId === datasetId)
+      row.visualizable
+        && (!selection.backtestId || row.backtestId === selection.backtestId)
+        && (!selection.datasetId || row.datasetId === selection.datasetId)
     ))?.backtestId || ''
-  ), DATASET_ID);
+  ), { backtestId: BACKTEST_ID, datasetId: DATASET_ID });
   assert(backtestId, 'No visualizable backtest is available');
   await page.goto(`${BASE}/result?backtestId=${encodeURIComponent(backtestId)}`, { waitUntil: 'networkidle2', timeout: 30000 });
   await page.waitForFunction((expected) => window.__tradeState?.selectedBacktest?.backtestId === expected,
@@ -82,21 +100,77 @@ async function main() {
     const candle = catalog.find((item) => item.id === 'ohlc.candles');
     const line = catalog.find((item) => item.id === 'series.line');
     const candlePaths = (candle?.optionMap?.dataKey || []).map((item) => item.value);
+    const declaration = (path, schema) => ({
+      label: path,
+      schema,
+      source: { path: `cycles.data.${path}` },
+      encoding: { value: `data.${path}` },
+    });
+    const ohlcProperties = {
+      open: { type: 'number' },
+      high: { type: 'number' },
+      low: { type: 'number' },
+      close: { type: 'number' },
+    };
+    const strictContractCatalog = window.TradeChartCore.visualizerCatalog({ dataKeys: {
+      'strict.candle': declaration('strict.candle', {
+        type: 'object',
+        properties: { eventTime: { type: 'string' }, ...ohlcProperties },
+        required: ['eventTime', 'open', 'high', 'low', 'close'],
+        additionalProperties: false,
+      }),
+      'legacy.ohlc': declaration('legacy.ohlc', {
+        type: 'object',
+        properties: ohlcProperties,
+        required: ['open', 'high', 'low', 'close'],
+        additionalProperties: false,
+      }),
+      'explicit.time': declaration('explicit.time', { type: 'string' }),
+      'explicit.value': declaration('explicit.value', { type: 'number' }),
+    } }, {});
+    const strictCandlePaths = (strictContractCatalog
+      .find((item) => item.id === 'ohlc.candles')?.optionMap?.dataKey || [])
+      .map((item) => item.value);
+    const strictLine = strictContractCatalog.find((item) => item.id === 'series.line');
     return {
       definitionCount: catalog.length,
+      definitionIds: catalog.map((item) => item.id).sort(),
       ohlcPath: candlePaths[0] || '',
       candlePaths,
       linePaths: (line?.optionMap?.dataKey || []).map((item) => item.value),
+      lineTimePaths: (line?.optionMap?.timeKey || []).map((item) => item.value),
+      strictCandlePaths,
+      strictLineDataPaths: (strictLine?.optionMap?.dataKey || []).map((item) => item.value),
+      strictLineTimePaths: (strictLine?.optionMap?.timeKey || []).map((item) => item.value),
+      candleRequiredFields: candle?.inputPorts?.dataKey?.schema?.required || [],
+      lineRequiredParams: line?.paramsSchema?.required || [],
     };
   });
 
-  assert(catalogAudit.definitionCount === 6, 'Visualizer definitions were not loaded from the service', catalogAudit);
-  assert(catalogAudit.ohlcPath, 'Selected result has no structured OHLC DataKey', catalogAudit);
+  assert(catalogAudit.definitionCount === EXPECTED_VISUALIZERS.length
+    && JSON.stringify(catalogAudit.definitionIds) === JSON.stringify(EXPECTED_VISUALIZERS),
+  'The expected Visualizer definitions were not loaded from the service', catalogAudit);
+  assert(catalogAudit.candleRequiredFields.includes('eventTime'),
+    'Candles do not explicitly require eventTime in their requested DataKey', catalogAudit);
+  assert(catalogAudit.strictCandlePaths.includes('strict.candle')
+    && !catalogAudit.strictCandlePaths.includes('legacy.ohlc'),
+  'Candles did not reject the legacy OHLC-only contract or accept explicit eventTime', catalogAudit);
+  assert(['timeKey', 'timeDomainId', 'priceScaleId'].every((name) => (
+    catalogAudit.lineRequiredParams.includes(name)
+  )), 'Line does not require explicit time and coordinate-domain parameters', catalogAudit);
+  assert(catalogAudit.strictLineDataPaths.includes('explicit.value')
+    && catalogAudit.strictLineTimePaths.includes('explicit.time'),
+  'Line does not expose separate compatible Data and Time bindings', catalogAudit);
+  assert(catalogAudit.ohlcPath,
+    'Selected Result has no Candle-compatible DataKey with explicit eventTime; rerun it with a current Sampler contract',
+    catalogAudit);
   assert(catalogAudit.candlePaths.includes(catalogAudit.ohlcPath),
-    'Candles rejected a compatible structured object DataKey', catalogAudit);
+    'Candles rejected an explicitly timed structured DataKey', catalogAudit);
   assert(catalogAudit.linePaths.includes(`${catalogAudit.ohlcPath}.close`)
     && !catalogAudit.linePaths.includes(catalogAudit.ohlcPath),
   'Line did not distinguish a numeric leaf from its object parent', catalogAudit);
+  assert(catalogAudit.lineTimePaths.length > 0,
+    'Selected Result exposes no explicit string DataKey for the Line Time binding', catalogAudit);
   assert(pageErrors.length === 0, 'Browser page errors occurred', pageErrors);
   assert(failedResponses.length === 0, 'Browser received server errors', failedResponses);
 

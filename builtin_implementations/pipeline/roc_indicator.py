@@ -7,10 +7,10 @@ class RocIndicator(SignalModule):
         price = number(price)
         if price is None:
             return {"roc": None}
-        size = period(self.config, default=12)
+        size = period(self.config, default=9)
         values = self.state.setdefault("values", [])
         values.append(price)
         if len(values) <= size:
             return {"roc": None}
         previous = values.pop(0)
-        return {"roc": price / previous - 1.0 if previous else None}
+        return {"roc": 100.0 * (price / previous - 1.0) if previous else None}

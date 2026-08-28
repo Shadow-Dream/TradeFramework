@@ -6,10 +6,9 @@ The user preview runs the current working tree as two same-host services:
 - Agent Web: `http://10.130.130.66:30810`
 
 TradeEngine control, release, live, session, and database state remain isolated
-under `.runtime/preview`. Mining evidence lives in the current account's
-repository-external `/file/share/data_jyz/.trade-engine-preview-mining` root, as
-required by Mining's source/evidence isolation contract. The Engine supervises the preview-only Mining worker;
-Engine BuiltIns are installed through the normal immutable publication flow.
+under `.runtime/preview`. The data-mining feature is offline and is neither
+mounted nor supervised by the preview Engine. Engine BuiltIns are installed
+through the normal immutable publication flow.
 Private strategy Projects and their resources are installed separately and are
 declared through the server-owned `TRADE_AGENT_PROJECTS_JSON` setting. Agent Web uses its clean `~/.trade-agent` Event Store
 and the locally installed Claude Code/Codex credentials. The two browser apps

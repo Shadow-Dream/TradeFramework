@@ -96,8 +96,10 @@ time,open,close,high,low
 和逗号分隔。`time` 是 K 线结束时间，使用带绝对时区的 ISO-8601，严格递增且不能重复。
 OHLC 必须是有限正数，并满足 `low <= min(open, close) <= max(open, close) <= high`。
 
-Sampler 按配置的决策周期对这些表格做时间对齐，并转换为下一节定义的输出。Engine 只把
-目录作为不可变 Dataset 封存，不解释目录名、文件名或表格列。
+Sampler 按决策周期对这些表格做时间对齐，并转换为下一节定义的输出。未显式配置
+`decisionPeriod` 时，从 Dataset 各周期的实际时间轴中选择唯一拥有最多时点的周期；最多时点
+并列时必须显式配置，避免猜错时间轴。显式配置始终优先。
+Engine 只把目录作为不可变 Dataset 封存，不解释目录名、文件名或表格列。
 
 ## 4. Sampler
 
@@ -385,7 +387,9 @@ Analysis(t)
 Basic Workflow v2 已由普通应用层资源实现，不包含 TradeEngine 特殊执行路径：
 
 - Dataset Adapter 校验并封存上述目录、CSV 表头、绝对时间、严格时序和 OHLC 约束；
-- `basic-price-map-sampler` 按 `decisionPeriod` 生成 cycle，并对多个周期、多个标的做可见数据对齐；
+- `basic-price-map-sampler` 是唯一的通用因果 Sampler：默认从 Dataset 推断唯一最密集的时间轴，
+  也可由 `decisionPeriod` 覆盖，并对多个周期、多个标的做可见数据对齐；它只输出 `time` 和
+  `price` 两个顶层 DataKey；
 - `basic-multi-asset-bar-account` 在 Module lifecycle state 中维护 cash 和 positions，在下一根
   execution bar 的 open 执行上一周期获批目标，并按当前 close 估值；
 - `basic-price-map-universe`、`basic-neutral-score-map`、

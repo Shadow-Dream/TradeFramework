@@ -11,8 +11,10 @@ from builtin_implementations import resources as builtin_resources
 import engine_service
 from dataset_adapters import ohlcv
 from engine.control import database as engine_database
+from engine.compiler import environment as environment_compiler
 from engine.contracts import sampler as sampler_contracts
 from engine.repository import datasets
+from engine.repository import graph_resources
 from engine.repository import module_definitions
 from engine.repository import pipelines as pipeline_repository
 from engine.repository import samplers
@@ -42,6 +44,20 @@ class BacktestRuntimeFixture:
         }
         engine_database.prepare_database(self.config)
         builtin_resources.install(self.config)
+        graph_resources.archive_if_changed(
+            self.config,
+            "environment",
+            {
+                "schemaVersion": 2,
+                "environmentId": environment_presets.NEUTRAL_ENVIRONMENT_ID,
+                "name": "Test Empty Environment",
+                "description": "Test-local empty Environment fixture.",
+                "instances": {},
+                "graph": {"nodes": [], "inputs": {}, "outputs": {}},
+            },
+            module_definitions={},
+            validate=environment_compiler.validate_environment_definition_authority,
+        )
         rows = [
             {
                 "date": "2026-01-01",

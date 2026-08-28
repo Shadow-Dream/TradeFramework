@@ -1,5 +1,8 @@
 # K Line Mining
 
+> 状态：离线参考。TradeEngine 当前不挂载本功能、不接受 Mining 配置、不启动
+> worker，也不提供浏览器或 HTTP API。重新上线前必须重新完成数据正确性与部署评审。
+
 This subsystem accumulates provider-native minute pages for long-running use. It is deliberately independent from Engine Dataset storage and publishing: collection writes only beneath `miningRoot`, and no collected job is automatically interpreted or published as a Dataset.
 
 ## Data boundary
@@ -35,7 +38,7 @@ provider/transport failure -> retry_wait or blocked
 - Optional `continuityStep` is a numeric distance in the provider's own event-time unit. It enables generic gap indexing; it does not imply any field names or calendar. A provider can construct an opaque refill cursor for a selected gap.
 - Gap maintenance is incremental: only predecessor/successor neighborhoods touched by new or revised event times are re-evaluated. Distant gaps are not scanned or rewritten.
 
-When explicitly enabled, the Engine service supervises the worker as a separate process and restarts unexpected exits with bounded backoff. `miningAutoStart` defaults to `false`, so installing this code does not add a process or require HTTPX for existing Engine instances. A standalone worker can be managed by systemd instead; its single-writer lock causes the embedded supervisor to stand down.
+The retained standalone worker code is not part of the active TradeEngine product contract.
 
 ## Providers and reused components
 
@@ -111,24 +114,6 @@ python3 -m mining --config .runtime/strategy-control.json list
 python3 -m mining --config .runtime/strategy-control.json health
 python3 -m mining --config .runtime/strategy-control.json integrity
 python3 -m mining --config .runtime/strategy-control.json export JOB_ID /tmp/provider-native.jsonl
-```
-
-Authenticated UI APIs:
-
-```text
-GET  /api/mining/providers
-GET  /api/mining/health
-GET  /api/mining/jobs
-GET  /api/mining/jobs/{jobId}
-GET  /api/mining/jobs/{jobId}/records
-GET  /api/mining/jobs/{jobId}/gaps
-GET  /api/mining/jobs/{jobId}/manifest
-GET  /api/mining/events
-POST /api/mining/jobs
-POST /api/mining/jobs/{jobId}/pause
-POST /api/mining/jobs/{jobId}/resume
-POST /api/mining/jobs/{jobId}/run-now
-POST /api/mining/jobs/{jobId}/gaps/{gapId}/refill
 ```
 
 Publishing is intentionally absent. A later adapter may read a frozen provider-native export and call the Engine's general Dataset capability, but it must not make the mining store a Dataset implementation or add provider fields to the Engine contract.

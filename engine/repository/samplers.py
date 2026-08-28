@@ -19,6 +19,7 @@ from engine.contracts.data_model import (
     schema_types,
 )
 from engine.contracts.exact_fields import require_exact_fields
+from engine.contracts.protocol import PROTOCOL_ID_FIELD, normalize_protocol_id
 from engine.control import database as engine_database
 from engine.core import resource_ids
 from engine.repository import control_state
@@ -84,9 +85,16 @@ def _sampler_from_row(config, row):
     require_exact_fields(
         archived,
         allowed=sampler_contracts.SAMPLER_VERSION_FIELDS,
-        required=sampler_contracts.SAMPLER_VERSION_FIELDS,
+        required=sampler_contracts.LEGACY_SAMPLER_VERSION_FIELDS,
         label=f"Sampler Version {row['sampler_id']}@{row['version']}",
     )
+    if PROTOCOL_ID_FIELD in archived:
+        normalize_protocol_id(
+            archived[PROTOCOL_ID_FIELD],
+            label=(
+                f"Sampler Version {row['sampler_id']}@{row['version']} protocolId"
+            ),
+        )
     expected = {
         "samplerId": row["sampler_id"],
         "version": row["version"],
@@ -252,6 +260,11 @@ def _save_sampler_locked(config, request, *, engine_owned):
         raise ValueError("Sampler source must be a string.")
     if not isinstance(request["entryPoint"], str):
         raise ValueError("Sampler entryPoint must be a string.")
+    if PROTOCOL_ID_FIELD in request:
+        normalize_protocol_id(
+            request[PROTOCOL_ID_FIELD],
+            label="Sampler Draft protocolId",
+        )
     requested_id = (request.get("samplerId") or "").strip()
     sampler_id = (
         resource_ids.normalize_resource_id(requested_id)
@@ -302,6 +315,8 @@ def _save_sampler_locked(config, request, *, engine_owned):
         "runtime": runtime,
         "builtin": engine_owned,
     }
+    if PROTOCOL_ID_FIELD in request:
+        draft[PROTOCOL_ID_FIELD] = request[PROTOCOL_ID_FIELD]
     with engine_database.connect_database(config) as connection:
         existing_rows = connection.execute(
             "SELECT * FROM sampler_definitions WHERE sampler_id = ?",
@@ -407,7 +422,11 @@ def _save_sampler_locked(config, request, *, engine_owned):
         destination_for_version=destination_for_version,
         prepare_staging=prepare_staging,
         create_record=create_record,
-        record_fields=sampler_contracts.SAMPLER_VERSION_FIELDS,
+        record_fields=(
+            sampler_contracts.SAMPLER_VERSION_FIELDS
+            if PROTOCOL_ID_FIELD in draft
+            else sampler_contracts.LEGACY_SAMPLER_VERSION_FIELDS
+        ),
         write_record=write_record,
         commit_record=commit_record,
         read_committed_record=read_committed_record,

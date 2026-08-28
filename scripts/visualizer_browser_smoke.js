@@ -11,7 +11,7 @@ const styles = fs.readFileSync("web/styles.css", "utf8")
 
 assert(html.includes('id="visualizerRepositoryBrowser"'), "Visualizer must mount the shared Resource Browser")
 assert(!html.includes("visualizerBrowserList") && !html.includes("visualizerBrowserDetails"), "Legacy Visualizer browser DOM remains")
-assert(html.indexOf('data-view="mining-kline"') < html.indexOf('id="agentNavLink"'), "Agent navigation must follow Mining")
+assert(!html.includes('data-view="mining-kline"') && !app.includes('/api/mining/'), "Retired Mining surface remains")
 assert(app.includes('visualizers: "visualizerRepositoryBrowser"'), "Visualizer repository is absent from the common browser registry")
 assert(app.includes('readOnly: repository === "visualizers"'), "Visualizer browser is not explicitly read-only")
 assert(!app.includes("function renderVisualizerBrowser"), "Legacy Visualizer renderer remains")

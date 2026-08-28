@@ -8,6 +8,8 @@ from unittest import mock
 
 from engine.repository import control_state
 from engine.repository import graph_resources
+from engine.contracts.analysis import normalize_analysis
+from engine.contracts.environment import normalize_environment
 
 
 class GraphResourceRepositoryTests(unittest.TestCase):
@@ -207,6 +209,71 @@ class GraphResourceRepositoryTests(unittest.TestCase):
             set(graph_resources.load_repository(self.config, "analysis")),
             {"owned/1", "owned/2"},
         )
+
+    def test_protocol_id_is_optional_versioned_graph_metadata(self):
+        cases = (
+            (
+                "analysis",
+                "analysisId",
+                1,
+                normalize_analysis,
+            ),
+            (
+                "environment",
+                "environmentId",
+                2,
+                normalize_environment,
+            ),
+        )
+        for resource_type, identity_field, schema_version, normalize in cases:
+            with self.subTest(resource_type=resource_type):
+                identity = f"protocol-{resource_type}"
+                draft = {
+                    "schemaVersion": schema_version,
+                    identity_field: identity,
+                    "name": identity,
+                    "description": "",
+                    "instances": {},
+                    "graph": {"nodes": [], "inputs": {}, "outputs": {}},
+                }
+
+                def validate(candidate, _module_definitions):
+                    return normalize(candidate, archived=True)
+
+                first = graph_resources.archive_if_changed(
+                    self.config,
+                    resource_type,
+                    draft,
+                    module_definitions={},
+                    validate=validate,
+                )["definition"]
+                second = graph_resources.archive_if_changed(
+                    self.config,
+                    resource_type,
+                    {**draft, "protocolId": "trade.basic-workflow"},
+                    module_definitions={},
+                    validate=validate,
+                )["definition"]
+                records = graph_resources.load_repository(self.config, resource_type)
+
+                self.assertNotIn("protocolId", first)
+                self.assertEqual(second["protocolId"], "trade.basic-workflow")
+                self.assertEqual(first["version"], "1")
+                self.assertEqual(second["version"], "2")
+                self.assertNotIn("protocolId", records[f"{identity}/1"])
+                self.assertEqual(
+                    records[f"{identity}/2"]["protocolId"],
+                    "trade.basic-workflow",
+                )
+
+                with self.assertRaisesRegex(ValueError, "canonical non-empty string"):
+                    graph_resources.archive_if_changed(
+                        self.config,
+                        resource_type,
+                        {**draft, "protocolId": ""},
+                        module_definitions={},
+                        validate=validate,
+                    )
 
     def test_exact_version_path_segments_are_rejected_before_index_access(self):
         invalid_pairs = (

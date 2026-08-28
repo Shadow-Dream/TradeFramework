@@ -50,7 +50,6 @@ const DOCUMENT_KINDS = new Set<UiDocumentState["kind"]>([
   "backtest-draft",
   "visualization-draft",
   "dataset-draft",
-  "mining-draft",
   "jupyter-text",
   "jupyter-notebook",
 ])

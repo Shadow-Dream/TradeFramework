@@ -11,6 +11,7 @@ from engine.contracts import digest as digest_contracts
 from engine.contracts import strict_json
 from engine.contracts.data_model import validate_normalized_json_value
 from engine.contracts.exact_fields import require_exact_fields
+from engine.contracts.protocol import PROTOCOL_ID_FIELD, normalize_protocol_id
 from engine.control import database as engine_database
 from engine.core import clock as engine_clock
 
@@ -47,7 +48,9 @@ def list_datasets(config, limit=None):
     sql = """
         SELECT d.*,
                (SELECT version_id FROM dataset_versions v
-                WHERE v.dataset_id = d.dataset_id ORDER BY v.rowid DESC LIMIT 1) AS latest_version_id
+                WHERE v.dataset_id = d.dataset_id ORDER BY v.rowid DESC LIMIT 1) AS latest_version_id,
+               (SELECT manifest_json FROM dataset_versions v
+                WHERE v.dataset_id = d.dataset_id ORDER BY v.rowid DESC LIMIT 1) AS latest_manifest_json
         FROM datasets d ORDER BY d.created_at DESC
     """
     params = ()
@@ -67,7 +70,9 @@ def get_dataset(config, dataset_id):
             """
             SELECT d.*,
                    (SELECT version_id FROM dataset_versions v
-                    WHERE v.dataset_id = d.dataset_id ORDER BY v.rowid DESC LIMIT 1) AS latest_version_id
+                    WHERE v.dataset_id = d.dataset_id ORDER BY v.rowid DESC LIMIT 1) AS latest_version_id,
+                   (SELECT manifest_json FROM dataset_versions v
+                    WHERE v.dataset_id = d.dataset_id ORDER BY v.rowid DESC LIMIT 1) AS latest_manifest_json
             FROM datasets d WHERE d.dataset_id = ?
             """,
             (dataset_id,),
@@ -93,6 +98,30 @@ def decode_dataset_index_row(row):
         "archivedAt": row["archived_at"],
         "archiveReason": row["archive_reason"],
     }
+    row_fields = set(row.keys()) if hasattr(row, "keys") else set(row)
+    if "latest_manifest_json" in row_fields and row["latest_manifest_json"] is not None:
+        manifest = _json_column(
+            row,
+            "latest_manifest_json",
+            label="Latest Dataset Version manifest",
+            value_type=dict,
+        )
+        dataset_archive.validate_manifest(manifest)
+        manifest_dataset = manifest["dataset"]
+        if (
+            manifest["datasetVersionId"] != item["latestVersionId"]
+            or manifest_dataset["datasetId"] != item["datasetId"]
+            or manifest_dataset["source"] != item["source"]
+            or manifest_dataset["metadata"] != item["metadata"]
+        ):
+            raise ValueError(
+                "Dataset index does not match its latest sealed Version manifest."
+            )
+        if PROTOCOL_ID_FIELD in manifest_dataset:
+            item[PROTOCOL_ID_FIELD] = normalize_protocol_id(
+                manifest_dataset[PROTOCOL_ID_FIELD],
+                label="Dataset protocolId",
+            )
     require_exact_fields(
         item,
         allowed={
@@ -105,6 +134,7 @@ def decode_dataset_index_row(row):
             "status",
             "archivedAt",
             "archiveReason",
+            PROTOCOL_ID_FIELD,
         },
         required={
             "datasetId",
@@ -143,6 +173,8 @@ def decode_dataset_index_row(row):
     if item["status"] == "archived" and not item["archivedAt"]:
         raise ValueError("Archived Dataset index is missing archivedAt.")
     validate_normalized_json_value(item["metadata"], {}, path="Dataset.metadata")
+    if PROTOCOL_ID_FIELD in item:
+        normalize_protocol_id(item[PROTOCOL_ID_FIELD], label="Dataset protocolId")
     return item
 
 
@@ -201,7 +233,7 @@ def _dataset_version_from_row(row):
         row, "manifest_json", label="Dataset Version manifest", value_type=dict
     )
     dataset_archive.validate_manifest(manifest)
-    return {
+    version = {
         "datasetVersionId": row["version_id"],
         "datasetId": row["dataset_id"],
         "contentHash": row["content_hash"],
@@ -214,6 +246,12 @@ def _dataset_version_from_row(row):
         "manifestDigest": row["manifest_digest"],
         "buildJobId": row["build_job_id"],
     }
+    if PROTOCOL_ID_FIELD in manifest["dataset"]:
+        version[PROTOCOL_ID_FIELD] = normalize_protocol_id(
+            manifest["dataset"][PROTOCOL_ID_FIELD],
+            label="Dataset Version protocolId",
+        )
+    return version
 
 
 def verify_dataset_version_id(config, version_id):
@@ -342,7 +380,8 @@ def list_dataset_version_summaries(config, dataset_ids):
     with engine_database.connect_database(config) as connection:
         rows = connection.execute(
             f"""
-            SELECT version_id, dataset_id, content_hash, status, capabilities_json, created_at
+            SELECT version_id, dataset_id, content_hash, status, capabilities_json,
+                   created_at, manifest_json
             FROM dataset_versions
             WHERE dataset_id IN ({placeholders})
             ORDER BY rowid DESC
@@ -358,6 +397,13 @@ def list_dataset_version_summaries(config, dataset_ids):
             value_type=dict,
         )
         dataset_archive.normalize_capabilities(capabilities)
+        manifest = _json_column(
+            row,
+            "manifest_json",
+            label="Dataset Version summary manifest",
+            value_type=dict,
+        )
+        dataset_archive.validate_manifest(manifest)
         summary = {
             "datasetVersionId": row["version_id"],
             "datasetId": row["dataset_id"],
@@ -366,6 +412,21 @@ def list_dataset_version_summaries(config, dataset_ids):
             "capabilities": capabilities,
             "createdAt": row["created_at"],
         }
+        if (
+            manifest["datasetVersionId"] != summary["datasetVersionId"]
+            or manifest["datasetId"] != summary["datasetId"]
+            or manifest["contentHash"] != summary["contentHash"]
+            or manifest["capabilities"] != summary["capabilities"]
+            or manifest["createdAt"] != summary["createdAt"]
+        ):
+            raise ValueError(
+                "Dataset Version summary does not match its sealed manifest."
+            )
+        if PROTOCOL_ID_FIELD in manifest["dataset"]:
+            summary[PROTOCOL_ID_FIELD] = normalize_protocol_id(
+                manifest["dataset"][PROTOCOL_ID_FIELD],
+                label="Dataset Version summary protocolId",
+            )
         if (
             not isinstance(summary["datasetId"], str)
             or not summary["datasetId"]

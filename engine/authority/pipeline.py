@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from engine.authority import execution_records
 from engine.archive import version as version_archive
@@ -12,6 +12,7 @@ from engine.authority import graph as graph_authority
 from engine.authority import module_definition as module_definition_authority
 from engine.authority import module_invocation as module_invocation_authority
 from engine.contracts import strict_json
+from engine.contracts import config_override as config_override_contracts
 from engine.contracts.data_path import canonical_data_key_order
 from engine.contracts.json_schema import validate_config
 from engine.contracts.module import (
@@ -114,6 +115,7 @@ class _PipelineContractTemplate:
     """Nominal same-stack proof for invariant Pipeline contract authorities."""
 
     _manifest: dict
+    _identity_manifest_hash: str
     _module_definitions: dict
     _module_definition_authorities: dict
     _modules: dict
@@ -322,7 +324,7 @@ class _CompiledPipelineAuthority:
                     "Compiled Pipeline Module invocation does not match its plan."
                 )
         pipeline_id, version, manifest_hash = pipeline_definition_identity(identity)
-        if pipeline_manifest_digest(contract_template._manifest) != manifest_hash:
+        if contract_template._identity_manifest_hash != manifest_hash:
             raise ValueError(
                 "Compiled Pipeline manifest does not match its verified identity."
             )
@@ -355,6 +357,7 @@ def pipeline_contract_template_material(template):
     require_pipeline_contract_template(template)
     return {
         "manifest": copy.deepcopy(template._manifest),
+        "identityManifestHash": template._identity_manifest_hash,
         "moduleDefinitions": copy.deepcopy(template._module_definitions),
         "moduleDefinitionAuthorities": dict(
             template._module_definition_authorities
@@ -373,6 +376,7 @@ def _clone_pipeline_contract_template(template):
     material = pipeline_contract_template_material(template)
     return _PipelineContractTemplate(
         _manifest=material["manifest"],
+        _identity_manifest_hash=material["identityManifestHash"],
         _module_definitions=material["moduleDefinitions"],
         _module_definition_authorities=material["moduleDefinitionAuthorities"],
         _modules=material["modules"],
@@ -457,6 +461,7 @@ def pipeline_contract_template_from_verified_authorities(
             })
     return _PipelineContractTemplate(
         _manifest=frozen_manifest,
+        _identity_manifest_hash=pipeline_manifest_digest(frozen_manifest),
         _module_definitions=frozen_definitions,
         _module_definition_authorities=frozen_authorities,
         _modules=copy.deepcopy(modules),
@@ -470,6 +475,25 @@ def pipeline_contract_template_from_verified_authorities(
     )
 
 
+def configure_pipeline_contract_template(base_template, effective_manifest):
+    """Derive a template changed only by Pipeline or inner Module config."""
+
+    require_pipeline_contract_template(base_template)
+    candidate = pipeline_contract_template_from_verified_authorities(
+        effective_manifest,
+        base_template._module_definitions,
+        base_template._module_definition_authorities,
+    )
+    config_override_contracts.require_pipeline_manifest_override_derivation(
+        base_template._manifest,
+        candidate._manifest,
+    )
+    return replace(
+        candidate,
+        _identity_manifest_hash=base_template._identity_manifest_hash,
+    )
+
+
 def pipeline_contract_template_from_validated_plan(
     manifest,
     module_definitions,
@@ -477,43 +501,36 @@ def pipeline_contract_template_from_validated_plan(
     validated_plan,
     *,
     label="Validated Pipeline plan",
+    identity_template=None,
 ):
     """Bind invariant Pipeline facts to a separately validated complete plan."""
 
-    template = pipeline_contract_template_from_verified_authorities(
-        manifest,
-        module_definitions,
-        module_definition_authorities,
+    template = (
+        pipeline_contract_template_from_verified_authorities(
+            manifest, module_definitions, module_definition_authorities
+        )
+        if identity_template is None
+        else configure_pipeline_contract_template(identity_template, manifest)
     )
     require_validated_pipeline_plan(validated_plan)
     frozen_plan = validated_pipeline_plan_material(validated_plan)
     require_canonical_value_match(
-        frozen_plan["topology"],
-        list(template._topology),
+        frozen_plan["topology"], list(template._topology),
         label=f"{label} topology",
     )
     require_canonical_value_match(
-        frozen_plan["directPlans"],
-        list(template._direct_plans),
+        frozen_plan["directPlans"], list(template._direct_plans),
         label=f"{label} direct plans",
     )
     signal_definition = copy.deepcopy(template._signal_plan)
     frozen_signal_plan = frozen_plan["signalPlan"]
     if set(frozen_signal_plan["nodes"]) != set(signal_definition["nodes"]):
-        raise ValueError(
-            f"{label} Signal Graph nodes do not "
-            "match its frozen manifest."
+        raise ValueError(f"{label} Signal Graph nodes do not match its frozen manifest.")
+    for field in ("inputs", "outputs"):
+        require_canonical_value_match(
+            frozen_signal_plan[field], signal_definition[field],
+            label=f"{label} Signal Graph {field}",
         )
-    require_canonical_value_match(
-        frozen_signal_plan["inputs"],
-        signal_definition["inputs"],
-        label=f"{label} Signal Graph inputs",
-    )
-    require_canonical_value_match(
-        frozen_signal_plan["outputs"],
-        signal_definition["outputs"],
-        label=f"{label} Signal Graph outputs",
-    )
     expected_bindings = {
         node_id: {
             name: copy.deepcopy(template._modules[node_id][name])
@@ -522,8 +539,7 @@ def pipeline_contract_template_from_validated_plan(
         for node_id in signal_definition["nodes"]
     }
     require_canonical_value_match(
-        frozen_signal_plan["bindings"],
-        expected_bindings,
+        frozen_signal_plan["bindings"], expected_bindings,
         label=f"{label} Signal Graph bindings",
     )
     return template
@@ -753,6 +769,7 @@ __all__ = (
     "bound_pipeline_contract_plan",
     "bound_pipeline_contract_plan_material",
     "compiled_pipeline_authority_material",
+    "configure_pipeline_contract_template",
     "pipeline_contract_template_from_validated_plan",
     "pipeline_contract_template_from_verified_authorities",
     "pipeline_contract_template_material",

@@ -24,11 +24,13 @@ from engine.contracts.module import (
 from engine.contracts.pipeline import (
     MULTI_STAGES,
     PIPELINE_DRAFT_FIELDS,
+    PIPELINE_REQUIRED_DRAFT_FIELDS,
     STAGES,
     STAGE_KINDS,
     normalize_pipeline_config,
     validate_pipeline_manifest,
 )
+from engine.contracts.protocol import normalize_protocol_id
 
 
 def normalize_pipeline_id(value):
@@ -166,15 +168,7 @@ def normalize_pipeline_draft(draft):
         )
     if "signalGraph" not in draft:
         raise ValueError("Pipeline Draft requires signalGraph.")
-    required_fields = {
-        "pipelineId",
-        "name",
-        "config",
-        "instances",
-        "stages",
-        "signalGraph",
-    }
-    missing_fields = sorted(required_fields - set(draft))
+    missing_fields = sorted(PIPELINE_REQUIRED_DRAFT_FIELDS - set(draft))
     if missing_fields:
         raise ValueError(
             "Pipeline Draft is missing required field(s): "
@@ -193,6 +187,11 @@ def normalize_pipeline_draft(draft):
         if key in draft
     }
     normalized["pipelineId"] = normalize_pipeline_id(normalized["pipelineId"])
+    if "protocolId" in draft:
+        normalized["protocolId"] = normalize_protocol_id(
+            draft["protocolId"],
+            label=f"Pipeline '{normalized['pipelineId']}' protocolId",
+        )
     if not isinstance(normalized["name"], str) or not normalized["name"].strip():
         raise ValueError("Pipeline Draft name must be a non-empty string.")
     normalized["config"] = normalize_pipeline_config(normalized["config"])

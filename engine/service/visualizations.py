@@ -11,6 +11,19 @@ from engine.repository import module_definitions as module_repository
 from engine.repository import visualizations as visualization_repository
 
 
+VisualizationRevisionConflict = (
+    visualization_repository.VisualizationRevisionConflict
+)
+
+
+def current_visualization_id(backtest_id):
+    """Return the one server-authoritative current Visualization identity."""
+
+    if type(backtest_id) is not str or not backtest_id.strip():
+        raise ValueError("Visualization current backtestId must be a non-empty string.")
+    return resource_ids.normalize_resource_id(f"{backtest_id.strip()}-current")
+
+
 def validate_visualization_contracts(
     config,
     result,
@@ -55,9 +68,14 @@ def save_visualization(config, request, visualizer_definitions):
         "backtestId": request["backtestId"],
         "name": request["name"].strip(),
         "createdAt": engine_clock.utc_now(),
+        "revision": request["expectedRevision"] + 1,
         "spec": spec,
     }
-    saved = visualization_repository.save_visualization(config, record)
+    saved = visualization_repository.save_visualization(
+        config,
+        record,
+        expected_revision=request["expectedRevision"],
+    )
     return {"accepted": True, "visualization": saved}
 
 
@@ -70,6 +88,8 @@ def list_visualizations(config, backtest_id=""):
 
 
 __all__ = (
+    "VisualizationRevisionConflict",
+    "current_visualization_id",
     "get_visualization",
     "list_visualizations",
     "save_visualization",

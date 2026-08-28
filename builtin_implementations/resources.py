@@ -7,12 +7,22 @@ import copy
 import importlib
 from pathlib import Path
 
+from application_protocols.basic_workflow.manifest import (
+    PROTOCOL_ID as BASIC_WORKFLOW_PROTOCOL_ID,
+)
 from builtin_implementations import analysis_presets
 from builtin_implementations import analysis_contracts
 from builtin_implementations import environment_contracts
 from builtin_implementations import environment_presets
 from builtin_implementations.pipeline_contracts import BUILTIN_PIPELINE_MODULES
-from builtin_implementations.basic_workflow_contracts import SAMPLER_OUTPUT_SCHEMA
+from builtin_implementations.basic_workflow_contracts import (
+    OHLCV_SAMPLER_OUTPUT_SCHEMA,
+    SAMPLER_OUTPUT_SCHEMA,
+)
+from builtin_implementations.sampler.basic_ohlcv_map_sampler import (
+    SOURCE as BASIC_OHLCV_SAMPLER_SOURCE,
+    ENTRY_POINT as BASIC_OHLCV_SAMPLER_ENTRY_POINT,
+)
 from builtin_implementations.sampler.basic_price_map_sampler import (
     ENTRY_POINT as BASIC_WORKFLOW_SAMPLER_ENTRY_POINT,
     SOURCE as BASIC_WORKFLOW_SAMPLER_SOURCE,
@@ -22,6 +32,7 @@ from engine.compiler import analysis as analysis_compiler
 from engine.compiler import environment as environment_compiler
 from engine.repository import graph_resources
 from engine.repository import module_definitions
+from engine.repository import folders as repository_folders
 from engine.repository import samplers
 from engine.service import module_publication
 from strategy_devkit.bundle import encode_file
@@ -37,8 +48,38 @@ APPLICATION_COMPONENT_FILES = (
     "basic_workflow/numbers.py",
     "basic_workflow/brokerage.py",
     "basic_workflow/account.py",
-    "basic_workflow/performance.py",
 )
+
+
+def _ensure_folder(config, repository, path):
+    """Create one virtual classification path without coupling it to storage."""
+    path = "/" + "/".join(part for part in str(path).split("/") if part)
+    tree = repository_folders.repository_tree(config, repository)
+    folders_by_path = {item["path"]: item for item in tree["folders"]}
+    if path in folders_by_path:
+        return folders_by_path[path]["folderId"]
+    parent_id = ""
+    current_path = ""
+    for name in path.split("/")[1:]:
+        current_path += "/" + name
+        existing = folders_by_path.get(current_path)
+        if existing is None:
+            existing = repository_folders.create_folder(
+                config, repository, name, parent_id
+            )
+            folders_by_path[current_path] = existing
+        parent_id = existing["folderId"]
+    return parent_id
+
+
+def _place(config, repository, item_id, path, *, definition=None):
+    repository_folders.assign_item(
+        config,
+        repository,
+        item_id,
+        _ensure_folder(config, repository, path),
+        module_definition=definition,
+    )
 
 
 def _implementation_file(repository, module_id):
@@ -133,31 +174,45 @@ def _sources():
 
 def install(config):
     installed = []
-    installed.append(
-        samplers.save_sampler(
-            config,
-            {
-                "samplerId": "basic-price-map-sampler",
-                "name": "Basic Workflow Price Map Sampler",
-                "type": "python-script",
-                "config": {},
-                "parameterSchema": {
-                    "type": "object",
-                    "properties": {
-                        "decisionPeriod": {
-                            "type": "string",
-                        }
-                    },
-                    "required": ["decisionPeriod"],
-                    "additionalProperties": False,
+    saved_sampler = samplers.save_sampler(
+        config,
+        {
+            "samplerId": "basic-price-map-sampler",
+            "name": "Basic",
+            "protocolId": BASIC_WORKFLOW_PROTOCOL_ID,
+            "type": "python-script",
+            "config": {},
+            "parameterSchema": {
+                "type": "object",
+                "properties": {
+                    "decisionPeriod": {
+                        "type": "string",
+                    }
                 },
-                "outputSchema": copy.deepcopy(SAMPLER_OUTPUT_SCHEMA),
-                "source": BASIC_WORKFLOW_SAMPLER_SOURCE,
-                "entryPoint": BASIC_WORKFLOW_SAMPLER_ENTRY_POINT,
+                "additionalProperties": False,
             },
-            engine_owned=True,
-        )
+            "outputSchema": copy.deepcopy(SAMPLER_OUTPUT_SCHEMA),
+            "source": BASIC_WORKFLOW_SAMPLER_SOURCE,
+            "entryPoint": BASIC_WORKFLOW_SAMPLER_ENTRY_POINT,
+        },
+        engine_owned=True,
     )
+    installed.append(saved_sampler)
+    _place(
+        config,
+        "samplers",
+        f"{saved_sampler['samplerId']}::{saved_sampler['version']}",
+        "/BuiltIn/Basic Workflow",
+    )
+    saved_v3 = samplers.save_sampler(config, {
+        "samplerId": "basic-ohlcv-map-sampler", "name": "Basic OHLCV v3",
+        "protocolId": BASIC_WORKFLOW_PROTOCOL_ID, "type": "python-script", "config": {},
+        "parameterSchema": {"type": "object", "properties": {"decisionPeriod": {"type": "string"}}, "additionalProperties": False},
+        "outputSchema": copy.deepcopy(OHLCV_SAMPLER_OUTPUT_SCHEMA),
+        "source": BASIC_OHLCV_SAMPLER_SOURCE, "entryPoint": BASIC_OHLCV_SAMPLER_ENTRY_POINT,
+    }, engine_owned=True)
+    installed.append(saved_v3)
+    _place(config, "samplers", f"{saved_v3['samplerId']}::{saved_v3['version']}", "/BuiltIn/Basic Workflow")
     for repository, source in _sources():
         module_id = source["moduleId"]
         payload = {
@@ -173,7 +228,26 @@ def install(config):
             repository=repository,
             engine_owned=True,
         )
-        installed.append(result["definition"])
+        definition = result["definition"]
+        installed.append(definition)
+        if module_id.startswith("basic-"):
+            catalog_repository = {
+                "pipeline": "modules",
+                "analysis": "analysis-modules",
+                "environment": "environment-modules",
+            }[repository]
+            prefix = (
+                f"/{definition['kind']}/BuiltIn"
+                if repository == "pipeline"
+                else "/BuiltIn"
+            )
+            _place(
+                config,
+                catalog_repository,
+                f"{definition['kind']}/{definition['moduleId']}",
+                prefix + "/Basic Workflow",
+                definition=definition,
+            )
 
     analysis_definitions, analysis_evidence = (
         module_definitions.load_repository_evidence(config, "analysis")
@@ -234,5 +308,22 @@ def install(config):
             validate=validator,
             engine_owned=True,
         )
-        installed.append(result["definition"])
+        definition = result["definition"]
+        installed.append(definition)
+        resource_id = definition[f"{resource_type}Id"]
+        category = (
+            "Basic Workflow"
+            if resource_id.startswith("basic-")
+            else "Standard"
+            if resource_id.startswith("standard-")
+            else "Neutral"
+        )
+        _place(
+            config,
+            {"analysis": "analyses", "environment": "environments"}[
+                resource_type
+            ],
+            resource_id,
+            f"/BuiltIn/{category}",
+        )
     return installed

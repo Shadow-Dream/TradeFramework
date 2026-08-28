@@ -44,7 +44,6 @@ export interface UiDocumentState {
     | "backtest-draft"
     | "visualization-draft"
     | "dataset-draft"
-    | "mining-draft"
     | "jupyter-text"
     | "jupyter-notebook"
   label: string

@@ -17,7 +17,10 @@ from application_protocols.basic_workflow.manifest import (
     PROTOCOL_VERSION,
 )
 from builtin_implementations import resources as builtin_resources
-from builtin_implementations.basic_workflow_contracts import SAMPLER_OUTPUT_SCHEMA
+from builtin_implementations.basic_workflow_contracts import (
+    BAR_SCHEMA,
+    SAMPLER_OUTPUT_SCHEMA,
+)
 from dataset_adapters import basic_workflow
 from engine.authority.dataset import verify_dataset_version_storage_authority
 from engine.authority.sampler import verify_sampler_runtime_bundle_authority
@@ -125,6 +128,12 @@ class BasicWorkflowDatasetTests(unittest.TestCase):
             published["datasetId"],
             published["latestVersionId"],
         )
+        self.assertEqual(published["protocolId"], PROTOCOL_ID)
+        self.assertEqual(version["protocolId"], PROTOCOL_ID)
+        self.assertEqual(
+            version["manifest"]["dataset"]["protocolId"],
+            PROTOCOL_ID,
+        )
         self.assertEqual(
             version["capabilities"]["basicWorkflow"],
             {
@@ -159,6 +168,7 @@ class BasicWorkflowDatasetTests(unittest.TestCase):
             sampler_record["samplerId"],
             sampler_record["version"],
         )
+        self.assertEqual(definition["protocolId"], PROTOCOL_ID)
         sampler_authority = verify_sampler_runtime_bundle_authority(definition)
         with tempfile.TemporaryDirectory(dir=self.root) as execution_root:
             runtime = create_verified_sampler_runtime(
@@ -173,6 +183,24 @@ class BasicWorkflowDatasetTests(unittest.TestCase):
                 runtime.close()
         self.assertEqual(definition["outputSchema"], SAMPLER_OUTPUT_SCHEMA)
         self.assertEqual(
+            set(BAR_SCHEMA["required"]),
+            {"eventTime", "open", "close", "high", "low"},
+        )
+        self.assertTrue(samples)
+        self.assertTrue(
+            all(set(sample.data) == {"time", "price"} for sample in samples)
+        )
+        for sample in samples:
+            for period, instruments in sample.data["price"].items():
+                for instrument, bar in instruments.items():
+                    self.assertEqual(set(bar), set(BAR_SCHEMA["required"]))
+                    self.assertEqual(
+                        bar["eventTime"],
+                        sample.provenance[
+                            f"price.{period}.{instrument}"
+                        ]["barTime"],
+                    )
+        self.assertEqual(
             [sample.decision_time for sample in samples],
             [
                 "2026-01-02T21:00:00Z",
@@ -182,13 +210,157 @@ class BasicWorkflowDatasetTests(unittest.TestCase):
         )
         self.assertEqual(samples[0].data["time"], samples[0].decision_time)
         self.assertEqual(samples[0].data["price"]["day"]["SPY"]["open"], 100.0)
+        self.assertEqual(
+            samples[0].data["price"]["day"]["SPY"]["eventTime"],
+            "2026-01-02T21:00:00Z",
+        )
         self.assertEqual(samples[0].data["price"]["week"]["SPY"]["close"], 101.0)
         self.assertEqual(samples[1].data["price"]["day"]["QQQ"]["open"], 50.0)
         self.assertEqual(samples[2].data["price"]["day"]["SPY"]["open"], 200.0)
         self.assertEqual(
+            samples[1].data["price"]["day"]["QQQ"]["eventTime"],
+            "2026-01-02T21:00:00Z",
+        )
+        self.assertNotEqual(
+            samples[1].data["price"]["day"]["QQQ"]["eventTime"],
+            samples[1].decision_time,
+        )
+        self.assertEqual(
+            [
+                sample.data["price"]["week"]["SPY"]["eventTime"]
+                for sample in samples
+            ],
+            ["2026-01-02T21:00:00Z"] * 3,
+        )
+        self.assertEqual(
             samples[1].provenance["price.day.SPY"]["sourcePath"],
             "day/SPY.csv",
         )
+
+    def test_single_period_dataset_uses_the_same_sampler_and_exact_data_keys(self):
+        source = self._source("single-period-source")
+        for path in (source / "week").glob("*.csv"):
+            path.unlink()
+        (source / "week").rmdir()
+        published = self._publish(source, dataset_id="single-period-prices")
+        installed = builtin_resources.install(self.config)
+        sampler_record = next(item for item in installed if item.get("samplerId"))
+        version = datasets.verify_dataset_version_id(
+            self.config,
+            published["latestVersionId"],
+        )
+        _version, dataset_authority = verify_dataset_version_storage_authority(
+            self.config["releaseRoot"],
+            version,
+        )
+        dataset = create_dataset_handle(dataset_authority)
+        definition = samplers.get_sampler(
+            self.config,
+            sampler_record["samplerId"],
+            sampler_record["version"],
+        )
+        sampler_authority = verify_sampler_runtime_bundle_authority(definition)
+        with tempfile.TemporaryDirectory(dir=self.root) as execution_root:
+            runtime = create_verified_sampler_runtime(
+                sampler_authority,
+                dataset,
+                {},
+                execution_root=execution_root,
+            )
+            try:
+                samples = list(runtime)
+            finally:
+                runtime.close()
+        self.assertEqual(definition["outputSchema"], SAMPLER_OUTPUT_SCHEMA)
+        self.assertEqual(len(samples), 3)
+        for sample in samples:
+            self.assertEqual(set(sample.data), {"time", "price"})
+            self.assertEqual(set(sample.data["price"]), {"day"})
+
+    def test_multi_period_dataset_infers_the_unique_largest_timeline(self):
+        published = self._publish(dataset_id="inferred-period-prices")
+        installed = builtin_resources.install(self.config)
+        sampler_record = next(item for item in installed if item.get("samplerId"))
+        version = datasets.verify_dataset_version_id(
+            self.config,
+            published["latestVersionId"],
+        )
+        _version, dataset_authority = verify_dataset_version_storage_authority(
+            self.config["releaseRoot"],
+            version,
+        )
+        dataset = create_dataset_handle(dataset_authority)
+        definition = samplers.get_sampler(
+            self.config,
+            sampler_record["samplerId"],
+            sampler_record["version"],
+        )
+        sampler_authority = verify_sampler_runtime_bundle_authority(definition)
+        with tempfile.TemporaryDirectory(dir=self.root) as execution_root:
+            runtime = create_verified_sampler_runtime(
+                sampler_authority,
+                dataset,
+                {},
+                execution_root=execution_root,
+            )
+            try:
+                samples = list(runtime)
+            finally:
+                runtime.close()
+        self.assertEqual(
+            [sample.decision_time for sample in samples],
+            [
+                "2026-01-02T21:00:00Z",
+                "2026-01-05T21:00:00Z",
+                "2026-01-06T21:00:00Z",
+            ],
+        )
+        self.assertTrue(
+            all(
+                sample.provenance["time"]["decisionPeriod"] == "day"
+                for sample in samples
+            )
+        )
+
+    def test_multi_period_dataset_requires_override_when_timelines_tie(self):
+        source = self._source("tied-period-source")
+        (source / "week" / "SPY.csv").write_text(
+            "time,open,close,high,low\n"
+            "2026-01-02T21:00:00Z,90,101,103,89\n"
+            "2026-01-05T21:00:00Z,101,102,104,100\n"
+            "2026-01-06T21:00:00Z,102,103,105,101\n",
+            encoding="utf-8",
+        )
+        published = self._publish(source, dataset_id="tied-period-prices")
+        installed = builtin_resources.install(self.config)
+        sampler_record = next(item for item in installed if item.get("samplerId"))
+        version = datasets.verify_dataset_version_id(
+            self.config,
+            published["latestVersionId"],
+        )
+        _version, dataset_authority = verify_dataset_version_storage_authority(
+            self.config["releaseRoot"],
+            version,
+        )
+        dataset = create_dataset_handle(dataset_authority)
+        definition = samplers.get_sampler(
+            self.config,
+            sampler_record["samplerId"],
+            sampler_record["version"],
+        )
+        sampler_authority = verify_sampler_runtime_bundle_authority(definition)
+        with tempfile.TemporaryDirectory(dir=self.root) as execution_root:
+            runtime = create_verified_sampler_runtime(
+                sampler_authority,
+                dataset,
+                {},
+                execution_root=execution_root,
+            )
+            try:
+                with self.assertRaisesRegex(RuntimeError, "timelines are tied"):
+                    list(runtime)
+            finally:
+                runtime.close()
 
     def test_invalid_csv_fails_before_dataset_publication(self):
         source = self._source("invalid-source")

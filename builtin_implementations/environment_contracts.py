@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import copy
+from application_protocols.basic_workflow.manifest import PROTOCOL_ID
 from builtin_implementations.basic_workflow_contracts import (
     APPROVED_INTENT_SCHEMA,
     EXECUTION_ORDERS_SCHEMA,
-    PRICE_SCHEMA,
+    PRICE_WITH_OPTIONAL_VOLUME_SCHEMA,
     PORTFOLIO_ACCOUNT_SCHEMA,
 )
 from engine.contracts.data_model import normalize_data_key_schema
@@ -92,6 +93,7 @@ def _definition(
     inputs=None,
     outputs=None,
     config=None,
+    protocol_id=PROTOCOL_ID,
 ):
     result = {
         "kind": "Environment",
@@ -103,6 +105,7 @@ def _definition(
             "inputs": copy.deepcopy(inputs or {}),
             "outputs": copy.deepcopy(outputs or {}),
         },
+        **({"protocolId": protocol_id} if protocol_id is not None else {}),
     }
     return result
 
@@ -110,12 +113,12 @@ def _definition(
 ENVIRONMENT_MODULES = [
     _definition(
         "basic-multi-asset-bar-account",
-        "Basic Multi-Asset Bar Account",
+        "Multi-Asset Bar Account",
         "Account",
         "Executes prior approved intents at bar open and marks a stateful account at close.",
         inputs={
             "time": _port(STRING),
-            "price": _port(PRICE_SCHEMA),
+            "price": _port(PRICE_WITH_OPTIONAL_VOLUME_SCHEMA),
             "previousApprovedIntent": _port(
                 APPROVED_INTENT_SCHEMA,
                 required=False,
@@ -241,6 +244,7 @@ ENVIRONMENT_MODULES = [
     _definition(
         "datakey-benchmark-provider", "Benchmark Return", "Benchmark",
         "Publishes benchmark value and cumulative return from an explicitly connected input.",
+        protocol_id=None,
         inputs={"value": _port(NUMBER)},
         outputs={"benchmark": _port(BENCHMARK_SCHEMA)},
     ),

@@ -157,14 +157,14 @@ def _bounded(result):
 
 def _resource_summary(kind, item):
     if kind == "pipeline":
-        return {key: item.get(key) for key in ("pipelineId", "name", "status", "currentVersion", "manifestHash", "updatedAt")}
+        return {key: item.get(key) for key in ("pipelineId", "name", "status", "currentVersion", "manifestHash", "updatedAt", "protocolId") if key in item}
     if kind == "dataset":
         return {key: item.get(key) for key in ("datasetId", "name", "status", "latestVersionId", "createdAt")}
     if kind in {"environment", "analysis"}:
         prefix = "environment" if kind == "environment" else "analysis"
-        return {key: item.get(key) for key in (f"{prefix}Id", "name", "version", "contentDigest") if key in item}
+        return {key: item.get(key) for key in (f"{prefix}Id", "name", "version", "contentDigest", "protocolId") if key in item}
     if kind == "module":
-        return {key: item.get(key) for key in ("kind", "moduleId", "name", "version", "builtin") if key in item}
+        return {key: item.get(key) for key in ("kind", "moduleId", "name", "version", "builtin", "protocolId") if key in item}
     if kind in {"backtest", "result"}:
         return {key: item.get(key) for key in ("backtestId", "name", "status", "createdAt", "completedAt", "resultAvailable") if key in item}
     return {}

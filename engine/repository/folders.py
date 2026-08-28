@@ -386,13 +386,6 @@ def validate_state(payload: Any) -> dict[str, Any]:
             for folder_id in checked_folders:
                 if not any(_is_descendant(folder_id, root_id, all_repository_folders) for root_id in fixed_ids):
                     raise ValueError(f"Module folder '{folder_id}' is outside its fixed type tree.")
-        elif repository in FLAT_MODULE_REPOSITORIES:
-            builtin_id = _repository_builtin_folder_id(repository)
-            for folder_id in checked_folders:
-                if _is_descendant(folder_id, builtin_id, all_repository_folders):
-                    raise ValueError(
-                        f"Module folder '{folder_id}' is inside the reserved BuiltIn folder."
-                    )
 
         checked_assignments = {}
         for item_id, folder_id in assignments.items():
@@ -413,14 +406,6 @@ def validate_state(payload: Any) -> dict[str, Any]:
                         raise ValueError(
                             f"Module assignment '{item_id}' is outside its {kind} folder."
                         )
-                elif _is_descendant(
-                    folder_id,
-                    _repository_builtin_folder_id(repository),
-                    all_repository_folders,
-                ):
-                    raise ValueError(
-                        f"Module assignment '{item_id}' is inside the reserved BuiltIn folder."
-                    )
             checked_assignments[item_id] = folder_id
         state["folders"][repository] = checked_folders
         state["assignments"][repository] = checked_assignments
@@ -558,12 +543,6 @@ def create_folder(config, repository: str, name: str, parent_id: str = "") -> di
         raise ValueError(f"Parent folder does not exist: {parent_id}")
     if repository == "modules" and not parent_id:
         raise ValueError("Module top-level folders are fixed; create folders inside a module type.")
-    if repository in FLAT_MODULE_REPOSITORIES and parent_id and _is_descendant(
-        parent_id,
-        _repository_builtin_folder_id(repository),
-        folders,
-    ):
-        raise ValueError("User folders cannot be created inside the BuiltIn folder.")
     siblings = [folder for folder in folders.values() if str(folder.get("parentId") or "") == parent_id]
     if any(str(folder.get("name") or "").casefold() == name.casefold() for folder in siblings):
         raise ValueError(f"Folder '{name}' already exists under the selected parent.")
@@ -617,6 +596,23 @@ def move_folder(config, repository: str, folder_id: str, parent_id: str = "") ->
         raise ValueError(f"Parent folder does not exist: {parent_id}")
     if parent_id == folder_id or _is_descendant(parent_id, folder_id, folders):
         raise ValueError("A folder cannot be moved inside itself or one of its descendants.")
+    builtin_roots = (
+        tuple(_builtin_folder_id(kind) for kind in MODULE_FIXED_FOLDERS)
+        if repository == "modules"
+        else (_repository_builtin_folder_id(repository),)
+        if repository in FLAT_MODULE_REPOSITORIES
+        else ()
+    )
+    current_is_builtin = any(
+        _is_descendant(folder_id, builtin_id, folders)
+        for builtin_id in builtin_roots
+    )
+    target_is_builtin = any(
+        parent_id and _is_descendant(parent_id, builtin_id, folders)
+        for builtin_id in builtin_roots
+    )
+    if current_is_builtin != target_is_builtin:
+        raise ValueError("Module folders cannot cross the BuiltIn boundary.")
     if repository == "modules":
         current_root = next(
             (fixed_id for fixed_id in fixed if _is_descendant(folder_id, fixed_id, folders)),
@@ -624,12 +620,6 @@ def move_folder(config, repository: str, folder_id: str, parent_id: str = "") ->
         )
         if not current_root or not parent_id or not _is_descendant(parent_id, current_root, folders):
             raise ValueError("Module folders must remain inside their fixed type folder.")
-    elif repository in FLAT_MODULE_REPOSITORIES and parent_id and _is_descendant(
-        parent_id,
-        _repository_builtin_folder_id(repository),
-        folders,
-    ):
-        raise ValueError("User folders cannot be moved inside the BuiltIn folder.")
     siblings = [
         candidate
         for candidate_id, candidate in folders.items()
@@ -714,9 +704,13 @@ def assign_item(
     if repository in module_repositories:
         fixed_parent = default_item_folder(repository, item_id, item_definition)
         if item_definition.get("builtin") and (
-            not fixed_parent or folder_id != fixed_parent
+            not fixed_parent
+            or not folder_id
+            or not _is_descendant(folder_id, fixed_parent, folders)
         ):
-            raise ValueError("Built-in Modules are fixed inside their type's BuiltIn folder.")
+            raise ValueError(
+                "Built-in Modules must remain inside their type's BuiltIn folder."
+            )
         if repository == "modules" and (
             not fixed_parent
             or not folder_id
@@ -750,11 +744,7 @@ def resolve_item_folder(
     if not isinstance(assignments, Mapping) or not isinstance(folders, list):
         raise ValueError("Repository tree does not match the current snapshot contract.")
     item_id = str(item_id)
-    if repository in {"modules", "analysis-modules", "environment-modules"} and (
-        item or {}
-    ).get("builtin"):
-        folder_id = default_item_folder(repository, item_id, item)
-    elif item_id in assignments:
+    if item_id in assignments:
         folder_id = assignments[item_id]
     else:
         folder_id = default_item_folder(repository, item_id, item)
