@@ -1,7 +1,6 @@
 "use strict";
 
 const BASIC_PROTOCOL_ID = "trade.basic-workflow";
-const MARKET_ENDPOINT = "/api/subsystems/basic/market";
 const PROJECTION_CACHE_STORAGE_KEY = "trade.basic-workflow.projections.v1";
 const PROJECTION_CACHE_MAX_ENTRIES = 24;
 const PROJECTION_CACHE_MAX_BYTES = 4_000_000;
@@ -82,7 +81,7 @@ const state = {
   projectionCacheOwner: "",
   projectionControllers: new Set(),
   cacheEvidence: {
-    materializationHit: false,
+    sampleResultHit: false,
     browserProjectionHits: 0,
     serverProjectionHits: 0,
   },
@@ -219,7 +218,7 @@ async function getJson(path) {
   return payload;
 }
 
-async function postJson(path, payload, { signal } = {}) {
+async function postJson(path, payload, { signal, projection = false } = {}) {
   const response = await authenticatedFetch(path, {
     method: "POST",
     headers: {
@@ -230,7 +229,9 @@ async function postJson(path, payload, { signal } = {}) {
     body: JSON.stringify(payload),
     ...(signal ? { signal } : {}),
   });
-  const result = await response.json().catch(() => ({}));
+  const result = await (projection && window.TradeChartCore?.parseProjectionResponse
+    ? window.TradeChartCore.parseProjectionResponse(response)
+    : response.json()).catch(() => ({}));
   if (!response.ok || result.accepted === false) {
     const error = new Error(result.error || `${path} returned ${response.status}`);
     error.status = response.status;
@@ -298,16 +299,6 @@ function renderInstrumentHeader() {
   favorite.setAttribute("aria-label", `${watched ? "Remove" : "Add"} ${instrument.symbol} ${watched ? "from" : "to"} watchlist`);
 }
 
-async function loadMarket() {
-  const market = requireMarketEnvelope(await getJson(MARKET_ENDPOINT));
-  state.market = market;
-  renderInstrumentHeader();
-  setStatus(market.snapshot
-    ? `Stock list loaded · catalog as of ${formatInstant(market.snapshot.asOf)}`
-    : "Stock catalog unavailable.");
-  return market;
-}
-
 async function toggleSelectedWatchlist() {
   const snapshot = state.market?.snapshot;
   const instrument = marketInstrument(state.selectedInstrumentId);
@@ -326,7 +317,10 @@ async function toggleSelectedWatchlist() {
     if (response.accepted !== true || response.snapshotId !== snapshot.snapshotId) {
       throw new Error("Watchlist response did not preserve the selected snapshot.");
     }
-    await loadMarket();
+    if (!Array.isArray(response.watchlist)) {
+      throw new Error("Watchlist response.watchlist must be an array.");
+    }
+    state.market.watchlist = response.watchlist.map((item) => structuredClone(item));
   } catch (error) {
     setStatus(error?.message || "Watchlist update failed.", true);
   } finally {
@@ -337,8 +331,8 @@ async function toggleSelectedWatchlist() {
 
 function resetProvenance() {
   byId("bwChartDataset").textContent = "Waiting for data";
-  byId("bwChartPipeline").textContent = "Preparing";
-  byId("bwChartBacktest").textContent = "Not started";
+  byId("bwChartPipeline").textContent = "Preparing Sampler cache";
+  byId("bwChartBacktest").textContent = "Not required";
   byId("bwOpenResult").hidden = true;
 }
 
@@ -356,11 +350,10 @@ function renderProvenance(openResponse) {
   const symbol = openResponse.instrument.symbol;
   const bars = openResponse.barSnapshot;
   byId("bwChartDataset").textContent = `${symbol} · 1D bars · ${bars.barCount.toLocaleString()} records`;
-  byId("bwChartPipeline").textContent = "Basic market analysis · 1D";
-  byId("bwChartBacktest").textContent = jobStatusLabel(openResponse.job.status);
+  byId("bwChartPipeline").textContent = "Dataset → Sampler → sealed DataKeys";
+  byId("bwChartBacktest").textContent = "Not required for chart";
   const link = byId("bwOpenResult");
-  link.href = `/result?backtestId=${encodeURIComponent(openResponse.job.backtestId)}`;
-  link.hidden = false;
+  link.hidden = true;
 }
 
 function requireResourceRef(value, label, idField, { protocol = false, contentDigest = false } = {}) {
@@ -379,6 +372,20 @@ function requireOpenResponse(value, expected) {
   if (response.snapshotId !== expected.snapshotId) throw new Error("Open instrument response changed snapshotId.");
   const instrument = requireInstrument(response.instrument, "Open instrument response.instrument");
   if (instrument.instrumentId !== expected.instrumentId) throw new Error("Open instrument response changed instrumentId.");
+  if (!Array.isArray(response.watchlistInstrumentIds)
+      || response.watchlistInstrumentIds.some((value) => typeof value !== "string" || !value)
+      || new Set(response.watchlistInstrumentIds).size !== response.watchlistInstrumentIds.length) {
+    throw new Error("Open instrument response.watchlistInstrumentIds must be unique strings.");
+  }
+  if (typeof response.ready !== "boolean") throw new Error("Open instrument response.ready must be boolean.");
+  if (!response.ready) {
+    const cacheJob = requireObject(response.cacheJob, "Open instrument response.cacheJob");
+    ["jobId", "status", "instrumentId", "period"].forEach((field) => requireString(cacheJob[field], `Open instrument response.cacheJob.${field}`));
+    if (cacheJob.instrumentId !== expected.instrumentId || cacheJob.period !== expected.period) {
+      throw new Error("Open instrument cache job changed the selected instrument.");
+    }
+    return response;
+  }
   const bars = requireObject(response.barSnapshot, "Open instrument response.barSnapshot");
   ["providerId", "asOf", "period", "firstTime", "lastTime", "contentDigest"].forEach((field) => {
     requireString(bars[field], `Open instrument response.barSnapshot.${field}`);
@@ -391,65 +398,49 @@ function requireOpenResponse(value, expected) {
   requireString(dataset.datasetId, "Materialized Dataset ID");
   requireString(dataset.datasetVersionId, "Materialized Dataset Version ID");
   requireProtocol(dataset.protocolId, "Materialized Dataset protocolId");
-  requireResourceRef(materialization.pipeline, "Materialized Pipeline", "pipelineId", {
-    protocol: true,
-    contentDigest: true,
-  });
   requireResourceRef(materialization.sampler, "Materialized Sampler", "samplerId", { protocol: true });
-  requireResourceRef(materialization.environment, "Materialized Environment", "environmentId", { protocol: true });
-  requireResourceRef(materialization.analysis, "Materialized Analysis", "analysisId", { protocol: true });
-  requireObject(materialization.backtestRequest, "Materialized Backtest request");
+  const sampleResult = requireObject(materialization.sampleResult, "Materialized Sample Result");
+  requireContentDigest(sampleResult.sampleResultId, "Materialized Sample Result ID");
+  requireContentDigest(sampleResult.resultContentDigest, "Materialized Sample Result digest");
+  requireObject(sampleResult.dataKeys, "Materialized Sample Result dataKeys");
+  if (sampleResult.datasetId !== dataset.datasetId || sampleResult.datasetVersionId !== dataset.datasetVersionId) {
+    throw new Error("Materialized Sample Result Dataset identity changed.");
+  }
   const saveRequest = requireObject(materialization.visualizationSaveRequest, "Materialized Visualization save request");
-  ["backtestId", "visualizationId", "name"].forEach((field) => requireString(saveRequest[field], `Visualization save request.${field}`));
+  ["sampleResultId", "visualizationId", "name"].forEach((field) => requireString(saveRequest[field], `Visualization save request.${field}`));
   if (saveRequest.expectedRevision !== 0) throw new Error("A new market Visualization must start at revision 0.");
   requireObject(saveRequest.spec, "Visualization save request.spec");
-  const job = requireObject(response.job, "Open instrument response.job");
-  ["jobId", "backtestId", "status"].forEach((field) => requireString(job[field], `Open instrument response.job.${field}`));
-  if (saveRequest.backtestId !== job.backtestId) throw new Error("Visualization and Backtest identities differ.");
-  const prepared = requireObject(response.prepared, "Open instrument response.prepared");
-  requireString(prepared.requestDigest, "Prepared request digest");
-  requireString(prepared.snapshotHash, "Prepared snapshot hash");
+  if (saveRequest.sampleResultId !== sampleResult.sampleResultId) throw new Error("Visualization and Sample Result identities differ.");
   const cache = requireObject(response.cache, "Open instrument response.cache");
-  if (typeof cache.materializationHit !== "boolean" || Object.keys(cache).length !== 1) {
-    throw new Error("Open instrument response.cache must contain one materializationHit flag.");
+  if (cache.sampleResultHit !== true || Object.keys(cache).length !== 1) {
+    throw new Error("Open instrument response.cache must confirm one Sample Result hit.");
   }
   return response;
+}
+
+function installOpenMarketContext(response) {
+  const selected = response.instrument;
+  state.market = {
+    protocolId: BASIC_PROTOCOL_ID,
+    snapshot: {
+      snapshotId: response.snapshotId,
+      instruments: [structuredClone(selected)],
+    },
+    watchlist: response.watchlistInstrumentIds.map((instrumentId) => (
+      instrumentId === selected.instrumentId
+        ? structuredClone(selected)
+        : { instrumentId }
+    )),
+    barSnapshots: [],
+    snapshotJobs: [],
+  };
+  renderInstrumentHeader();
 }
 
 function wait(milliseconds) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
-async function waitForBacktest(initialJob, seq) {
-  let job = initialJob;
-  let polls = 0;
-  while (["queued", "running"].includes(job.status)) {
-    if (polls >= 500) throw new Error("Backtest did not complete within five minutes.");
-    polls += 1;
-    if (seq !== state.openSeq) throw new Error("Stock selection changed.");
-    const progress = Number.isFinite(job.progress) ? ` · ${Math.round(job.progress * 100)}%` : "";
-    setOpenStatus(`Trade Engine ${job.phase || job.status}${progress}`);
-    await wait(600);
-    const response = await getJson(`/api/backtest-jobs/${encodeURIComponent(job.jobId)}`);
-    job = requireObject(response.job, "Backtest job response.job");
-    if (job.jobId !== initialJob.jobId || job.backtestId !== initialJob.backtestId) {
-      throw new Error("Backtest job identity changed while polling.");
-    }
-    requireString(job.status, "Backtest job status");
-  }
-  if (job.status !== "completed") throw new Error(job.error || `Backtest ended with status ${job.status}.`);
-  return job;
-}
-
-function requireBacktestView(view, openResponse) {
-  requireObject(view, "Backtest Result view");
-  requireProtocol(view.protocolId, "Backtest Result view.protocolId");
-  if (view.backtestId !== openResponse.job.backtestId) throw new Error("Result view backtestId differs from the submitted Backtest.");
-  if (view.datasetId !== openResponse.materialization.dataset.datasetId) throw new Error("Result view Dataset differs from materialization.");
-  if (view.pipelineId !== openResponse.materialization.pipeline.pipelineId) throw new Error("Result view Pipeline differs from materialization.");
-  requireObject(view.dataKeys, "Backtest Result view.dataKeys");
-  return view;
-}
 
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -597,10 +588,10 @@ function requireVisualizationSpecShape(value, label) {
 }
 
 function requireVisualizationRecord(value, request, label) {
-  const fields = ["visualizationId", "backtestId", "name", "createdAt", "revision", "spec"];
+  const fields = ["visualizationId", "sampleResultId", "name", "createdAt", "revision", "spec"];
   const record = requireExactObjectFields(value, fields, fields, label);
   if (record.visualizationId !== request.visualizationId
-      || record.backtestId !== request.backtestId) {
+      || record.sampleResultId !== request.sampleResultId) {
     throw new Error(`${label} identity differs from the save request.`);
   }
   requireString(record.name, `${label}.name`);
@@ -621,11 +612,11 @@ async function saveVisualizationRevision(request, seq) {
   }
   let result;
   try {
-    result = await postJson("/api/visualizations", request);
+    result = await postJson("/api/subsystems/basic/sample-visualizations/save", request);
   } catch (error) {
-    if (error.status === 409 && error.payload?.code === "visualization_revision_conflict") {
+    if (error.status === 409 && error.payload?.code === "sample_visualization_revision_conflict") {
       const conflict = new Error(error.message);
-      conflict.code = "visualization_revision_conflict";
+      conflict.code = "sample_visualization_revision_conflict";
       conflict.currentVisualization = null;
       try {
         const current = requireVisualizationRecord(
@@ -656,7 +647,9 @@ async function saveVisualizationRevision(request, seq) {
 
 async function loadCurrentVisualization(request, seq) {
   const response = requireObject(
-    await getJson(`/api/visualizations?backtestId=${encodeURIComponent(request.backtestId)}`),
+    await postJson("/api/subsystems/basic/sample-visualizations/list", {
+      sampleResultId: request.sampleResultId,
+    }),
     "Visualization repository response",
   );
   if (seq !== state.openSeq) throw new Error("Stock selection changed.");
@@ -1354,14 +1347,16 @@ function financialPaneLayout(spec, candle) {
   return panes;
 }
 
-async function projectionForPlan(backtestId, plan, seq) {
+async function projectionForPlan(sampleResultId, plan, seq) {
   if (plan.planningError) throw new Error(plan.planningError.message || "Visualizer dependencies are invalid.");
   if (!(plan.paths || []).length && !(plan.temporaryModules || []).length) return null;
   const request = {
     paths: [...(plan.paths || [])].sort(),
     temporaryModules: structuredClone(plan.temporaryModules || []),
+    projectionFormat: "columns-v2",
+    window: null,
   };
-  const cacheKey = `${backtestId}:${canonicalJson(request)}`;
+  const cacheKey = `${sampleResultId}:${canonicalJson(request)}`;
   if (state.projectionCache.has(cacheKey)) {
     state.cacheEvidence.browserProjectionHits += 1;
     return state.projectionCache.get(cacheKey);
@@ -1370,9 +1365,9 @@ async function projectionForPlan(backtestId, plan, seq) {
   state.projectionControllers.add(controller);
   const pending = (async () => {
     const response = await postJson(
-      "/api/subsystems/basic/result-projections",
-      { backtestId, ...request },
-      { signal: controller.signal },
+      "/api/subsystems/basic/sample-projections",
+      { sampleResultId, ...request },
+      { signal: controller.signal, projection: true },
     );
     if (seq !== state.openSeq) throw new Error("Stock selection changed.");
     if (response.cache?.hit === true) state.cacheEvidence.serverProjectionHits += 1;
@@ -1427,7 +1422,7 @@ async function projectPane(view, pane, spec, seq) {
   const plans = core.visualizerDependencyPlan({ dataKeys: view.dataKeys }, pane, spec);
   const groupedSlices = await Promise.all(projectionGroups(plans).map(async (group) => {
     try {
-      return { group, result: await projectionForPlan(view.backtestId, group.plan, seq), error: null };
+      return { group, result: await projectionForPlan(view.sampleResultId, group.plan, seq), error: null };
     } catch (error) {
       return {
         group,
@@ -1746,13 +1741,17 @@ async function persistIndicatorMutation(mutation) {
   const action = mutation.type === "add" ? "Adding" : mutation.type === "update" ? "Updating" : "Removing";
   setIndicatorStatus(`${action} ${actionLabel}…`);
   setIndicatorBusy(true);
+  const projectionOutcome = prepareCurrentChartProjection(seq, request.spec).then(
+    (value) => ({ value, error: null }),
+    (error) => ({ value: null, error }),
+  );
   let record;
   let conflict = false;
   try {
     record = await saveVisualizationRevision(request, seq);
   } catch (error) {
     if (seq !== state.openSeq) return false;
-    if (error?.code === "visualization_revision_conflict" && error.currentVisualization) {
+    if (error?.code === "sample_visualization_revision_conflict" && error.currentVisualization) {
       record = error.currentVisualization;
       conflict = true;
     } else {
@@ -1766,7 +1765,13 @@ async function persistIndicatorMutation(mutation) {
   installCanonicalVisualization(request, record, { resetPresentation: true });
   state.indicatorDraft = null;
   try {
-    await renderCurrentChart(seq);
+    let prepared = null;
+    if (!conflict) {
+      const outcome = await projectionOutcome;
+      if (outcome.error) throw outcome.error;
+      prepared = outcome.value;
+    }
+    await renderCurrentChart(seq, prepared);
     setIndicatorStatus(
       conflict
         ? "Visualization changed elsewhere. Loaded the current server indicators without merging."
@@ -1980,7 +1985,7 @@ function restoreCanonicalDrawingPresentation() {
 function failDrawingPersistence(inFlight, error) {
   if (state.drawingSaveInFlight !== inFlight || inFlight.openSeq !== state.openSeq) return;
   state.drawingSaveInFlight = null;
-  const conflict = error?.code === "visualization_revision_conflict";
+  const conflict = error?.code === "sample_visualization_revision_conflict";
   const installedConflictCurrent = conflict && !!error.currentVisualization;
   if (conflict) {
     if (installedConflictCurrent) {
@@ -2089,11 +2094,14 @@ function persistDrawingEvent(event) {
   }
 }
 
-async function renderCurrentChart(seq) {
+async function prepareCurrentChartProjection(
+  seq,
+  presentationSpec = state.visualizationPresentationSpec,
+) {
   const core = window.TradeChartCore;
   if (!core || !window.LightweightCharts?.createChart) throw new Error("TradeChartCore is unavailable.");
   const view = state.resultView;
-  const canonicalSpec = core.normalizeVisualizationSpec({ dataKeys: view.dataKeys }, state.visualizationPresentationSpec);
+  const canonicalSpec = core.normalizeVisualizationSpec({ dataKeys: view.dataKeys }, presentationSpec);
   const spec = projectBasicVisualizationSpec(canonicalSpec);
   const candle = candleInstance(spec, state.selectedInstrumentId, state.period);
   const panes = financialPaneLayout(spec, candle);
@@ -2101,11 +2109,64 @@ async function renderCurrentChart(seq) {
     pane,
     result: await projectPane(view, pane, spec, seq),
   })));
+  if (seq !== state.openSeq) throw new Error("Stock selection changed.");
+  return { canonicalSpec, spec, candle, panes, paneResults };
+}
+
+async function renderCurrentChart(seq, preparedProjection = null) {
+  const core = window.TradeChartCore;
+  if (!core || !window.LightweightCharts?.createChart) throw new Error("TradeChartCore is unavailable.");
+  const prepared = preparedProjection || await prepareCurrentChartProjection(seq);
+  const { spec, candle, panes, paneResults } = prepared;
   if (seq !== state.openSeq) return;
-  disposeChart();
   const host = byId("bwChart");
+  const previousMainContext = state.chartContext;
+  const previousSubscription = state.chartSubscription;
+  const previousRange = state.chart?.timeScale?.().getVisibleRange?.() || null;
+  for (const unsubscribe of state.paneTimeSubscriptions || []) {
+    try { unsubscribe?.(); } catch { /* time-range listener cleanup */ }
+  }
+  state.paneTimeSubscriptions = [];
+  try { state.chartObserver?.disconnect?.(); } catch { /* resize observer cleanup */ }
+  state.chartObserver = null;
+  const existingFrames = new Map(
+    [...host.children]
+      .filter((item) => item?.dataset?.paneId)
+      .map((item) => [item.dataset.paneId, item]),
+  );
+  const canReconcile = state.paneContexts.length > 0
+    && state.paneContexts.length === state.paneCharts.length
+    && state.paneContexts.every((context) => (
+      typeof context?.paneId === "string"
+      && typeof context?.reconcile === "function"
+      && existingFrames.has(context.paneId)
+    ));
+  if (!canReconcile && state.paneContexts.length) disposeChart();
   host.style.setProperty("--bw-oscillator-count", String(Math.max(0, panes.length - 1)));
+  const existing = new Map();
+  if (canReconcile) {
+    state.paneContexts.forEach((context, index) => existing.set(context.paneId, {
+      context,
+      chart: state.paneCharts[index],
+      frame: existingFrames.get(context.paneId),
+    }));
+  }
   const mounts = panes.map((pane, index) => {
+    const retained = existing.get(pane.id);
+    if (retained) {
+      retained.frame.className = `bw-chart-pane ${index === 0 ? "bw-chart-pane-main" : "bw-chart-pane-oscillator"}`;
+      retained.frame.setAttribute("aria-label", `${pane.title} chart Pane`);
+      const label = retained.frame.querySelector(".bw-chart-pane-label");
+      if (label) label.textContent = pane.title;
+      host.append(retained.frame);
+      return {
+        pane,
+        frame: retained.frame,
+        container: retained.frame.querySelector(".bw-chart-pane-surface"),
+        chart: retained.chart,
+        context: retained.context,
+      };
+    }
     const frame = document.createElement("section");
     frame.className = `bw-chart-pane ${index === 0 ? "bw-chart-pane-main" : "bw-chart-pane-oscillator"}`;
     frame.dataset.paneId = pane.id;
@@ -2117,34 +2178,64 @@ async function renderCurrentChart(seq) {
     container.className = "bw-chart-pane-surface";
     frame.append(label, container);
     host.append(frame);
-    return { pane, frame, container };
+    return { pane, frame, container, chart: null, context: null };
   });
   const diagnostics = [];
   const resizeTargets = [];
   paneResults.forEach(({ pane, result }, index) => {
-    const { container } = mounts[index];
-    const timeInfo = core.paneTimeInfo(result, pane, spec);
-    const chart = core.createFinancialChart(container, {
-      timeZone: spec.timeZone,
-      showTime: state.period !== "day" && timeInfo.showTime,
-      logScale: !!pane.view.logScale,
-    });
-    const context = core.drawFinancialPane(window.LightweightCharts, chart, result, pane, spec);
-    state.paneCharts.push(chart);
-    state.paneContexts.push(context);
+    const mount = mounts[index];
+    const { container } = mount;
+    const preparedPane = core.prepareFinancialPane(result, pane, spec);
+    const timeInfo = core.paneTimeInfo(result, pane, spec, preparedPane);
+    let { chart, context } = mount;
+    let paneDiagnostics;
+    if (chart && context) {
+      chart.applyOptions({
+        rightPriceScale: { mode: core.priceScaleMode(!!pane.view.logScale) },
+      });
+      const reconciled = context.reconcile(result, pane, spec, preparedPane);
+      paneDiagnostics = reconciled.diagnostics || [];
+    } else {
+      chart = core.createFinancialChart(container, {
+        timeZone: spec.timeZone,
+        showTime: state.period !== "day" && timeInfo.showTime,
+        logScale: !!pane.view.logScale,
+      });
+      context = core.drawFinancialPane(
+        window.LightweightCharts, chart, result, pane, spec, preparedPane,
+      );
+      mount.chart = chart;
+      mount.context = context;
+      paneDiagnostics = context.diagnostics || [];
+    }
     resizeTargets.push({ chart, container });
-    diagnostics.push(...(timeInfo.diagnostics || []), ...(context.diagnostics || []));
+    diagnostics.push(...(timeInfo.diagnostics || []), ...paneDiagnostics);
   });
-  state.chart = state.paneCharts[0];
-  state.chartContext = state.paneContexts[0];
+  const targetPaneIds = new Set(panes.map((pane) => pane.id));
+  for (const [paneId, retained] of existing) {
+    if (targetPaneIds.has(paneId)) continue;
+    for (const cleanup of retained.context?.cleanups || []) {
+      try { cleanup(); } catch { /* obsolete Pane cleanup isolation */ }
+    }
+    try { retained.chart?.remove?.(); } catch { /* obsolete chart cleanup */ }
+    retained.frame?.remove?.();
+  }
+  state.paneCharts = mounts.map((mount) => mount.chart);
+  state.paneContexts = mounts.map((mount) => mount.context);
+  state.chart = state.paneCharts[0] || null;
+  state.chartContext = state.paneContexts[0] || null;
   diagnostics.splice(0, diagnostics.length, ...diagnostics
     .filter((item, index, items) => item?.message && items.findIndex((candidate) => (
       candidate?.code === item.code
       && candidate?.visualizerId === item.visualizerId
       && candidate?.message === item.message
     )) === index));
-  state.paneCharts.forEach((chart) => chart.timeScale().fitContent());
-  const mainRange = state.chart.timeScale().getVisibleRange?.();
+  if (previousRange && canReconcile) {
+    state.paneCharts.forEach((chart) => chart.timeScale().setVisibleRange?.(previousRange));
+  } else {
+    state.paneCharts.forEach((chart) => chart.timeScale().fitContent());
+  }
+  const mainRange = state.chart?.timeScale?.().getVisibleRange?.();
   if (mainRange) {
     state.paneCharts.slice(1).forEach((chart) => chart.timeScale().setVisibleRange?.(mainRange));
   }
@@ -2158,7 +2249,9 @@ async function renderCurrentChart(seq) {
     resizeTargets.forEach(({ container }) => state.chartObserver.observe(container));
   }
   const controller = state.chartContext.interactionController;
-  state.chartSubscription = controller.subscribe((event) => {
+  if (state.chartContext !== previousMainContext) {
+    try { previousSubscription?.(); } catch { /* prior chart listener cleanup */ }
+    state.chartSubscription = controller.subscribe((event) => {
     if (event.type === "selection") {
       state.selectedDrawingId = event.visualizerId || "";
       const remove = byId("bwDrawingTools").querySelector("[data-drawing-delete]");
@@ -2180,7 +2273,10 @@ async function renderCurrentChart(seq) {
     } else if (["commit", "delete"].includes(event.type)) {
       void persistDrawingEvent(event);
     }
-  });
+    });
+  } else {
+    state.chartSubscription = previousSubscription;
+  }
   renderDrawingTools(controller, candle.item.id);
   renderIndicatorTools();
   hideChartState();
@@ -2191,15 +2287,9 @@ async function renderCurrentChart(seq) {
 }
 
 async function loadMaterializedResult(openResponse, seq) {
-  const completed = await waitForBacktest(openResponse.job, seq);
-  if (seq !== state.openSeq) return;
-  openResponse.job = completed;
   renderProvenance(openResponse);
-  setOpenStatus("Backtest completed. Verifying Result contracts…");
-  const view = requireBacktestView(
-    await getJson(`/api/backtests/${encodeURIComponent(completed.backtestId)}/view`),
-    openResponse,
-  );
+  setOpenStatus("Sampler cache ready. Verifying DataKey and Visualizer contracts…");
+  const view = structuredClone(openResponse.materialization.sampleResult);
   if (!state.catalog) {
     setOpenStatus("Loading Basic Visualizer and temporary Module definitions…");
     await loadCatalog();
@@ -2210,13 +2300,13 @@ async function loadMaterializedResult(openResponse, seq) {
     openResponse.instrument.instrumentId,
     openResponse.barSnapshot.period,
   );
-  setOpenStatus("Persisting the server-built Candles Visualizer after Result completion…");
+  setOpenStatus("Loading the saved Candles Visualization…");
   let saved = await loadCurrentVisualization(request, seq);
   const loadedSavedVisualization = !!saved;
   try {
     if (!saved) saved = await saveVisualizationRevision(request, seq);
   } catch (error) {
-    if (error?.code !== "visualization_revision_conflict") throw error;
+    if (error?.code !== "sample_visualization_revision_conflict") throw error;
     if (!error.currentVisualization) {
       throw new Error("Visualization changed elsewhere, but the conflict response had no valid current record.");
     }
@@ -2259,23 +2349,24 @@ async function loadMaterializedResult(openResponse, seq) {
 
 function readyCacheLabel() {
   const evidence = state.cacheEvidence;
-  if (evidence.materializationHit) return " · Materialization cache hit";
+  if (evidence.sampleResultHit) return " · Sampler cache hit";
   if (evidence.serverProjectionHits > 0) return " · Result cache hit";
   if (evidence.browserProjectionHits > 0) return " · Browser render cache hit";
   return " · Cached for next open";
 }
 
-async function openInstrument(instrumentId) {
-  const snapshot = state.market?.snapshot;
+async function openInstrument(instrumentId, initialSelection = null) {
+  const snapshotId = initialSelection?.snapshotId || state.market?.snapshot?.snapshotId;
+  const period = initialSelection?.period || state.period;
   const instrument = marketInstrument(instrumentId);
-  if (!snapshot || !instrument || state.openBusy) return;
-  if (!instrument.availablePeriods.includes(state.period)) {
+  if (!snapshotId || state.openBusy) return;
+  if (instrument && !instrument.availablePeriods.includes(period)) {
     setOpenStatus(`${instrument.symbol} has no ${state.period} snapshot.`, true);
     return;
   }
-  if (state.activeOpen?.snapshotId === snapshot.snapshotId
+  if (state.activeOpen?.snapshotId === snapshotId
       && state.activeOpen?.instrument?.instrumentId === instrumentId
-      && state.activeOpen?.barSnapshot?.period === state.period) return;
+      && state.activeOpen?.barSnapshot?.period === period) return;
   state.openBusy = true;
   state.selectedInstrumentId = instrumentId;
   renderInstrumentHeader();
@@ -2294,34 +2385,48 @@ async function openInstrument(instrumentId) {
   state.indicatorDialogOpen = false;
   state.indicatorDraft = null;
   state.cacheEvidence = {
-    materializationHit: false,
+    sampleResultHit: false,
     browserProjectionHits: 0,
     serverProjectionHits: 0,
   };
   disposeChart();
   syncChartBusyState();
   renderIndicatorTools();
-  setIndicatorStatus("Indicators become available after the Result is ready.");
+  setIndicatorStatus("Indicators become available after the Sampler cache is ready.");
   resetProvenance();
-  showChartState(`Materializing ${instrument.symbol}…`, "Downloading the selected bar snapshot and publishing ordinary Trade Engine resources.");
-  setOpenStatus("Creating Dataset and Pipeline through Basic application services…");
+  showChartState(`Opening ${instrument?.symbol || "stock"}…`, "Checking the sealed Sampler timeline cache.");
+  setOpenStatus("Checking the chart cache…");
   try {
-    const response = requireOpenResponse(await postJson("/api/subsystems/basic/instruments/open", {
-      snapshotId: snapshot.snapshotId,
-      instrumentId: instrument.instrumentId,
-      period: state.period,
-    }), {
-      snapshotId: snapshot.snapshotId,
-      instrumentId: instrument.instrumentId,
-      period: state.period,
-    });
+    const selection = {
+      snapshotId,
+      instrumentId,
+      period,
+    };
+    let response;
+    for (let polls = 0; polls < 600; polls += 1) {
+      response = requireOpenResponse(
+        await postJson("/api/subsystems/basic/charts/open", selection),
+        selection,
+      );
+      if (seq !== state.openSeq) return;
+      installOpenMarketContext(response);
+      if (response.ready) break;
+      if (response.cacheJob.status === "failed") {
+        throw new Error(response.cacheJob.error || "Chart cache preparation failed.");
+      }
+      setOpenStatus(
+        response.cacheJob.status === "running"
+          ? "Preparing Dataset → Sampler cache…"
+          : "Chart cache queued with interactive priority…",
+      );
+      await wait(250);
+    }
+    if (!response?.ready) throw new Error("Chart cache did not become ready in time.");
     if (seq !== state.openSeq) return;
-    state.cacheEvidence.materializationHit = response.cache.materializationHit;
+    state.cacheEvidence.sampleResultHit = response.cache.sampleResultHit;
     state.activeOpen = response;
     renderProvenance(response);
-    if (response.cache.materializationHit) {
-      setOpenStatus("Materialization cache hit. Loading the saved Result and Visualization…");
-    }
+    setOpenStatus("Sampler cache hit. Loading the saved Visualization…");
     await loadMaterializedResult(response, seq);
   } catch (error) {
     if (seq !== state.openSeq) return;
@@ -2345,7 +2450,7 @@ async function loadCatalog() {
   state.catalogPromise = (async () => {
     const [visualizers, modules] = await Promise.all([
       getJson("/api/visualizers"),
-      getJson("/api/modules?kind=Signal&limit=500"),
+      getJson("/api/subsystems/basic/chart-catalog"),
     ]);
     state.catalog = {
       visualizers: (visualizers.visualizers || []).filter(protocolOwned),
@@ -2424,17 +2529,10 @@ async function main() {
     state.selectedInstrumentId = selection.instrumentId;
     state.period = selection.period;
     const catalogPromise = loadCatalog();
-    const market = await loadMarket();
-    if (!market.snapshot) throw new Error("The requested market snapshot is unavailable.");
-    if (market.snapshot.snapshotId !== selection.snapshotId) {
-      throw new Error("The requested snapshot is no longer the current Basic market snapshot.");
-    }
-    const instrument = marketInstrument(selection.instrumentId);
-    if (!instrument) throw new Error("The requested instrument is outside this market snapshot.");
-    if (!instrument.availablePeriods.includes(selection.period)) {
-      throw new Error(`${instrument.symbol} has no ${selection.period} snapshot.`);
-    }
-    await Promise.all([catalogPromise, openInstrument(selection.instrumentId)]);
+    await Promise.all([
+      catalogPromise,
+      openInstrument(selection.instrumentId, selection),
+    ]);
   } catch (error) {
     const message = error?.message || "Basic workspace could not be opened.";
     setStatus(message, true);

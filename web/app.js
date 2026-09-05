@@ -924,7 +924,9 @@ async function postJson(path, payload, options = {}) {
   });
   let data;
   try {
-    data = await response.json();
+    data = options.projection && window.TradeChartCore?.parseProjectionResponse
+      ? await window.TradeChartCore.parseProjectionResponse(response)
+      : await response.json();
   } catch (error) {
     if (response.ok) throw error;
     data = {};
@@ -946,7 +948,7 @@ async function postResultJson(path, payload, controller, timeoutMessage) {
     controller.abort();
   }, RESULT_REQUEST_TIMEOUT_MS);
   try {
-    return await postJson(path, payload, { signal: controller.signal });
+    return await postJson(path, payload, { signal: controller.signal, projection: true });
   } catch (error) {
     if (timedOut) throw new Error(timeoutMessage);
     throw error;
@@ -7589,7 +7591,12 @@ async function ensurePaneResultLoaded(pane, spec, { force = false, visualizerId 
       try {
         const response = await postResultJson(
           `/api/backtests/${encodeURIComponent(backtestId)}/result`,
-          { paths: plan.paths, temporaryModules: plan.temporaryModules },
+          {
+            paths: plan.paths,
+            temporaryModules: plan.temporaryModules,
+            projectionFormat: "columns-v2",
+            window: null,
+          },
           controller,
           "Chart data request timed out. Retry when the Result service is available.",
         );
@@ -9064,11 +9071,11 @@ function createDrawingToolbar(paneIndex, controller, interactionSurface) {
   syncButtons();
   return {
     element,
-    cleanup() {
+    cleanup({ disposeController = true } = {}) {
       unsubscribe?.();
       element.removeEventListener("keydown", onKeyDown);
       interactionSurface?.removeEventListener?.("keydown", onKeyDown);
-      controller?.dispose?.();
+      if (disposeController) controller?.dispose?.();
     },
   };
 }
@@ -9323,9 +9330,17 @@ function renderChartControls(result, spec, pane, paneIndex) {
 }
 
 function clearResultCharts() {
-  state.resultCharts.forEach(({ chart, observer, cleanups = [] }) => {
+  state.resultCharts.forEach(({
+    chart, observer, cleanups = [], chartContext = null,
+    drawingToolbar = null, viewCleanup = null,
+  }) => {
     try { observer?.disconnect(); } catch { /* continue cleanup */ }
-    runChartCleanups(cleanups);
+    if (chartContext) {
+      try { drawingToolbar?.cleanup?.({ disposeController: false }); } catch { /* continue cleanup */ }
+      runChartCleanups([viewCleanup, ...(chartContext.cleanups || [])]);
+    } else {
+      runChartCleanups(cleanups);
+    }
     try { chart?.remove?.(); } catch { /* continue cleanup */ }
   });
   state.resultCharts = [];
@@ -9333,10 +9348,19 @@ function clearResultCharts() {
 
 function drawVisualization(spec) {
   const area = $("chartArea");
-  clearResultCharts();
-  area.innerHTML = "";
+  const previousEntries = new Map(state.resultCharts
+    .filter((entry) => typeof entry?.paneId === "string" && entry.paneId)
+    .map((entry) => [entry.paneId, entry]));
+  previousEntries.forEach((entry) => {
+    try { entry.observer?.disconnect?.(); } catch { /* retained chart UI cleanup */ }
+    runChartCleanups([entry.viewCleanup]);
+    try { entry.drawingToolbar?.cleanup?.({ disposeController: false }); } catch { /* retained controller remains owned by Chart Core */ }
+  });
+  state.resultCharts = [];
+  area.replaceChildren();
   area.dataset.backtestId = state.selectedBacktest?.backtestId || "";
   const library = window.LightweightCharts;
+  const retainedPaneIds = new Set();
   if (state.selectedBacktest?.discoveryError) {
     const failure = document.createElement("div");
     failure.className = "chart-load-error";
@@ -9364,6 +9388,9 @@ function drawVisualization(spec) {
     area.appendChild(panel);
     if (pane.collapsed) return;
     let chartForCleanup = null;
+    let chartContextForCleanup = null;
+    let drawingToolbarForCleanup = null;
+    let retainedEntry = null;
     try {
     const result = paneResult(pane, spec);
     const scoped = paneScopedSpec(spec, pane);
@@ -9410,7 +9437,12 @@ function drawVisualization(spec) {
       panel.appendChild(missing);
       return;
     }
-    const timeInfo = window.TradeChartCore.paneTimeInfo(result, pane, scoped);
+    const preparedPane = window.TradeChartCore.prepareFinancialPane(
+      result, pane, scoped,
+    );
+    const timeInfo = window.TradeChartCore.paneTimeInfo(
+      result, pane, scoped, preparedPane,
+    );
     const zone = currentResultTimeZone(spec);
     const viewToolbar = document.createElement("div");
     viewToolbar.className = "chart-view-toolbar";
@@ -9428,28 +9460,65 @@ function drawVisualization(spec) {
       <span class="chart-view-error" data-chart-view-error="${paneIndex}" hidden></span>
     `;
     panel.appendChild(viewToolbar);
-    const container = document.createElement("div");
+    const candidate = previousEntries.get(pane.id) || null;
+    const canRetain = candidate
+      && candidate.timeZone === zone.timeZone
+      && candidate.showTime === timeInfo.showTime
+      && typeof candidate.chartContext?.reconcile === "function";
+    retainedEntry = canRetain ? candidate : null;
+    const container = retainedEntry?.container || document.createElement("div");
     container.className = "tv-chart";
     container.style.height = "460px";
     container.tabIndex = 0;
     container.setAttribute("aria-label", `${semanticPaneTitle(pane, paneIndex)} drawing surface`);
     panel.appendChild(container);
-    const chart = window.TradeChartCore.createFinancialChart(container, {
-      timeZone: zone.timeZone,
-      showTime: timeInfo.showTime,
-      logScale: !!pane.view.logScale,
-    });
-    chartForCleanup = chart;
-    const chartContext = window.TradeChartCore.drawFinancialPane(library, chart, result, pane, scoped);
+    let chart = retainedEntry?.chart || null;
+    let chartContext = retainedEntry?.chartContext || null;
+    let reconcileDiagnostics = [];
+    const retainedRange = chart?.timeScale?.().getVisibleRange?.() || null;
+    if (chart && chartContext) {
+      chart.applyOptions({
+        rightPriceScale: { mode: window.TradeChartCore.priceScaleMode(!!pane.view.logScale) },
+      });
+      const reconciled = chartContext.reconcile(result, pane, scoped, preparedPane);
+      if (reconciled.updated !== true) {
+        runChartCleanups(chartContext.cleanups || []);
+        try { chart.remove?.(); } catch { /* rebuild below */ }
+        chart = null;
+        chartContext = null;
+        retainedEntry = null;
+      } else {
+        reconcileDiagnostics = reconciled.diagnostics || [];
+        retainedPaneIds.add(pane.id);
+      }
+    }
+    if (!chart || !chartContext) {
+      if (candidate && candidate !== retainedEntry) {
+        runChartCleanups(candidate.chartContext?.cleanups || candidate.cleanups || []);
+        try { candidate.chart?.remove?.(); } catch { /* replacement continues */ }
+        retainedPaneIds.add(pane.id);
+      }
+      chart = window.TradeChartCore.createFinancialChart(container, {
+        timeZone: zone.timeZone,
+        showTime: timeInfo.showTime,
+        logScale: !!pane.view.logScale,
+      });
+      chartForCleanup = chart;
+      chartContext = window.TradeChartCore.drawFinancialPane(
+        library, chart, result, pane, scoped, preparedPane,
+      );
+    }
+    chartContextForCleanup = chartContext;
     const drawingToolbar = createDrawingToolbar(
       paneIndex,
       chartContext?.interactionController || null,
       container,
     );
+    drawingToolbarForCleanup = drawingToolbar;
     panel.insertBefore(drawingToolbar.element, container);
     const diagnostics = mergeChartDiagnostics(
       timeInfo?.diagnostics,
-      chartContext?.diagnostics,
+      retainedEntry ? reconcileDiagnostics : chartContext?.diagnostics,
     ).filter((item) => !(
       item?.code === "missing-instance-result"
       && pendingVisualizerIds.has(item?.visualizerId)
@@ -9461,7 +9530,9 @@ function drawVisualization(spec) {
     const savedEnd = timeInfo.end == null
       ? null
       : (typeof storedEnd === "number" && Number.isFinite(storedEnd) ? Math.min(storedEnd, timeInfo.end) : timeInfo.end);
-    if (pane.view.start || pane.view.end) {
+    if (retainedRange && retainedEntry) {
+      chart.timeScale().setVisibleRange(retainedRange);
+    } else if (pane.view.start || pane.view.end) {
       if (savedStart != null && savedEnd != null && savedStart < savedEnd) {
         chart.timeScale().setVisibleRange({ from: savedStart, to: savedEnd });
       } else {
@@ -9493,10 +9564,18 @@ function drawVisualization(spec) {
       chart.timeScale().unsubscribeVisibleTimeRangeChange?.(visibleRangeChanged);
     };
     const entry = {
+      paneId: pane.id,
       paneIndex,
+      panel,
+      container,
       chart,
+      chartContext,
+      drawingToolbar,
       observer,
       cleanups: [...(chartContext?.cleanups || []), drawingToolbar.cleanup, viewCleanup],
+      viewCleanup,
+      timeZone: zone.timeZone,
+      showTime: timeInfo.showTime,
       controls,
       controlsButton: title.querySelector(`[data-toggle-chart-controls="${paneIndex}"]`),
       rangeStartInput: viewToolbar.querySelector(`[data-chart-start="${paneIndex}"]`),
@@ -9509,12 +9588,25 @@ function drawVisualization(spec) {
     viewToolbar.querySelector(`[data-fit-chart="${paneIndex}"]`)?.addEventListener("click", () => fitChartPane(paneIndex));
     entry.logButton?.addEventListener("click", () => toggleChartLogScale(paneIndex));
     } catch (error) {
+      if (retainedEntry) {
+        runChartCleanups(retainedEntry.chartContext?.cleanups || retainedEntry.cleanups || []);
+        try { retainedEntry.chart?.remove?.(); } catch { /* preserve the pane failure */ }
+        retainedPaneIds.add(pane.id);
+      } else if (chartContextForCleanup) {
+        try { drawingToolbarForCleanup?.cleanup?.({ disposeController: false }); } catch { /* continue failed draw cleanup */ }
+        runChartCleanups(chartContextForCleanup.cleanups || []);
+      }
       try { chartForCleanup?.remove?.(); } catch { /* preserve the pane failure */ }
       const failure = document.createElement("div");
       failure.className = "chart-load-error";
       failure.textContent = visibleText(`Chart could not be drawn: ${error?.message || "unknown renderer error"}`);
       panel.appendChild(failure);
     }
+  });
+  previousEntries.forEach((entry, paneId) => {
+    if (retainedPaneIds.has(paneId)) return;
+    runChartCleanups(entry.chartContext?.cleanups || entry.cleanups || []);
+    try { entry.chart?.remove?.(); } catch { /* obsolete Pane cleanup */ }
   });
   area.querySelectorAll("[data-open-chart]").forEach((button) => {
     button.addEventListener("click", () => {

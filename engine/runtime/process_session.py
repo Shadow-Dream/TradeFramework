@@ -605,6 +605,30 @@ def _active_descendants():
     }
 
 
+def set_parent_death_signal(signal_number):
+    """Attach one Linux parent-death signal to the current process."""
+
+    return _set_parent_death_signal(signal_number)
+
+
+def become_child_subreaper():
+    """Make the current isolated executor accountable for late descendants."""
+
+    return _become_child_subreaper()
+
+
+def reap_children():
+    """Reap current-process children and return the kernel no-child proof."""
+
+    return _reap_children()
+
+
+def active_descendants():
+    """Return current descendants and the subset still capable of execution."""
+
+    return _active_descendants()
+
+
 def _run_supervisor(expected_parent_pid, command):
     requested_signal = None
 

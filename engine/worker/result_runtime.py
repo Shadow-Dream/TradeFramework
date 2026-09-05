@@ -7,6 +7,7 @@ import traceback
 from pathlib import Path
 
 from engine.composition.result_projection import project_result
+from engine.composition.sample_result_projection import project_sample_result
 from engine.contracts import strict_json
 from engine.contracts.module import require_exact_fields
 
@@ -16,53 +17,39 @@ def main() -> int:
         raise SystemExit("usage: python -m engine.worker.result_runtime SPEC_PATH")
     spec_path = Path(sys.argv[1]).resolve()
     spec = strict_json.loads(spec_path.read_text(encoding="utf-8"))
+    if spec.get("schemaVersion") == 2:
+        evidence_field = "resultEvidence"
+        evidence_fields = {
+            "path", "manifest", "contentDigest", "resultSize", "request",
+            "metrics", "dataKeys", "executionChain",
+        }
+        projector = project_result
+    elif spec.get("schemaVersion") == 3:
+        evidence_field = "sampleResultEvidence"
+        evidence_fields = {
+            "path", "manifest", "contentDigest", "resultSize", "dataKeys",
+            "execution", "sampleFrameContract",
+        }
+        projector = project_sample_result
+    else:
+        raise ValueError(
+            "Result Runtime specification schemaVersion 2 or 3 is required."
+        )
+    common_fields = {
+        "schemaVersion", evidence_field, "paths", "temporaryModules",
+        "moduleDefinitions", "outputPath",
+    }
     require_exact_fields(
         spec,
-        allowed={
-            "schemaVersion",
-            "resultEvidence",
-            "paths",
-            "temporaryModules",
-            "moduleDefinitions",
-            "outputPath",
-        },
-        required={
-            "schemaVersion",
-            "resultEvidence",
-            "paths",
-            "temporaryModules",
-            "moduleDefinitions",
-            "outputPath",
-        },
+        allowed=common_fields,
+        required=common_fields,
         label="Result Runtime specification",
     )
-    if spec["schemaVersion"] != 2:
-        raise ValueError(
-            "Result Runtime specification schemaVersion 2 is required."
-        )
-    evidence = spec["resultEvidence"]
+    evidence = spec[evidence_field]
     require_exact_fields(
         evidence,
-        allowed={
-            "path",
-            "manifest",
-            "contentDigest",
-            "resultSize",
-            "request",
-            "metrics",
-            "dataKeys",
-            "executionChain",
-        },
-        required={
-            "path",
-            "manifest",
-            "contentDigest",
-            "resultSize",
-            "request",
-            "metrics",
-            "dataKeys",
-            "executionChain",
-        },
+        allowed=evidence_fields,
+        required=evidence_fields,
         label="Result Runtime archive evidence",
     )
     if not isinstance(spec["paths"], list):
@@ -81,7 +68,7 @@ def main() -> int:
     if output_path == result_path or output_path.is_symlink():
         raise ValueError("Result Runtime output path is invalid.")
     try:
-        project_result(
+        projector(
             {**evidence, "path": result_path},
             spec["paths"],
             spec["temporaryModules"],

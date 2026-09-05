@@ -1483,9 +1483,13 @@ vm.runInContext(loader, context);
   );
   assert.equal(callsBeforeRetry, 2);
   assert.equal(calls.length, 3);
-  assert.deepEqual(calls[0], { paths: ['cycles.data.a'], temporaryModules: [] });
+  assert.deepEqual(calls[0], {
+    paths: ['cycles.data.a'], temporaryModules: [],
+    projectionFormat: 'columns-v2', window: null,
+  });
   assert.deepEqual(calls[1], {
     paths: ['cycles.data.raw'], temporaryModules: [{ instanceId: 'thrower' }],
+    projectionFormat: 'columns-v2', window: null,
   });
   assert.deepEqual(calls[2], calls[1]);
   assert.equal(keyBefore, keyAfterStyle);
@@ -1669,7 +1673,10 @@ vm.runInContext(loader, context);
   pane.visualizers[1].params.dataKey = 'b2';
   await context.ensurePaneResultLoaded(pane, spec);
   assert.equal(calls.length, 3);
-  assert.deepEqual(calls[2], { paths: ['cycles.data.b2'], temporaryModules: [] });
+  assert.deepEqual(calls[2], {
+    paths: ['cycles.data.b2'], temporaryModules: [],
+    projectionFormat: 'columns-v2', window: null,
+  });
   assert.equal(cache.entries.get('a'), aEntry);
   assert.equal(context.paneResult(pane, spec).instanceResults.a.token, 'cycles.data.a');
 

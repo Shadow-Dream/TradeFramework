@@ -10,6 +10,80 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class BasicWorkflowSubsystemTests(unittest.TestCase):
+    def test_columnar_projection_binds_exactly_like_row_projection(self):
+        from builtin_implementations.visualizer_contracts import (
+            visualizer_definition_map,
+        )
+
+        core_path = ROOT / "web" / "chart_core.js"
+        definition = visualizer_definition_map()["series.line"]
+        script = textwrap.dedent(
+            f"""
+            const assert = require('node:assert/strict');
+            const fs = require('node:fs');
+            const vm = require('node:vm');
+            const source = fs.readFileSync({json.dumps(str(core_path))}, 'utf8');
+            const context = {{ window: {{}}, structuredClone }};
+            context.globalThis = context;
+            vm.runInNewContext(source, context, {{ filename: {json.dumps(str(core_path))} }});
+            const core = context.window.TradeChartCore;
+            core.setVisualizerDefinitions([{json.dumps(definition)}]);
+            const dataKeys = {{
+              value: {{
+                label: 'value', required: true,
+                schema: {{ type: ['number', 'null'] }},
+                source: {{ path: 'cycles.data.value' }},
+                encoding: {{ value: 'data.value' }},
+              }},
+              time: {{
+                label: 'time', required: true,
+                schema: {{ type: 'string' }},
+                source: {{ path: 'cycles.data.time' }},
+                encoding: {{ value: 'data.time' }},
+              }},
+            }};
+            const cycles = [
+              {{ schemaVersion: 3, cycleId: 'a', decisionTime: '2026-01-01T00:00:00Z', data: {{ value: null, time: '2026-01-01T00:00:00Z' }} }},
+              {{ schemaVersion: 3, cycleId: 'b', decisionTime: '2026-01-02T00:00:00Z', data: {{ value: 2, time: '2026-01-02T00:00:00Z' }} }},
+            ];
+            const columnar = {{
+              projectionSchemaVersion: 2,
+              projectionFormat: 'columns-v2',
+              dataKeys,
+              totalRowCount: 2,
+              window: {{ startIndex: 0, endIndexExclusive: 2 }},
+              columnOrder: ['cycles.data.time', 'cycles.data.value'],
+              columns: {{
+                'cycles.data.time': {{ values: cycles.map((item) => item.data.time), absent: [] }},
+                'cycles.data.value': {{ values: cycles.map((item) => item.data.value), absent: [] }},
+              }},
+            }};
+            const pane = {{ id: 'pane', visualizers: [{{
+              id: 'line', callback: 'series.line', params: {{
+                dataKey: 'value', timeKey: 'time', timeDomainId: 'day', priceScaleId: 'main',
+              }},
+            }}] }};
+            const row = core.prepareFinancialPane({{ dataKeys, cycles }}, pane, {{}});
+            const columns = core.prepareFinancialPane(columnar, pane, {{}});
+            assert.deepEqual(
+              JSON.parse(JSON.stringify(columns.plans[0].inputs)),
+              JSON.parse(JSON.stringify(row.plans[0].inputs)),
+            );
+            assert.deepEqual(
+              JSON.parse(JSON.stringify(columns.plans[0].prepared)),
+              JSON.parse(JSON.stringify(row.plans[0].prepared)),
+            );
+            """
+        )
+        completed = subprocess.run(
+            ["node", "-e", script],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_daily_axis_includes_full_year_and_hides_library_logo(self):
         core_path = ROOT / "web" / "chart_core.js"
         script = textwrap.dedent(
@@ -74,7 +148,7 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
         self.assertNotIn('id="bwFavoriteInstrument"', workspace_topbar)
         self.assertIn('id="bwSyncMarket" type="button" aria-label="Refresh the complete stock list">Refresh stock list</button>', home)
         self.assertNotIn("Sync snapshot", home)
-        self.assertIn("Price data is downloaded when a workspace opens.", home)
+        self.assertIn("Starred stocks prepare their Dataset → Sampler chart cache in the background.", home)
         self.assertIn('id="bwStatus" class="bw-plain-status"', home)
         self.assertIn('id="bwStatus" class="bw-plain-status"', workspace)
         self.assertIn('id="bwInstrumentList"', home)
@@ -133,8 +207,8 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
         self.assertIn("instrumentId: instrument.instrumentId", source)
         self.assertIn('period: "day"', source)
         self.assertIn("const MARKET_PAGE_SIZE = 50;", source)
-        self.assertIn("Snapshot cached · ${formatInstant(barSnapshot.lastTime)}", source)
-        self.assertIn("Automatic snapshot queued…", source)
+        self.assertIn("Chart cached · ${formatInstant(barSnapshot.lastTime)}", source)
+        self.assertIn("Chart cache queued…", source)
         self.assertNotIn("dataAsOf.textContent = formatInstant(barSnapshot.asOf);", source)
         self.assertIn('window.addEventListener("pageshow"', source)
         self.assertIn("if (!event.persisted || !state.csrfToken) return;", source)
@@ -144,8 +218,12 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
         self.assertIn('syncButton.textContent = state.syncBusy ? "Refreshing stock list…" : "Refresh stock list";', source)
 
         workspace_source = (ROOT / "web" / "basic_workflow_workspace.js").read_text(encoding="utf-8")
-        self.assertIn('postJson("/api/subsystems/basic/instruments/open"', workspace_source)
+        self.assertIn('postJson("/api/subsystems/basic/charts/open"', workspace_source)
+        self.assertIn('getJson("/api/subsystems/basic/chart-catalog")', workspace_source)
         self.assertNotIn('`${MARKET_ENDPOINT}/sync`', workspace_source)
+        self.assertNotIn('const MARKET_ENDPOINT = "/api/subsystems/basic/market";', workspace_source)
+        self.assertNotIn("async function loadMarket()", workspace_source)
+        self.assertNotIn('/api/modules?kind=Signal&limit=500', workspace_source)
         self.assertNotIn("Refresh stock list", workspace_source)
 
     def test_market_pagination_renders_only_one_page_and_missing_cutoff_is_blank(self):
@@ -209,11 +287,11 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
             ]]), new Map());
             assert.equal(
               present.children[0].children[3].textContent,
-              `Snapshot cached · ${{api.formatInstant(lastTime)}}`,
+              `Chart cached · ${{api.formatInstant(lastTime)}}`,
             );
             assert.equal(
               present.children[0].children[3].title,
-              `Cached K-line snapshot through ${{lastTime}}`,
+              `Cached Sampler timeline through ${{lastTime}}`,
             );
             assert.equal(present.children[0].children[3].dataset.snapshotState, 'cached');
             """
@@ -494,7 +572,7 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
             }}
             assert.match(output, /AAPL/);
             assert.match(output, /1D bars/);
-            assert.match(output, /Queued/);
+            assert.match(output, /Not required for chart/);
             assert.match(ids.bwStatus.textContent, /workspace action failed/i);
             assert.match(ids.bwOpenStatus.textContent, /workspace action failed/i);
             """
@@ -563,10 +641,10 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
             "function mapValues(", 1,
         )[0]
         for value in (
-            '"/api/subsystems/basic/instruments/open"',
+            '"/api/subsystems/basic/charts/open"',
             'core.visualizerDependencyPlan',
             'core.drawFinancialPane',
-            '"/api/visualizations"',
+            '"/api/subsystems/basic/sample-visualizations/save"',
             'expectedRevision',
             'controller?.listTools?.().tools',
         ):
@@ -584,7 +662,7 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
         self.assertNotIn("getJson(", save_revision)
         self.assertIn("result.visualization", save_revision)
         self.assertIn("loadCurrentVisualization(request, seq)", load_materialized)
-        self.assertIn("/api/visualizations?backtestId=", source)
+        self.assertIn('"/api/subsystems/basic/sample-visualizations/list"', source)
         self.assertNotIn("projectionCache.clear()", load_materialized)
         self.assertNotIn("disposeChart({ clearCache: true })", open_instrument)
 
@@ -852,6 +930,9 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
             const instrumented = original.replace(
               'void main();',
               'globalThis.__basicTest = {{ state, persistIndicatorMutation }};',
+            ).replace(
+              'const projectionOutcome = prepareCurrentChartProjection(seq, request.spec).then(',
+              'const projectionOutcome = Promise.resolve(null).then(',
             );
             const classes = new Set();
             const chart = {{
@@ -915,11 +996,11 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
             api.state.openSeq = 4;
             api.state.selectedInstrumentId = 'US-AAPL';
             api.state.period = 'day';
-            api.state.resultView = {{ backtestId: 'bt', dataKeys: {{}} }};
+            api.state.resultView = {{ sampleResultId: 'sample', dataKeys: {{}} }};
             api.state.visualizationCanonical = {{ revision: 1, spec: structuredClone(base) }};
             api.state.visualizationPresentationSpec = structuredClone(base);
             api.state.visualizationSaveRequest = {{
-              backtestId: 'bt', visualizationId: 'current', name: 'current',
+              sampleResultId: 'sample', visualizationId: 'current', name: 'current',
               expectedRevision: 1, spec: structuredClone(base),
             }};
             let renderCalls = 0;
@@ -945,7 +1026,7 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
               const conflictSpec = structuredClone(base);
               context.saveVisualizationRevision = async () => {{
                 const error = new Error('revision conflict');
-                error.code = 'visualization_revision_conflict';
+                error.code = 'sample_visualization_revision_conflict';
                 error.currentVisualization = {{ revision: 9, spec: conflictSpec }};
                 throw error;
               }};
@@ -1305,7 +1386,7 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
 
     def test_basic_chart_uses_core_cleanup_order_without_reversal(self):
         source = (ROOT / "web" / "basic_workflow_workspace.js").read_text(encoding="utf-8")
-        self.assertIn('"/api/subsystems/basic/result-projections"', source)
+        self.assertIn('"/api/subsystems/basic/sample-projections"', source)
         dispose = source.split("function disposeChart(", 1)[1].split(
             "async function projectionForPlan(", 1,
         )[0]
@@ -1353,7 +1434,7 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
               temporaryModules: [module],
             }}));
             context.window.TradeChartCore = {{ visualizerDependencyPlan() {{ return plans; }} }};
-            const view = {{ backtestId: 'bt_1', dataKeys: {{}} }};
+            const view = {{ sampleResultId: 'sample', dataKeys: {{}} }};
             const first = api.projectPane(view, {{}}, {{}}, 4);
             await Promise.resolve();
             assert.equal(calls.length, 1, 'three Bollinger output paths must share one Runtime');
@@ -1454,7 +1535,7 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
               }}],
             }}] }};
             api.state.visualizationSaveRequest = {{
-              backtestId: 'bt', visualizationId: 'current', name: 'current',
+              sampleResultId: 'sample', visualizationId: 'current', name: 'current',
               expectedRevision: 1, spec: structuredClone(api.state.visualizationSpec),
             }};
             api.state.chartContext = {{ interactionController: {{
@@ -1516,7 +1597,7 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
               }};
               context.saveAndVerifyVisualization = async () => {{
                 const error = new Error('revision conflict');
-                error.code = 'visualization_revision_conflict';
+                error.code = 'sample_visualization_revision_conflict';
                 throw error;
               }};
               context.reloadVisualizationAfterConflict = async () => {{
@@ -1546,7 +1627,7 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
               }};
               context.saveAndVerifyVisualization = async () => {{
                 const error = new Error('revision conflict');
-                error.code = 'visualization_revision_conflict';
+                error.code = 'sample_visualization_revision_conflict';
                 throw error;
               }};
               context.reloadVisualizationAfterConflict = async () => {{ throw new Error('reload unavailable'); }};
@@ -1645,7 +1726,7 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
             api.state.visualizationCanonical = {{ revision: 1, spec: structuredClone(baseSpec) }};
             api.state.visualizationPresentationSpec = structuredClone(baseSpec);
             api.state.visualizationSaveRequest = {{
-              backtestId: 'bt', visualizationId: 'current', name: 'current',
+              sampleResultId: 'sample', visualizationId: 'current', name: 'current',
               expectedRevision: 1, spec: structuredClone(baseSpec),
             }};
             let cancelCalls = 0;
@@ -1746,9 +1827,9 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
               const serverSpec = structuredClone(api.state.visualizationCanonical.spec);
               serverSpec.panes[0].visualizers.push(serverDrawing);
               const conflict = new Error('revision conflict');
-              conflict.code = 'visualization_revision_conflict';
+              conflict.code = 'sample_visualization_revision_conflict';
               conflict.currentVisualization = {{
-                visualizationId: 'current', backtestId: 'bt', name: 'current',
+                visualizationId: 'current', sampleResultId: 'sample', name: 'current',
                 createdAt: '2026-08-26T20:00:00Z', revision: 9, spec: serverSpec,
               }};
               saves[4].reject(conflict);
@@ -1843,15 +1924,15 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
               schemaVersion: 3, datasetId: 'dataset', timeZone: 'UTC', panes: [],
             }};
             const request = {{
-              backtestId: 'bt', visualizationId: 'current', name: 'current',
+              sampleResultId: 'sample', visualizationId: 'current', name: 'current',
               expectedRevision: 4, spec,
             }};
             const current = {{
-              visualizationId: 'current', backtestId: 'bt', name: 'current',
+              visualizationId: 'current', sampleResultId: 'sample', name: 'current',
               createdAt: '2026-08-26T20:00:00Z', revision: 7, spec,
             }};
             let payload = {{
-              accepted: false, code: 'visualization_revision_conflict',
+              accepted: false, code: 'sample_visualization_revision_conflict',
               error: 'revision conflict', visualization: current,
             }};
             let postCalls = 0;
@@ -1870,17 +1951,17 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
               try {{
                 await api.saveVisualizationRevision(structuredClone(request), 3);
               }} catch (error) {{ conflict = error; }}
-              assert.equal(conflict.code, 'visualization_revision_conflict');
+              assert.equal(conflict.code, 'sample_visualization_revision_conflict');
               assert.deepEqual(conflict.currentVisualization, current);
               assert.equal(postCalls, 1);
               assert.equal(getCalls, 0);
 
-              payload.visualization = {{ ...current, backtestId: 'other' }};
+              payload.visualization = {{ ...current, sampleResultId: 'other' }};
               let malformed;
               try {{
                 await api.saveVisualizationRevision(structuredClone(request), 3);
               }} catch (error) {{ malformed = error; }}
-              assert.equal(malformed.code, 'visualization_revision_conflict');
+              assert.equal(malformed.code, 'sample_visualization_revision_conflict');
               assert.equal(malformed.currentVisualization, null);
 
               payload.visualization = {{ ...current, unexpected: true }};
@@ -1903,7 +1984,7 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    def test_open_response_requires_exact_pipeline_content_digest(self):
+    def test_open_response_requires_exact_sample_result_content_digest(self):
         script = textwrap.dedent(
             f"""
             const assert = require('node:assert/strict');
@@ -1927,6 +2008,7 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
             const digest = `sha256:${{'a'.repeat(64)}}`;
             const response = {{
               accepted: true,
+              ready: true,
               protocolId: basic,
               snapshotId: 'snapshot-1',
               instrument: {{
@@ -1934,6 +2016,7 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
                 exchange: 'NASDAQ', currency: 'USD', assetType: 'stock',
                 availablePeriods: ['day'],
               }},
+              watchlistInstrumentIds: ['US-AAPL'],
               barSnapshot: {{
                 providerId: 'nasdaq-us-snapshot', asOf: '2026-08-25T20:00:00Z',
                 period: 'day', firstTime: '2026-08-25T20:00:00Z',
@@ -1942,37 +2025,36 @@ class BasicWorkflowSubsystemTests(unittest.TestCase):
               }},
               materialization: {{
                 dataset: {{ datasetId: 'dataset-1', datasetVersionId: digest, protocolId: basic }},
-                pipeline: {{ pipelineId: 'pipe-1', version: '2', protocolId: basic, contentDigest: digest }},
                 sampler: {{ samplerId: 'sampler-1', version: '1', protocolId: basic }},
-                environment: {{ environmentId: 'environment-1', version: '1', protocolId: basic }},
-                analysis: {{ analysisId: 'analysis-1', version: '1', protocolId: basic }},
-                backtestRequest: {{}},
+                sampleResult: {{
+                  sampleResultId: digest, resultContentDigest: digest, dataKeys: {{}},
+                  datasetId: 'dataset-1', datasetVersionId: digest,
+                }},
                 visualizationSaveRequest: {{
-                  backtestId: 'bt-1', visualizationId: 'bt-1-current', name: 'current',
+                  sampleResultId: digest, visualizationId: 'sample-current', name: 'current',
                   expectedRevision: 0, spec: {{}},
                 }},
               }},
-              job: {{ jobId: 'job-1', backtestId: 'bt-1', status: 'queued' }},
-              prepared: {{ requestDigest: digest, snapshotHash: digest }},
-              cache: {{ materializationHit: false }},
+              cacheJob: {{ jobId: 'job-1', status: 'completed', instrumentId: 'US-AAPL', period: 'day' }},
+              cache: {{ sampleResultHit: true }},
             }};
             const expected = {{ snapshotId: 'snapshot-1', instrumentId: 'US-AAPL', period: 'day' }};
             assert.equal(
               context.__basicTest.requireOpenResponse(structuredClone(response), expected)
-                .materialization.pipeline.contentDigest,
+                .materialization.sampleResult.resultContentDigest,
               digest,
             );
             const missing = structuredClone(response);
-            delete missing.materialization.pipeline.contentDigest;
+            delete missing.materialization.sampleResult.resultContentDigest;
             assert.throws(
               () => context.__basicTest.requireOpenResponse(missing, expected),
-              /Materialized Pipeline.contentDigest must be a non-empty canonical string/,
+              /Materialized Sample Result digest must be a non-empty canonical string/,
             );
             const malformed = structuredClone(response);
-            malformed.materialization.pipeline.contentDigest = `sha256:${{'A'.repeat(64)}}`;
+            malformed.materialization.sampleResult.resultContentDigest = `sha256:${{'A'.repeat(64)}}`;
             assert.throws(
               () => context.__basicTest.requireOpenResponse(malformed, expected),
-              /Materialized Pipeline.contentDigest must be a canonical sha256 digest/,
+              /Materialized Sample Result digest must be a canonical sha256 digest/,
             );
             """
         )

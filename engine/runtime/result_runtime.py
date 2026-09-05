@@ -101,7 +101,7 @@ def shutdown_result_runtimes():
         raise first_error
 
 
-def _start_result_session(session_key, command, runtime_root, release_metadata):
+def start_result_session(session_key, command, runtime_root, release_metadata):
     """Keep the single Result process launcher behind the shared registry."""
 
     return process_session.PROCESS_SESSIONS.start(
@@ -326,7 +326,7 @@ def verify_result_archive_in_runtimes(evidence):
                 }, sort_keys=True, separators=(",", ":")),
                 encoding="utf-8",
             )
-            entry["session"] = _start_result_session(
+            entry["session"] = start_result_session(
                 session_key,
                 [
                     sys.executable,
@@ -593,7 +593,7 @@ def write_result_projection_in_runtime(
             encoding="utf-8",
         )
         process_started = True
-        session = _start_result_session(
+        session = start_result_session(
             session_key,
             [
                 sys.executable,
@@ -669,8 +669,127 @@ def write_result_projection_in_runtime(
     return destination
 
 
+def write_sample_result_projection_in_runtime(
+    evidence,
+    paths,
+    temporary_modules,
+    module_definitions,
+    destination_path,
+):
+    """Project temporary Modules over a Sample Result in an isolated Runtime."""
+
+    registry = process_session.PROCESS_SESSIONS
+    if registry.is_stopping(_RESULT_SESSION_PREFIX):
+        raise RuntimeError("Engine is stopping and cannot start a Result Runtime.")
+    destination = Path(destination_path).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    runtime_owner = tempfile.TemporaryDirectory(prefix="trade-sample-result-runtime-")
+    runtime_root = Path(runtime_owner.name)
+    session_key = f"{_RESULT_SESSION_PREFIX}{uuid.uuid4().hex}"
+    release_metadata = {
+        "executionRoot": str(runtime_root),
+        "destination": str(destination),
+        "removeDestinationOnRelease": True,
+        "scratchOwner": runtime_owner,
+    }
+    session = None
+    primary_error = None
+    primary_traceback = None
+    cleanup_error = None
+    process_started = False
+    try:
+        spec_path = runtime_root / "spec.json"
+        spec_path.write_text(
+            strict_json.dumps({
+                "schemaVersion": 3,
+                "sampleResultEvidence": {
+                    "path": str(Path(evidence["path"]).resolve()),
+                    "manifest": evidence["manifest"],
+                    "contentDigest": evidence["contentDigest"],
+                    "resultSize": evidence["resultSize"],
+                    "dataKeys": evidence["dataKeys"],
+                    "execution": evidence["execution"],
+                    "sampleFrameContract": evidence["sampleFrameContract"],
+                },
+                "paths": paths,
+                "temporaryModules": temporary_modules,
+                "moduleDefinitions": module_definitions,
+                "outputPath": str(destination),
+            }, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        process_started = True
+        session = start_result_session(
+            session_key,
+            [sys.executable, "-m", "engine.worker.result_runtime", str(spec_path)],
+            runtime_root,
+            release_metadata,
+        )
+        if registry.is_stopping(_RESULT_SESSION_PREFIX):
+            raise RuntimeError("Engine stopped before Result Runtime execution.")
+        while session.poll() is None:
+            if registry.is_stopping(_RESULT_SESSION_PREFIX):
+                raise RuntimeError("Engine stopped during Result Runtime execution.")
+            time.sleep(RESULT_RUNTIME_POLL_SECONDS)
+        return_code = session.wait()
+        if registry.is_stopping(_RESULT_SESSION_PREFIX):
+            raise RuntimeError("Engine stopped during Result Runtime execution.")
+        if return_code != 0:
+            detail = session.stderr_text()[-4000:].strip()
+            raise RuntimeError(
+                detail or f"Result Runtime exited with code {return_code}."
+            )
+    except BaseException as exc:
+        primary_error = exc
+        primary_traceback = exc.__traceback__
+        if session is None:
+            session = registry.get(session_key)
+    if session is not None:
+        try:
+            registry.finish(session_key, session, terminate=primary_error is not None)
+        except BaseException as exc:
+            cleanup_error = exc
+    retained = session is not None and registry.is_current(session_key, session)
+    if primary_error is None and cleanup_error is None:
+        try:
+            valid_destination = destination.is_file() and not destination.is_symlink()
+        except BaseException as exc:
+            primary_error = exc
+            primary_traceback = exc.__traceback__
+        else:
+            if not valid_destination:
+                primary_error = RuntimeError(
+                    "Result Runtime completed without its projected Result document."
+                )
+                primary_traceback = primary_error.__traceback__
+            elif session is not None:
+                session.metadata["removeDestinationOnRelease"] = False
+            else:
+                release_metadata["removeDestinationOnRelease"] = False
+    if not retained:
+        metadata = session.metadata if session is not None else release_metadata
+        _retain_pending_release(session_key, metadata)
+        scratch_error = _release_pending(session_key)
+        cleanup_error = cleanup_error or scratch_error
+    if primary_error is None and cleanup_error is not None:
+        primary_error = cleanup_error
+        primary_traceback = cleanup_error.__traceback__
+    if primary_error is not None:
+        if process_started and not retained:
+            try:
+                destination.unlink(missing_ok=True)
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+        if cleanup_error is not None and cleanup_error is not primary_error:
+            primary_error.__context__ = cleanup_error
+        raise primary_error.with_traceback(primary_traceback)
+    return destination
+
+
 __all__ = (
+    "start_result_session",
     "shutdown_result_runtimes",
     "verify_result_archive_in_runtimes",
     "write_result_projection_in_runtime",
+    "write_sample_result_projection_in_runtime",
 )

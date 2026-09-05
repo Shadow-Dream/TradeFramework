@@ -36,10 +36,15 @@ from engine.repository import backtest_results as result_repository
 from engine.repository import datasets as dataset_repository
 from engine.repository import module_definitions
 from engine.repository import samplers as sampler_repository
+from engine.repository import sample_results as sample_result_repository
+from engine.runtime import result_stream
 from engine.service import analysis as analysis_service
 from engine.service import environment as environment_service
 from engine.service import pipelines as pipeline_service
 from engine.service import result_projection as result_projection_service
+from engine.service import sample_result_projection as sample_result_projection_service
+from engine.service import sample_results as sample_result_service
+from engine.service import sample_visualizations as sample_visualization_service
 from engine.service import visualizations as visualization_service
 from engine.service.backtest_submissions import prepare_backtest_submission
 
@@ -72,14 +77,43 @@ _SNAPSHOT_ID = re.compile(r"^basic-market-catalog-[0-9a-f]{24}$")
 _SNAPSHOT_JOB_ID = re.compile(r"^basic-snapshot-[0-9a-f]{24}$")
 _SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _MARKET_LOCK = threading.RLock()
-_PROJECTION_CACHE_LOCK = threading.RLock()
 _SNAPSHOT_WORKER_LOCK = threading.RLock()
+_SNAPSHOT_CACHE_LOCK = threading.RLock()
 _SNAPSHOT_WORKERS = {}
+_INTERACTIVE_SNAPSHOT_KEYS = set()
+_SNAPSHOT_CACHE = {}
+_SNAPSHOT_CACHE_LIMIT = 8
+_CHART_CATALOG_CACHE = {}
+_CHART_CATALOG_CACHE_LIMIT = 4
 _VERIFIED_MATERIALIZATION_RESPONSES = set()
 _VERIFIED_MATERIALIZATION_RESPONSE_LIMIT = 2048
 _BASIC_WORKFLOW_SAMPLER_ID = "basic-price-map-sampler"
 _BASIC_WORKFLOW_V3_SAMPLER_ID = "basic-ohlcv-map-sampler"
 _V3_PROVIDER_ID = EODHD_DEMO_PROVIDER_ID
+_CHART_SIGNAL_MODULE_IDS = frozenset({
+    "basic-price-bar-selector",
+    "basic-price-close-selector",
+    "sma-indicator",
+    "ema-indicator",
+    "wma-indicator",
+    "vwma-indicator",
+    "bollinger-bands-indicator",
+    "rsi-indicator",
+    "macd-indicator",
+    "atr-indicator",
+    "stochastic-indicator",
+    "obv-indicator",
+    "roc-indicator",
+    "cci-indicator",
+    "williams-r-indicator",
+    "dmi-indicator",
+    "supertrend-indicator",
+    "mfi-indicator",
+    "parabolic-sar-indicator",
+    "volume-indicator",
+    "anchored-vwap-indicator",
+    "ichimoku-indicator",
+})
 DEFAULT_WATCHLIST_SYMBOLS = (
     "AAPL",
     "MSFT",
@@ -156,6 +190,24 @@ _SNAPSHOT_JOB_FIELDS = {
 }
 _SNAPSHOT_JOB_STATUSES = {"queued", "running", "completed", "failed"}
 _SNAPSHOT_JOB_LIMIT = 256
+_CHART_CACHE_STATE_FIELDS = {
+    "schemaVersion",
+    "protocolId",
+    "records",
+}
+_CHART_CACHE_RECORD_FIELDS = {
+    "snapshotId",
+    "providerId",
+    "instrumentId",
+    "period",
+    "datasetId",
+    "datasetVersionId",
+    "sampleResultId",
+    "resultContentDigest",
+    "createdAt",
+    "barSnapshot",
+}
+_LEGACY_CHART_CACHE_RECORD_FIELDS = _CHART_CACHE_RECORD_FIELDS - {"barSnapshot"}
 _MATERIALIZATION_CACHE_STATE_FIELDS = {
     "schemaVersion",
     "protocolId",
@@ -169,19 +221,6 @@ _MATERIALIZATION_CACHE_RECORD_FIELDS = {
     "dataDigest",
     "response",
 }
-_PROJECTION_CACHE_SCHEMA_VERSION = 1
-_PROJECTION_CACHE_RECORD_FIELDS = {
-    "schemaVersion",
-    "cacheKey",
-    "backtestId",
-    "resultContentDigest",
-    "request",
-    "moduleDefinitions",
-    "createdAt",
-    "resultDigest",
-    "result",
-}
-_PROJECTION_CACHE_LIMIT = 64
 _OPEN_RESPONSE_FIELDS = {
     "accepted",
     "protocolId",
@@ -795,6 +834,183 @@ def _snapshot_job_state_path(config):
     return _state_root(config) / "snapshot-jobs.json"
 
 
+def _chart_cache_state_path(config):
+    return _state_root(config) / "chart-cache.json"
+
+
+def _empty_chart_cache_state():
+    return {
+        "schemaVersion": _STATE_SCHEMA_VERSION,
+        "protocolId": PROTOCOL_ID,
+        "records": [],
+    }
+
+
+def _validate_chart_cache_state(config, value, *, verify_archives=True):
+    require_exact_fields(
+        value,
+        allowed=_CHART_CACHE_STATE_FIELDS,
+        required=_CHART_CACHE_STATE_FIELDS,
+        label="Basic chart cache state",
+    )
+    if (
+        value["schemaVersion"] != _STATE_SCHEMA_VERSION
+        or value["protocolId"] != PROTOCOL_ID
+        or type(value["records"]) is not list
+    ):
+        raise ValueError("Basic chart cache state is invalid.")
+    records = []
+    identities = []
+    for index, record in enumerate(value["records"]):
+        label = f"Basic chart cache records[{index}]"
+        require_exact_fields(
+            record,
+            allowed=_CHART_CACHE_RECORD_FIELDS,
+            required=_LEGACY_CHART_CACHE_RECORD_FIELDS,
+            label=label,
+        )
+        for field in (
+            "snapshotId", "providerId", "instrumentId", "period", "datasetId",
+            "datasetVersionId", "sampleResultId", "resultContentDigest", "createdAt",
+        ):
+            if type(record[field]) is not str or not record[field]:
+                raise ValueError(f"{label}.{field} is required.")
+        if (
+            _SNAPSHOT_ID.fullmatch(record["snapshotId"]) is None
+            or _SHA256_DIGEST.fullmatch(record["sampleResultId"]) is None
+            or _SHA256_DIGEST.fullmatch(record["resultContentDigest"]) is None
+        ):
+            raise ValueError(f"{label} identity is invalid.")
+        _absolute_instant(record["createdAt"], f"{label}.createdAt")
+        if verify_archives:
+            view = sample_result_repository.sample_result_view(
+                config,
+                record["sampleResultId"],
+            )
+            _verify_chart_cache_result(record, view, label=label)
+        normalized_record = copy.deepcopy(record)
+        if "barSnapshot" in record:
+            is_v3 = record["providerId"] == _V3_PROVIDER_ID
+            summary = require_exact_fields(
+                record["barSnapshot"],
+                allowed=_BAR_SUMMARY_FIELDS_V3 if is_v3 else _BAR_SUMMARY_FIELDS,
+                required=_BAR_SUMMARY_FIELDS_V3 if is_v3 else _BAR_SUMMARY_FIELDS,
+                label=f"{label}.barSnapshot",
+            )
+            if (
+                summary["providerId"] != record["providerId"]
+                or summary["period"] != record["period"]
+                or _SHA256_DIGEST.fullmatch(summary["contentDigest"]) is None
+                or isinstance(summary["barCount"], bool)
+                or not isinstance(summary["barCount"], int)
+                or summary["barCount"] < 1
+            ):
+                raise ValueError(f"{label} bar snapshot identity is invalid.")
+            for field in ("asOf", "firstTime", "lastTime"):
+                _absolute_instant(summary[field], f"{label}.barSnapshot.{field}")
+            normalized_record["barSnapshot"] = copy.deepcopy(summary)
+        records.append(normalized_record)
+        identities.append((
+            record["snapshotId"], record["providerId"],
+            record["instrumentId"], record["period"],
+        ))
+    if len(set(identities)) != len(identities):
+        raise ValueError("Basic chart cache records must have unique identities.")
+    return {
+        "schemaVersion": _STATE_SCHEMA_VERSION,
+        "protocolId": PROTOCOL_ID,
+        "records": sorted(
+            records,
+            key=lambda item: (
+                item["snapshotId"], item["providerId"],
+                item["instrumentId"], item["period"],
+            ),
+        ),
+    }
+
+
+def _load_chart_cache_state(config, *, verify_archives=True):
+    return _validate_chart_cache_state(
+        config,
+        _read_json(_chart_cache_state_path(config), missing=_empty_chart_cache_state()),
+        verify_archives=verify_archives,
+    )
+
+
+def _verify_chart_cache_result(record, view, *, label):
+    if (
+        view["sampleResultId"] != record["sampleResultId"]
+        or view["datasetId"] != record["datasetId"]
+        or view["datasetVersionId"] != record["datasetVersionId"]
+        or view["resultContentDigest"] != record["resultContentDigest"]
+    ):
+        raise ValueError(f"{label} immutable Sample Result identity changed.")
+
+
+def _record_chart_cache(config, snapshot, instrument, period, dataset, view, summary):
+    record = {
+        "snapshotId": snapshot["snapshotId"],
+        "providerId": snapshot["providerId"],
+        "instrumentId": instrument["instrumentId"],
+        "period": period,
+        "datasetId": dataset["datasetId"],
+        "datasetVersionId": dataset["latestVersionId"],
+        "sampleResultId": view["sampleResultId"],
+        "resultContentDigest": view["resultContentDigest"],
+        "createdAt": engine_clock.utc_now(),
+        "barSnapshot": copy.deepcopy(summary),
+    }
+    _verify_chart_cache_result(record, view, label="Basic chart cache record")
+    with _MARKET_LOCK, control_state.control_state_lock(config):
+        state = _load_chart_cache_state(config, verify_archives=False)
+        identity = (
+            snapshot["snapshotId"], snapshot["providerId"],
+            instrument["instrumentId"], period,
+        )
+        records = [
+            item for item in state["records"]
+            if (
+                item["snapshotId"], item["providerId"],
+                item["instrumentId"], item["period"],
+            ) != identity
+        ]
+        records.append(record)
+        updated = _validate_chart_cache_state(
+            config,
+            {
+                "schemaVersion": _STATE_SCHEMA_VERSION,
+                "protocolId": PROTOCOL_ID,
+                "records": records,
+            },
+            verify_archives=False,
+        )
+        control_state.atomic_write_json(_chart_cache_state_path(config), updated)
+    return copy.deepcopy(record)
+
+
+def _saved_chart_cache(config, snapshot, instrument, period):
+    with _MARKET_LOCK, control_state.control_state_lock(config):
+        matches = [
+            record
+            for record in _load_chart_cache_state(
+                config,
+                verify_archives=False,
+            )["records"]
+            if record["snapshotId"] == snapshot["snapshotId"]
+            and record["providerId"] == snapshot["providerId"]
+            and record["instrumentId"] == instrument["instrumentId"]
+            and record["period"] == period
+        ]
+    if len(matches) > 1:
+        raise ValueError("Basic chart cache identity is ambiguous.")
+    if not matches:
+        return None
+    record = copy.deepcopy(matches[0])
+    view = sample_result_repository.sample_result_view(config, record["sampleResultId"])
+    _verify_chart_cache_result(record, view, label="Basic chart cache record")
+    return record, view
+
+
 def _empty_snapshot_job_state():
     return {
         "schemaVersion": _STATE_SCHEMA_VERSION,
@@ -920,7 +1136,7 @@ def _write_snapshot_job_state(config, jobs):
 
 def _enqueue_snapshot_jobs(config, snapshot, instrument_ids):
     by_id = {instrument["instrumentId"]: instrument for instrument in snapshot["instruments"]}
-    now = engine_clock.utc_now()
+    now = _absolute_instant(engine_clock.utc_now(), "Basic snapshot queue time")
     created = []
     with _MARKET_LOCK, control_state.control_state_lock(config):
         state = _load_snapshot_job_state(config)
@@ -945,7 +1161,9 @@ def _enqueue_snapshot_jobs(config, snapshot, instrument_ids):
                 "period": "day",
                 "status": "queued",
                 "attempts": 0,
-                "queuedAt": now,
+                "queuedAt": _canonical_instant(
+                    now + timedelta(microseconds=len(created))
+                ),
                 "startedAt": "",
                 "completedAt": "",
                 "error": "",
@@ -997,7 +1215,21 @@ def _recover_snapshot_jobs(config):
 def _claim_snapshot_job(config):
     with _MARKET_LOCK, control_state.control_state_lock(config):
         state = _load_snapshot_job_state(config)
-        queued = next((job for job in state["jobs"] if job["status"] == "queued"), None)
+        queued_jobs = [job for job in state["jobs"] if job["status"] == "queued"]
+        queued = min(
+            queued_jobs,
+            key=lambda job: (
+                0 if _snapshot_queue_key(
+                    config,
+                    job["snapshotId"],
+                    job["instrumentId"],
+                    job["period"],
+                ) in _INTERACTIVE_SNAPSHOT_KEYS else 1,
+                job["queuedAt"],
+                job["jobId"],
+            ),
+            default=None,
+        )
         if queued is None:
             return None
         jobs = []
@@ -1014,9 +1246,50 @@ def _claim_snapshot_job(config):
                     "result": None,
                 })
                 claimed = copy.deepcopy(record)
+                _INTERACTIVE_SNAPSHOT_KEYS.discard(_snapshot_queue_key(
+                    config,
+                    record["snapshotId"],
+                    record["instrumentId"],
+                    record["period"],
+                ))
             jobs.append(record)
         _write_snapshot_job_state(config, jobs)
         return claimed
+
+
+def _snapshot_queue_key(config, snapshot_id, instrument_id, period):
+    return (
+        str(_state_root(config).resolve()),
+        snapshot_id,
+        instrument_id,
+        period,
+    )
+
+
+def _promote_snapshot_job(config, snapshot, instrument, period):
+    """Promote or enqueue the one chart-cache job selected by an interactive open."""
+
+    identity = (snapshot["snapshotId"], instrument["instrumentId"], period)
+    queue_key = _snapshot_queue_key(config, *identity)
+    with _MARKET_LOCK, control_state.control_state_lock(config):
+        state = _load_snapshot_job_state(config)
+        active = [
+            copy.deepcopy(job) for job in state["jobs"]
+            if (job["snapshotId"], job["instrumentId"], job["period"]) == identity
+            and job["status"] in {"queued", "running"}
+        ]
+        if len(active) > 1:
+            raise ValueError("Basic chart cache active job identity is ambiguous.")
+        if active:
+            if active[0]["status"] == "queued":
+                _INTERACTIVE_SNAPSHOT_KEYS.add(queue_key)
+            return active[0]
+    created = _enqueue_snapshot_jobs(config, snapshot, [instrument["instrumentId"]])
+    if len(created) != 1:
+        raise RuntimeError("Basic chart cache job could not be enqueued.")
+    with _MARKET_LOCK:
+        _INTERACTIVE_SNAPSHOT_KEYS.add(queue_key)
+    return created[0]
 
 
 def _finish_snapshot_job(config, job_id, *, result=None, error=""):
@@ -1039,6 +1312,32 @@ def _finish_snapshot_job(config, job_id, *, result=None, error=""):
         _write_snapshot_job_state(config, jobs)
 
 
+def _sample_result_request(config, snapshot, dataset, period):
+    is_v3 = snapshot["providerId"] == _V3_PROVIDER_ID
+    sampler_id = (
+        _BASIC_WORKFLOW_V3_SAMPLER_ID if is_v3 else _BASIC_WORKFLOW_SAMPLER_ID
+    )
+    sampler_output_schema = (
+        schemas.OHLCV_SAMPLER_OUTPUT_SCHEMA if is_v3 else schemas.SAMPLER_OUTPUT_SCHEMA
+    )
+    sampler = _latest_exact(
+        sampler_repository.list_samplers(config),
+        "samplerId",
+        sampler_id,
+        "Sampler",
+        predicate=lambda value: value.get("outputSchema") == sampler_output_schema,
+    )
+    return {
+        "datasetId": dataset["datasetId"],
+        "datasetVersionId": dataset["latestVersionId"],
+        "sampler": {
+            "samplerId": sampler["samplerId"],
+            "version": sampler["version"],
+            "parameters": {"decisionPeriod": period},
+        },
+    }
+
+
 def _capture_snapshot_job(config, job, providers):
     with _MARKET_LOCK, control_state.control_state_lock(config):
         snapshot = _load_snapshot(config, job["snapshotId"])
@@ -1054,20 +1353,86 @@ def _capture_snapshot_job(config, job, providers):
     provider = providers.get(job["providerId"]) if type(providers) is dict else None
     if provider is None or getattr(provider, "provider_id", None) != job["providerId"]:
         raise ValueError("Basic snapshot job provider is not installed.")
-    evidence, summary = _bar_snapshot(
-        job["providerId"],
+    published = _saved_bar_materialization(
+        config,
+        snapshot,
         instrument,
-        provider.download_bars(copy.deepcopy(instrument), job["period"]),
+        job["period"],
     )
-    with _MARKET_LOCK:
+    if published is None:
+        evidence, summary = _bar_snapshot(
+            job["providerId"],
+            instrument,
+            provider.download_bars(copy.deepcopy(instrument), job["period"]),
+        )
         dataset = _publish_dataset(config, snapshot, instrument, evidence, summary)
-        return _record_published_bar_snapshot(
+        projection = _record_published_bar_snapshot(
             config,
             snapshot,
             instrument,
             summary,
             dataset,
         )
+    else:
+        dataset = published["dataset"]
+        summary = published["summary"]
+        projection = _validate_bar_snapshot_projection(
+            config,
+            {
+                "catalogSnapshotId": snapshot["snapshotId"],
+                "providerId": snapshot["providerId"],
+                "instrumentId": instrument["instrumentId"],
+                "period": job["period"],
+                "asOf": summary["asOf"],
+                "firstTime": summary["firstTime"],
+                "lastTime": summary["lastTime"],
+                "barCount": summary["barCount"],
+                "contentDigest": summary["contentDigest"],
+                "datasetId": dataset["datasetId"],
+                "datasetVersionId": dataset["latestVersionId"],
+            },
+            label="Basic reused bar snapshot",
+        )
+    materialized = sample_result_service.materialize_sample_result(
+        config,
+        _sample_result_request(config, snapshot, dataset, job["period"]),
+    )
+    sample_result_id = materialized["view"]["sampleResultId"]
+    existing_visualizations = sample_visualization_service.list_sample_visualizations(
+        config,
+        sample_result_id,
+    )
+    if not existing_visualizations:
+        sample_visualization_service.save_sample_visualization(
+            config,
+            _sample_visualization_save_request(
+                dataset["datasetId"],
+                sample_result_id,
+                instrument,
+                job["period"],
+            ),
+        )
+    project_sample_result_cached(
+        config,
+        {
+            "sampleResultId": sample_result_id,
+            "paths": [
+                f"cycles.data.price.{job['period']}.{instrument['instrumentId']}"
+            ],
+            "temporaryModules": [],
+        },
+        _require_registered=False,
+    )
+    _record_chart_cache(
+        config,
+        snapshot,
+        instrument,
+        job["period"],
+        dataset,
+        materialized["view"],
+        summary,
+    )
+    return projection
 
 
 def run_snapshot_jobs(config, *, providers=None, limit=None):
@@ -1114,8 +1479,11 @@ def _enqueue_missing_watchlist_snapshots(config):
         watched = _watchlist_ids(config, snapshot)
         saved = {
             (record["instrumentId"], record["period"])
-            for record in _load_bar_snapshot_state(config)["barSnapshots"]
-            if record["catalogSnapshotId"] == snapshot["snapshotId"]
+            for record in _load_chart_cache_state(
+                config,
+                verify_archives=False,
+            )["records"]
+            if record["snapshotId"] == snapshot["snapshotId"]
             and record["providerId"] == snapshot["providerId"]
         }
         attempted = {
@@ -1123,6 +1491,7 @@ def _enqueue_missing_watchlist_snapshots(config):
             for job in _load_snapshot_job_state(config)["jobs"]
             if job["snapshotId"] == snapshot["snapshotId"]
             and job["providerId"] == snapshot["providerId"]
+            and job["status"] in {"queued", "running"}
         }
         missing = [
             instrument_id
@@ -1133,10 +1502,11 @@ def _enqueue_missing_watchlist_snapshots(config):
     return _enqueue_snapshot_jobs(config, snapshot, missing)
 
 
-def ensure_snapshot_worker(config, *, providers=None):
+def ensure_snapshot_worker(config, *, providers=None, enqueue_watchlist=True):
     """Start or wake one daemon worker for this Basic application state root."""
 
-    _enqueue_missing_watchlist_snapshots(config)
+    if enqueue_watchlist:
+        _enqueue_missing_watchlist_snapshots(config)
     providers = default_provider_registry() if providers is None else providers
     if type(providers) is not dict:
         raise TypeError("Basic snapshot worker providers must be an exact registry.")
@@ -1667,18 +2037,13 @@ def _saved_materialization_data_digest(config, published):
     return next(iter(matches), published["dataDigest"])
 
 
-def _projection_cache_root(config):
-    root = _state_root(config) / "projection-cache"
-    root.mkdir(parents=True, exist_ok=True)
-    if root.is_symlink() or not root.is_dir():
-        raise ValueError("Basic projection cache root is invalid.")
-    return root
-
-
 def _canonical_projection_request(request):
     require_exact_fields(
         request,
-        allowed={"backtestId", "paths", "temporaryModules"},
+        allowed={
+            "backtestId", "paths", "temporaryModules",
+            "projectionFormat", "window",
+        },
         required={"backtestId", "paths", "temporaryModules"},
         label="Basic projection request",
     )
@@ -1699,54 +2064,19 @@ def _canonical_projection_request(request):
     temporary_modules = request["temporaryModules"]
     if type(temporary_modules) is not list:
         raise ValueError("Basic projection request temporaryModules must be an array.")
+    projection_format = request.get("projectionFormat", "rows")
+    if projection_format not in {"rows", "columns-v2"}:
+        raise ValueError("Basic Result projection format is unsupported.")
+    window = result_stream.normalize_projection_window(request.get("window"))
+    if projection_format == "rows" and window is not None:
+        raise ValueError("Basic row Result projection does not support a window.")
     return {
         "backtestId": backtest_id,
         "paths": sorted(paths),
         "temporaryModules": copy.deepcopy(temporary_modules),
+        "projectionFormat": projection_format,
+        "window": window,
     }
-
-
-def _projection_module_definition_refs(config, temporary_modules):
-    if not temporary_modules:
-        return []
-    definitions = list(module_definitions.load_pipeline_definitions(config).values())
-    references = []
-    identities = set()
-    for index, instance in enumerate(temporary_modules):
-        if type(instance) is not dict:
-            raise ValueError(
-                f"Basic projection temporaryModules[{index}] must be an object."
-            )
-        identity = tuple(instance.get(field) for field in ("kind", "moduleId", "version"))
-        if any(type(value) is not str or not value for value in identity):
-            raise ValueError(
-                f"Basic projection temporaryModules[{index}] identity is invalid."
-            )
-        if identity in identities:
-            continue
-        identities.add(identity)
-        matches = [
-            definition
-            for definition in definitions
-            if tuple(definition.get(field) for field in ("kind", "moduleId", "version"))
-            == identity
-        ]
-        if len(matches) != 1 or not _SHA256_DIGEST.fullmatch(
-            str(matches[0].get("contentDigest") or "")
-        ):
-            raise ValueError(
-                "Basic projection requires one exact installed temporary Module version."
-            )
-        references.append({
-            "kind": identity[0],
-            "moduleId": identity[1],
-            "version": identity[2],
-            "contentDigest": matches[0]["contentDigest"],
-        })
-    return sorted(
-        references,
-        key=lambda value: (value["kind"], value["moduleId"], int(value["version"])),
-    )
 
 
 def _owner_owns_materialized_backtest(config, owner_identity, backtest_id):
@@ -1759,60 +2089,8 @@ def _owner_owns_materialized_backtest(config, owner_identity, backtest_id):
     )
 
 
-def _projection_cache_path(config, cache_key):
-    if type(cache_key) is not str or _SHA256_DIGEST.fullmatch(cache_key) is None:
-        raise ValueError("Basic projection cache key is invalid.")
-    return _projection_cache_root(config) / f"{cache_key.split(':', 1)[1]}.json"
-
-
-def _validate_projection_cache_record(value, expected_identity):
-    require_exact_fields(
-        value,
-        allowed=_PROJECTION_CACHE_RECORD_FIELDS,
-        required=_PROJECTION_CACHE_RECORD_FIELDS,
-        label="Basic projection cache record",
-    )
-    if value["schemaVersion"] != _PROJECTION_CACHE_SCHEMA_VERSION:
-        raise ValueError("Basic projection cache schemaVersion is unsupported.")
-    identity = {
-        field: copy.deepcopy(value[field])
-        for field in (
-            "cacheKey",
-            "backtestId",
-            "resultContentDigest",
-            "request",
-            "moduleDefinitions",
-        )
-    }
-    if identity != expected_identity:
-        raise ValueError("Basic projection cache identity is incompatible.")
-    _absolute_instant(value["createdAt"], "Basic projection cache createdAt")
-    if type(value["result"]) is not dict:
-        raise ValueError("Basic projection cache result must be an object.")
-    if value["resultDigest"] != version_archive.content_digest(value["result"]):
-        raise ValueError("Basic projection cache result digest is invalid.")
-    return copy.deepcopy(value)
-
-
-def _evict_projection_cache(config, keep_path):
-    root = _projection_cache_root(config)
-    files = sorted(
-        (
-            path
-            for path in root.iterdir()
-            if path.is_file()
-            and not path.is_symlink()
-            and re.fullmatch(r"[0-9a-f]{64}\.json", path.name)
-        ),
-        key=lambda path: (path.stat().st_mtime_ns, path.name),
-    )
-    for path in files[: max(0, len(files) - _PROJECTION_CACHE_LIMIT)]:
-        if path != keep_path:
-            path.unlink()
-
-
 def project_result_cached(config, request, *, session_identity):
-    """Return one exact Basic Result projection backed by a persistent cache."""
+    """Authorize Basic access to the Engine-owned exact projection cache."""
 
     normalized = _canonical_projection_request(request)
     backtest_id = normalized["backtestId"]
@@ -1826,72 +2104,105 @@ def project_result_cached(config, request, *, session_identity):
         str(result_digest or "")
     ):
         raise ValueError("Basic projection requires one completed immutable Result.")
-    definition_refs = _projection_module_definition_refs(
-        config,
-        normalized["temporaryModules"],
-    )
-    cache_key = version_archive.content_digest({
-        "schemaVersion": _PROJECTION_CACHE_SCHEMA_VERSION,
-        "backtestId": backtest_id,
-        "resultContentDigest": result_digest,
-        "request": normalized,
-        "moduleDefinitions": definition_refs,
-    })
-    identity = {
-        "cacheKey": cache_key,
-        "backtestId": backtest_id,
-        "resultContentDigest": result_digest,
-        "request": normalized,
-        "moduleDefinitions": definition_refs,
-    }
-    path = _projection_cache_path(config, cache_key)
-    with _PROJECTION_CACHE_LOCK:
-        cached = _read_json(path)
-        if cached is not None:
-            record = _validate_projection_cache_record(cached, identity)
-            return {
-                "backtestId": backtest_id,
-                "cache": {"hit": True, "cacheKey": cache_key},
-                "result": record["result"],
-            }
-        with tempfile.TemporaryDirectory(
-            prefix="trade-basic-projection-",
-            dir=_projection_cache_root(config),
-        ) as temporary:
-            destination = Path(temporary) / "result.json"
-            result_projection_service.write_backtest_result_slice(
-                config,
-                backtest_id,
-                normalized["paths"],
-                normalized["temporaryModules"],
-                destination,
-                module_definitions_loader=(
-                    lambda: module_definitions.load_pipeline_definitions(config)
-                    if normalized["temporaryModules"]
-                    else None
-                ),
-            )
-            result = strict_json.loads(destination.read_text(encoding="utf-8"))
-        if type(result) is not dict:
-            raise ValueError("Basic projection runtime returned a non-object Result.")
-        record = _validate_projection_cache_record(
-            {
-                "schemaVersion": _PROJECTION_CACHE_SCHEMA_VERSION,
-                **identity,
-                "createdAt": engine_clock.utc_now(),
-                "resultDigest": version_archive.content_digest(result),
-                "result": result,
-            },
-            identity,
+    with tempfile.TemporaryDirectory(prefix="trade-basic-projection-") as temporary:
+        destination = Path(temporary) / "result.json"
+        projected = result_projection_service.write_backtest_result_slice_cached(
+            config,
+            backtest_id,
+            normalized["paths"],
+            normalized["temporaryModules"],
+            destination,
+            module_definitions_loader=(
+                lambda: module_definitions.load_pipeline_definitions(config)
+                if normalized["temporaryModules"]
+                else None
+            ),
+            projection_format=normalized["projectionFormat"],
+            window=normalized["window"],
         )
-        control_state.atomic_write_json(path, record)
-        _evict_projection_cache(config, path)
-        return {
-            "backtestId": backtest_id,
-            "cache": {"hit": False, "cacheKey": cache_key},
-            "result": copy.deepcopy(result),
-        }
-    return copy.deepcopy(record)
+        result = strict_json.loads(destination.read_bytes())
+    if type(result) is not dict:
+        raise ValueError("Basic projection runtime returned a non-object Result.")
+    return {
+        "backtestId": backtest_id,
+        "cache": copy.deepcopy(projected["cache"]),
+        "result": result,
+    }
+
+
+def _canonical_sample_projection_request(request):
+    require_exact_fields(
+        request,
+        allowed={
+            "sampleResultId", "paths", "temporaryModules",
+            "projectionFormat", "window",
+        },
+        required={"sampleResultId", "paths", "temporaryModules"},
+        label="Basic Sample Result projection request",
+    )
+    if (
+        type(request["sampleResultId"]) is not str
+        or _SHA256_DIGEST.fullmatch(request["sampleResultId"]) is None
+    ):
+        raise ValueError("Basic Sample Result projection identity is invalid.")
+    if (
+        type(request["paths"]) is not list
+        or any(type(path) is not str or not path for path in request["paths"])
+        or len(set(request["paths"])) != len(request["paths"])
+    ):
+        raise ValueError("Basic Sample Result projection paths must be unique strings.")
+    if type(request["temporaryModules"]) is not list:
+        raise ValueError("Basic Sample Result temporaryModules must be an array.")
+    projection_format = request.get("projectionFormat", "rows")
+    if projection_format not in {"rows", "columns-v2"}:
+        raise ValueError("Basic Sample Result projection format is unsupported.")
+    window = result_stream.normalize_projection_window(request.get("window"))
+    if projection_format == "rows" and window is not None:
+        raise ValueError("Basic row Result projection does not support a window.")
+    return {
+        "sampleResultId": request["sampleResultId"],
+        "paths": sorted(request["paths"]),
+        "temporaryModules": copy.deepcopy(request["temporaryModules"]),
+        "projectionFormat": projection_format,
+        "window": window,
+    }
+
+
+def project_sample_result_cached(config, request, *, _require_registered=True):
+    """Authorize Basic access to the Engine-owned exact projection cache."""
+
+    normalized = _canonical_sample_projection_request(request)
+    sample_result_id = normalized["sampleResultId"]
+    if _require_registered:
+        with _MARKET_LOCK, control_state.control_state_lock(config):
+            allowed = any(
+                record["sampleResultId"] == sample_result_id
+                for record in _load_chart_cache_state(
+                    config,
+                    verify_archives=False,
+                )["records"]
+            )
+        if not allowed:
+            raise ValueError("Basic projection requires one prepared chart cache.")
+    with tempfile.TemporaryDirectory(prefix="trade-basic-sample-projection-") as temporary:
+        destination = Path(temporary) / "result.json"
+        projected = sample_result_projection_service.write_sample_result_slice_cached(
+            config,
+            sample_result_id,
+            normalized["paths"],
+            normalized["temporaryModules"],
+            destination,
+            projection_format=normalized["projectionFormat"],
+            window=normalized["window"],
+        )
+        result = strict_json.loads(destination.read_bytes())
+    if type(result) is not dict:
+        raise ValueError("Basic Sample Result projection returned a non-object.")
+    return {
+        "sampleResultId": sample_result_id,
+        "cache": copy.deepcopy(projected["cache"]),
+        "result": result,
+    }
 
 
 def _validate_instrument(value, *, label="Market instrument"):
@@ -1993,11 +2304,69 @@ def _snapshot_path(config, snapshot_id):
     return root / f"{snapshot_id}.json"
 
 
-def _load_snapshot(config, snapshot_id):
-    value = _read_json(_snapshot_path(config, snapshot_id))
+def _state_file_fingerprint(path):
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+
+
+def _remember_snapshot_cache(path, snapshot, fingerprint):
+    key = str(path.resolve())
+    cached_snapshot = copy.deepcopy(snapshot)
+    entry = {
+        "fingerprint": fingerprint,
+        "snapshot": cached_snapshot,
+        "instruments": {
+            instrument["instrumentId"]: instrument
+            for instrument in cached_snapshot["instruments"]
+        },
+    }
+    with _SNAPSHOT_CACHE_LOCK:
+        if len(_SNAPSHOT_CACHE) >= _SNAPSHOT_CACHE_LIMIT and key not in _SNAPSHOT_CACHE:
+            _SNAPSHOT_CACHE.pop(next(iter(_SNAPSHOT_CACHE)))
+        _SNAPSHOT_CACHE[key] = entry
+    return entry
+
+
+def _snapshot_cache_entry(config, snapshot_id):
+    path = _snapshot_path(config, snapshot_id)
+    fingerprint = _state_file_fingerprint(path)
+    if fingerprint is None:
+        raise ValueError(f"Unknown Basic market snapshot: {snapshot_id}")
+    key = str(path.resolve())
+    with _SNAPSHOT_CACHE_LOCK:
+        cached = _SNAPSHOT_CACHE.get(key)
+        if cached is not None and cached["fingerprint"] == fingerprint:
+            return cached
+    value = _read_json(path)
     if value is None:
         raise ValueError(f"Unknown Basic market snapshot: {snapshot_id}")
-    return _validate_snapshot(value)
+    return _remember_snapshot_cache(path, _validate_snapshot(value), fingerprint)
+
+
+def _load_snapshot(config, snapshot_id):
+    return copy.deepcopy(_snapshot_cache_entry(config, snapshot_id)["snapshot"])
+
+
+def _load_snapshot_instrument(config, snapshot_id, instrument_id):
+    entry = _snapshot_cache_entry(config, snapshot_id)
+    instrument = entry["instruments"].get(instrument_id)
+    if instrument is None:
+        raise ValueError("Basic chart instrumentId is not in the selected snapshot.")
+    snapshot = entry["snapshot"]
+    return {
+        "snapshotId": snapshot["snapshotId"],
+        "providerId": snapshot["providerId"],
+        "instruments": [copy.deepcopy(instrument)],
+    }, copy.deepcopy(instrument)
 
 
 def _current_snapshot(config):
@@ -2075,6 +2444,75 @@ def market_state(config):
         }
 
 
+def chart_module_catalog(config):
+    """Return only exact archived Signal versions used by the Basic chart."""
+
+    state_path = control_state.state_path(config, "modules.json")
+    fingerprint = _state_file_fingerprint(state_path)
+    cache_key = str(state_path.resolve())
+    with _MARKET_LOCK:
+        cached = _CHART_CATALOG_CACHE.get(cache_key)
+        if cached is not None and cached["fingerprint"] == fingerprint:
+            return copy.deepcopy(cached["catalog"])
+    with control_state.control_state_lock(config):
+        index = control_state.load_state(config, "modules.json", {})
+    if type(index) is not dict:
+        raise ValueError("Basic chart Module index is invalid.")
+    latest = {}
+    for definition in index.values():
+        if (
+            type(definition) is not dict
+            or definition.get("kind") != "Signal"
+            or definition.get("moduleId") not in _CHART_SIGNAL_MODULE_IDS
+            or type(definition.get("version")) is not str
+            or not definition["version"].isdecimal()
+            or not (
+                definition.get("builtin") is True
+                or definition.get("protocolId") == PROTOCOL_ID
+            )
+        ):
+            continue
+        module_id = definition["moduleId"]
+        if module_id not in latest or int(definition["version"]) > int(
+            latest[module_id]["version"]
+        ):
+            latest[module_id] = definition
+    missing = sorted(_CHART_SIGNAL_MODULE_IDS - set(latest))
+    if missing:
+        raise ValueError(
+            "Basic chart requires installed Module(s): " + ", ".join(missing)
+        )
+    references = [
+        (definition["kind"], definition["moduleId"], definition["version"])
+        for definition in latest.values()
+    ]
+    definitions, _evidence = module_definitions.load_definition_versions(
+        config,
+        references,
+    )
+    catalog = {
+        "protocolId": PROTOCOL_ID,
+        "modules": sorted(
+            definitions.values(),
+            key=lambda definition: definition["moduleId"],
+        ),
+    }
+    final_fingerprint = _state_file_fingerprint(state_path)
+    if final_fingerprint is None or final_fingerprint != fingerprint:
+        raise ValueError("Basic chart Module index changed while loading.")
+    with _MARKET_LOCK:
+        if (
+            len(_CHART_CATALOG_CACHE) >= _CHART_CATALOG_CACHE_LIMIT
+            and cache_key not in _CHART_CATALOG_CACHE
+        ):
+            _CHART_CATALOG_CACHE.pop(next(iter(_CHART_CATALOG_CACHE)))
+        _CHART_CATALOG_CACHE[cache_key] = {
+            "fingerprint": final_fingerprint,
+            "catalog": copy.deepcopy(catalog),
+        }
+    return catalog
+
+
 def sync_market(config, request, *, providers=None):
     require_exact_fields(
         request,
@@ -2117,6 +2555,10 @@ def sync_market(config, request, *, providers=None):
             raise ValueError("Basic market immutable snapshot identity is occupied.")
         if existing is None:
             control_state.atomic_write_json(path, snapshot)
+        fingerprint = _state_file_fingerprint(path)
+        if fingerprint is None:
+            raise ValueError("Basic market immutable snapshot was not persisted.")
+        _remember_snapshot_cache(path, snapshot, fingerprint)
         control_state.atomic_write_json(
             _state_root(config) / "current.json",
             {
@@ -2640,7 +3082,7 @@ def _execution_period_overrides(environment, period):
     return overrides
 
 
-def _visualization_save_request(dataset_id, backtest_id, instrument, period):
+def _market_visualization_spec(dataset_id, instrument, period):
     data_key = f"price.{period}.{instrument['instrumentId']}"
     spec = {
         "schemaVersion": 3,
@@ -2675,6 +3117,10 @@ def _visualization_save_request(dataset_id, backtest_id, instrument, period):
         ],
     }
     visualization_contracts.require_spec(spec)
+    return spec
+
+
+def _visualization_save_request(dataset_id, backtest_id, instrument, period):
     return {
         "backtestId": backtest_id,
         "visualizationId": visualization_service.current_visualization_id(
@@ -2682,7 +3128,24 @@ def _visualization_save_request(dataset_id, backtest_id, instrument, period):
         ),
         "name": f"{instrument['symbol']} {period} snapshot",
         "expectedRevision": 0,
-        "spec": spec,
+        "spec": _market_visualization_spec(dataset_id, instrument, period),
+    }
+
+
+def _sample_visualization_save_request(
+    dataset_id,
+    sample_result_id,
+    instrument,
+    period,
+):
+    return {
+        "sampleResultId": sample_result_id,
+        "visualizationId": sample_visualization_service.current_visualization_id(
+            sample_result_id
+        ),
+        "name": f"{instrument['symbol']} {period} snapshot",
+        "expectedRevision": 0,
+        "spec": _market_visualization_spec(dataset_id, instrument, period),
     }
 
 
@@ -2975,11 +3438,123 @@ def open_instrument(
         }
 
 
+def _chart_job_for(config, snapshot, instrument, period):
+    with _MARKET_LOCK, control_state.control_state_lock(config):
+        matches = [
+            copy.deepcopy(job)
+            for job in _load_snapshot_job_state(config)["jobs"]
+            if job["snapshotId"] == snapshot["snapshotId"]
+            and job["providerId"] == snapshot["providerId"]
+            and job["instrumentId"] == instrument["instrumentId"]
+            and job["period"] == period
+        ]
+    return matches[-1] if matches else None
+
+
+def open_chart(config, request, *, providers=None):
+    """Open one chart from the cached Sampler timeline, never a Backtest."""
+
+    require_exact_fields(
+        request,
+        allowed={"snapshotId", "instrumentId", "period"},
+        required={"snapshotId", "instrumentId", "period"},
+        label="Basic open chart request",
+    )
+    with _MARKET_LOCK, control_state.control_state_lock(config):
+        snapshot, instrument = _load_snapshot_instrument(
+            config,
+            request["snapshotId"],
+            request["instrumentId"],
+        )
+        watchlist_instrument_ids = _watchlist_ids(config, snapshot)
+    period = request["period"]
+    if period not in instrument["availablePeriods"]:
+        raise ValueError("Basic chart period is unavailable for this instrument.")
+    cached_result = _saved_chart_cache(config, snapshot, instrument, period)
+    if cached_result is None:
+        job = _promote_snapshot_job(config, snapshot, instrument, period)
+        ensure_snapshot_worker(
+            config,
+            providers=providers,
+            enqueue_watchlist=False,
+        )
+        cached_result = _saved_chart_cache(config, snapshot, instrument, period)
+        if cached_result is None:
+            current_job = _chart_job_for(config, snapshot, instrument, period) or job
+            return {
+                "accepted": True,
+                "ready": False,
+                "protocolId": PROTOCOL_ID,
+                "snapshotId": snapshot["snapshotId"],
+                "instrument": copy.deepcopy(instrument),
+                "watchlistInstrumentIds": watchlist_instrument_ids,
+                "cacheJob": current_job,
+            }
+    cached, view = cached_result
+    bar_summary = cached.get("barSnapshot")
+    if bar_summary is None:
+        published = _saved_bar_materialization(
+            config,
+            snapshot,
+            instrument,
+            period,
+        )
+        if published is None:
+            raise ValueError("Basic chart cache has no immutable Dataset materialization.")
+        if (
+            published["dataset"]["datasetId"] != cached["datasetId"]
+            or published["dataset"]["latestVersionId"] != cached["datasetVersionId"]
+        ):
+            raise ValueError("Basic chart cache Dataset identity changed.")
+        bar_summary = published["summary"]
+        _record_chart_cache(
+            config,
+            snapshot,
+            instrument,
+            period,
+            published["dataset"],
+            view,
+            bar_summary,
+        )
+    return {
+        "accepted": True,
+        "ready": True,
+        "protocolId": PROTOCOL_ID,
+        "snapshotId": snapshot["snapshotId"],
+        "instrument": copy.deepcopy(instrument),
+        "watchlistInstrumentIds": watchlist_instrument_ids,
+        "barSnapshot": copy.deepcopy(bar_summary),
+        "materialization": {
+            "dataset": {
+                "datasetId": cached["datasetId"],
+                "datasetVersionId": cached["datasetVersionId"],
+                "protocolId": PROTOCOL_ID,
+            },
+            "sampler": {
+                **copy.deepcopy(view["sampler"]),
+                "protocolId": PROTOCOL_ID,
+            },
+            "sampleResult": view,
+            "visualizationSaveRequest": _sample_visualization_save_request(
+                cached["datasetId"],
+                cached["sampleResultId"],
+                instrument,
+                period,
+            ),
+        },
+        "cacheJob": _chart_job_for(config, snapshot, instrument, period),
+        "cache": {"sampleResultHit": True},
+    }
+
+
 __all__ = (
     "DEFAULT_WATCHLIST_SYMBOLS",
+    "chart_module_catalog",
     "ensure_snapshot_worker",
     "market_state",
+    "open_chart",
     "open_instrument",
+    "project_sample_result_cached",
     "project_result_cached",
     "run_snapshot_jobs",
     "set_watchlist",

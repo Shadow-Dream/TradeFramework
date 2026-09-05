@@ -277,15 +277,15 @@ function instrumentRow(instrument, watched, barsByInstrument, jobsByInstrument) 
   dataAsOf.className = "bw-data-as-of";
   const barSnapshot = barsByInstrument.get(instrument.instrumentId);
   const snapshotJob = jobsByInstrument.get(instrument.instrumentId);
-  if (snapshotJob?.status === "queued") dataAsOf.textContent = "Automatic snapshot queued…";
-  else if (snapshotJob?.status === "running") dataAsOf.textContent = "Fetching automatic snapshot…";
-  else if (snapshotJob?.status === "failed") dataAsOf.textContent = "Automatic snapshot failed";
+  if (snapshotJob?.status === "queued") dataAsOf.textContent = "Chart cache queued…";
+  else if (snapshotJob?.status === "running") dataAsOf.textContent = "Preparing chart cache…";
+  else if (snapshotJob?.status === "failed") dataAsOf.textContent = "Chart cache failed";
   else if (barSnapshot) {
-    dataAsOf.textContent = `Snapshot cached · ${formatInstant(barSnapshot.lastTime)}`;
-    dataAsOf.title = `Cached K-line snapshot through ${barSnapshot.lastTime}`;
+    dataAsOf.textContent = `Chart cached · ${formatInstant(barSnapshot.lastTime)}`;
+    dataAsOf.title = `Cached Sampler timeline through ${barSnapshot.lastTime}`;
   } else if (snapshotJob?.status === "completed" && snapshotJob.result) {
-    dataAsOf.textContent = `Snapshot ready · ${formatInstant(snapshotJob.result.lastTime)}`;
-    dataAsOf.title = `Automatic K-line snapshot through ${snapshotJob.result.lastTime}`;
+    dataAsOf.textContent = `Chart ready · ${formatInstant(snapshotJob.result.lastTime)}`;
+    dataAsOf.title = `Prepared Sampler timeline through ${snapshotJob.result.lastTime}`;
   }
   dataAsOf.dataset.snapshotState = snapshotJob?.status || (barSnapshot ? "cached" : "missing");
   const action = document.createElement("span");
@@ -364,8 +364,8 @@ async function loadMarket() {
   const activeSnapshotJobs = (state.market.snapshotJobs || [])
     .filter((job) => ["queued", "running"].includes(job.status));
   setStatus(activeSnapshotJobs.length
-    ? `${activeSnapshotJobs.length} automatic K-line snapshot${activeSnapshotJobs.length === 1 ? "" : "s"} in progress…`
-    : (state.market.snapshot ? "Stock catalog ready · saved K-line snapshots are cached" : "No stock catalog available"));
+    ? `${activeSnapshotJobs.length} chart cache job${activeSnapshotJobs.length === 1 ? "" : "s"} in progress…`
+    : (state.market.snapshot ? "Stock catalog ready · saved chart caches are prepared" : "No stock catalog available"));
   if (state.snapshotPollTimer) clearTimeout(state.snapshotPollTimer);
   state.snapshotPollTimer = null;
   if ((state.market.snapshotJobs || []).some((job) => ["queued", "running"].includes(job.status))) {
@@ -419,9 +419,9 @@ async function toggleWatchlist(instrumentId) {
     if (response.accepted !== true || response.snapshotId !== snapshot.snapshotId) throw new Error("Watchlist response did not preserve the current snapshot.");
     await loadMarket();
     if ((response.snapshotJobs || []).length) {
-      setStatus("Automatic K-line snapshot queued in the background");
+      setStatus("Chart cache queued in the background");
     } else if (dailyBarSnapshots().has(instrumentId)) {
-      setStatus("Watchlist updated · K-line snapshot already cached");
+      setStatus("Watchlist updated · chart cache already prepared");
     }
   } catch {
     setStatus("Watchlist update failed.", true);

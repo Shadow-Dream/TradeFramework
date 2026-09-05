@@ -958,9 +958,28 @@ assert.deepEqual(dualChart.records.map((item) => item.options.title), ['Candles 
 assert(!JSON.stringify(dualChart.records.map((item) => item.options.title)).includes('ca'));
 assert(!JSON.stringify(dualChart.records.map((item) => item.options.title)).includes('cb'));
 assert.equal(dualChart.records[0].data[0].time, core.chartTime('2026-01-01T14:30:00Z'));
-assert.deepEqual(Object.keys(dual).sort(), ['cleanups', 'diagnostics', 'interactionController', 'styleNormalizationChanged']);
+assert.deepEqual(Object.keys(dual).sort(), [
+  'cleanups', 'diagnostics', 'interactionController', 'paneId', 'reconcile',
+  'styleNormalizationChanged',
+]);
 for (const name of ['chart', 'library', 'pane', 'result', 'seriesByDataKey', 'seriesByLayerId', 'spec']) assert.equal(name in dual, false);
 assert.deepEqual(plain(dual.interactionController.listTools()), { tools: [] });
+const dualWithLine = {
+  ...dualPane,
+  visualizers: [...dualPane.visualizers, {
+    id: 'line-added', callback: 'series.line', params: {
+      dataKey: 'a', timeKey: 'ta', timeDomainId: 'market', priceScaleId: 'right',
+    },
+  }],
+};
+const lineReconcile = dual.reconcile(result, dualWithLine, {});
+assert.equal(lineReconcile.updated, true);
+assert.equal(dualChart.records.length, 3);
+assert.equal(dualChart.removed.length, 0, 'unchanged candles must remain mounted');
+const lineRemove = dual.reconcile(result, dualPane, {});
+assert.equal(lineRemove.updated, true);
+assert.equal(dualChart.removed.length, 1);
+assert.equal(dualChart.removed[0].family, 'line');
 
 // Bar offsets use the explicit bound time array by index. They neither assume
 // a fixed duration nor synthesize a future time beyond the available domain.

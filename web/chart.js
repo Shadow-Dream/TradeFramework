@@ -25,6 +25,11 @@ const pageState = {
   pane: null,
   paneId: "",
   chart: null,
+  chartContext: null,
+  chartContainer: null,
+  chartTimeZone: "",
+  chartShowTime: false,
+  drawingToolbar: null,
   observer: null,
   saveTimer: null,
   saveSeq: 0,
@@ -174,7 +179,9 @@ async function getJson(path) {
   return response.json();
 }
 
-async function postJson(path, payload, { keepalive = false, signal = null } = {}) {
+async function postJson(path, payload, {
+  keepalive = false, signal = null, projection = false,
+} = {}) {
   const response = await authenticatedFetch(path, {
     method: "POST",
     headers: {
@@ -187,7 +194,9 @@ async function postJson(path, payload, { keepalive = false, signal = null } = {}
     ...(signal ? { signal } : {}),
   });
   const data = response.ok
-    ? await response.json()
+    ? (projection && window.TradeChartCore?.parseProjectionResponse
+      ? await window.TradeChartCore.parseProjectionResponse(response)
+      : await response.json())
     : await response.json().catch(() => ({}));
   if (!response.ok || data.accepted === false) {
     const error = new Error(data.error || `${path} returned ${response.status}`);
@@ -205,7 +214,7 @@ async function postResultJson(path, payload, controller, timeoutMessage) {
     controller.abort();
   }, RESULT_REQUEST_TIMEOUT_MS);
   try {
-    return await postJson(path, payload, { signal: controller.signal });
+    return await postJson(path, payload, { signal: controller.signal, projection: true });
   } catch (error) {
     if (timedOut) throw new Error(timeoutMessage);
     throw error;
@@ -445,7 +454,12 @@ async function loadPaneResult({ force = false, visualizerId = "" } = {}) {
       try {
         const response = await postResultJson(
           `/api/backtests/${encodeURIComponent(backtestId)}/result`,
-          { paths: plan.paths, temporaryModules: plan.temporaryModules },
+          {
+            paths: plan.paths,
+            temporaryModules: plan.temporaryModules,
+            projectionFormat: "columns-v2",
+            window: null,
+          },
           controller,
           "Chart data request timed out. Retry when the Result service is available.",
         );
@@ -1783,6 +1797,9 @@ function cleanupPaneDrawAttempt({ chart = null, observer = null, drawingToolbar 
   cleanupPaneDrawingResources(drawingToolbar, chartContext);
   try { chart?.remove?.(); } catch { /* continue failed draw cleanup */ }
   pageState.chart = null;
+  pageState.chartContext = null;
+  pageState.chartContainer = null;
+  pageState.drawingToolbar = null;
   pageState.observer = null;
   pageState.drawingCleanup = null;
   pageState.rangeStartInput = null;
@@ -2148,11 +2165,11 @@ function createDrawingToolbar(controller, interactionSurface) {
   syncButtons();
   return {
     element,
-    cleanup() {
+    cleanup({ disposeController = true } = {}) {
       unsubscribe?.();
       element.removeEventListener("keydown", onKeyDown);
       interactionSurface?.removeEventListener?.("keydown", onKeyDown);
-      controller?.dispose?.();
+      if (disposeController) controller?.dispose?.();
     },
   };
 }
@@ -2163,17 +2180,36 @@ function drawPane() {
   let controls = null;
   let chart = null;
   let chartContext = null;
+  let reconcileDiagnostics = null;
   let drawingToolbar = null;
   let observer = null;
+  const retained = pageState.chart && pageState.chartContext && pageState.chartContainer
+    ? {
+      chart: pageState.chart,
+      chartContext: pageState.chartContext,
+      container: pageState.chartContainer,
+      drawingToolbar: pageState.drawingToolbar,
+      timeZone: pageState.chartTimeZone,
+      showTime: pageState.chartShowTime,
+      range: pageState.chart.timeScale?.().getVisibleRange?.() || null,
+    }
+    : null;
+  const disposeRetained = () => {
+    if (!retained) return;
+    runChartCleanups(retained.chartContext?.cleanups || []);
+    try { retained.chart?.remove?.(); } catch { /* replacement cleanup */ }
+  };
   try {
     area = document.getElementById("singleChartArea");
     if (!area) throw new Error("Standalone chart area is unavailable.");
     try { cleanupPaneViewTracking({ flush: true }); } catch { /* continue pane cleanup */ }
-    runChartCleanups([pageState.drawingCleanup]);
+    try { retained?.drawingToolbar?.cleanup?.({ disposeController: false }); } catch { /* controller remains Chart Core owned */ }
     pageState.drawingCleanup = null;
+    pageState.drawingToolbar = null;
     try { pageState.observer?.disconnect(); } catch { /* continue pane cleanup */ }
-    try { pageState.chart?.remove?.(); } catch { /* continue pane cleanup */ }
     pageState.chart = null;
+    pageState.chartContext = null;
+    pageState.chartContainer = null;
     pageState.observer = null;
     pageState.rangeStartInput = null;
     pageState.rangeEndInput = null;
@@ -2194,6 +2230,7 @@ function drawPane() {
     }
 
     if (pageState.resultStatus === "loading" || pageState.resultStatus === "error") {
+      disposeRetained();
       const dataState = document.createElement("div");
       dataState.className = "chart-view-toolbar";
       const message = document.createElement("span");
@@ -2229,6 +2266,7 @@ function drawPane() {
     }
 
     if (!(pageState.pane.visualizers || []).length) {
+      disposeRetained();
       const empty = document.createElement("div");
       empty.className = "muted";
       empty.textContent = "No visualizers";
@@ -2240,7 +2278,13 @@ function drawPane() {
       throw new Error("Chart library failed to load. Configuration remains available above.");
     }
 
-    pageState.timeInfo = window.TradeChartCore.paneTimeInfo(pageState.result, pageState.pane, paneScopedSpec());
+    const scoped = paneScopedSpec();
+    const preparedPane = window.TradeChartCore.prepareFinancialPane(
+      pageState.result, pageState.pane, scoped,
+    );
+    pageState.timeInfo = window.TradeChartCore.paneTimeInfo(
+      pageState.result, pageState.pane, scoped, preparedPane,
+    );
     const zone = currentTimeZone();
     const rangeOptions = { timeZone: zone.timeZone, showTime: pageState.timeInfo.showTime };
     const storedStart = pageState.pane.view.start ? window.TradeChartCore.chartTime(pageState.pane.view.start) : null;
@@ -2257,7 +2301,13 @@ function drawPane() {
       <span class="chart-granularity">${pageState.timeInfo.showTime ? "Intraday" : "Date"}</span>
       <span class="chart-view-error" data-chart-view-error hidden></span>
     `;
-    const container = document.createElement("div");
+    const canRetain = retained
+      && retained.timeZone === zone.timeZone
+      && retained.showTime === pageState.timeInfo.showTime
+      && retained.chartContext?.paneId === pageState.pane.id
+      && typeof retained.chartContext?.reconcile === "function";
+    if (retained && !canRetain) disposeRetained();
+    const container = canRetain ? retained.container : document.createElement("div");
     container.className = "tv-chart";
     container.style.height = "calc(100vh - 230px)";
     container.tabIndex = 0;
@@ -2265,18 +2315,38 @@ function drawPane() {
     panel.appendChild(viewToolbar);
     panel.appendChild(container);
 
-    chart = window.TradeChartCore.createFinancialChart(container, {
-      timeZone: zone.timeZone,
-      showTime: pageState.timeInfo.showTime,
-      logScale: !!pageState.pane.view.logScale,
-    });
-    chartContext = window.TradeChartCore.drawFinancialPane(
-      window.LightweightCharts,
-      chart,
-      pageState.result,
-      pageState.pane,
-      paneScopedSpec(),
-    );
+    if (canRetain) {
+      chart = retained.chart;
+      chartContext = retained.chartContext;
+      chart.applyOptions({
+        rightPriceScale: { mode: window.TradeChartCore.priceScaleMode(!!pageState.pane.view.logScale) },
+      });
+      const reconciled = chartContext.reconcile(
+        pageState.result, pageState.pane, scoped, preparedPane,
+      );
+      if (reconciled.updated !== true) {
+        disposeRetained();
+        chart = null;
+        chartContext = null;
+      } else {
+        reconcileDiagnostics = reconciled.diagnostics || [];
+      }
+    }
+    if (!chart || !chartContext) {
+      chart = window.TradeChartCore.createFinancialChart(container, {
+        timeZone: zone.timeZone,
+        showTime: pageState.timeInfo.showTime,
+        logScale: !!pageState.pane.view.logScale,
+      });
+      chartContext = window.TradeChartCore.drawFinancialPane(
+        window.LightweightCharts,
+        chart,
+        pageState.result,
+        pageState.pane,
+        scoped,
+        preparedPane,
+      );
+    }
     drawingToolbar = createDrawingToolbar(
       chartContext?.interactionController || null,
       container,
@@ -2284,7 +2354,7 @@ function drawPane() {
     panel.insertBefore(drawingToolbar.element, container);
     const diagnostics = mergePaneDiagnostics(
       pageState.timeInfo?.diagnostics,
-      chartContext?.diagnostics,
+      reconcileDiagnostics || chartContext?.diagnostics,
     ).filter((item) => !(
       item?.code === "missing-instance-result"
       && pendingIds.has(item?.visualizerId)
@@ -2296,7 +2366,9 @@ function drawPane() {
     const savedEnd = pageState.timeInfo.end == null
       ? null
       : (typeof storedEnd === "number" && Number.isFinite(storedEnd) ? Math.min(storedEnd, pageState.timeInfo.end) : pageState.timeInfo.end);
-    if ((pageState.pane.view.start || pageState.pane.view.end) && savedStart != null && savedEnd != null && savedStart < savedEnd) {
+    if (canRetain && retained.range && chart === retained.chart) {
+      chart.timeScale().setVisibleRange(retained.range);
+    } else if ((pageState.pane.view.start || pageState.pane.view.end) && savedStart != null && savedEnd != null && savedStart < savedEnd) {
       chart.timeScale().setVisibleRange({ from: savedStart, to: savedEnd });
     } else {
       chart.timeScale().fitContent();
@@ -2313,6 +2385,11 @@ function drawPane() {
     const controlsButton = viewToolbar.querySelector("[data-toggle-chart-controls]");
     controlsButton?.addEventListener("click", () => toggleControls(controls, controlsButton));
     pageState.chart = chart;
+    pageState.chartContext = chartContext;
+    pageState.chartContainer = container;
+    pageState.chartTimeZone = zone.timeZone;
+    pageState.chartShowTime = pageState.timeInfo.showTime;
+    pageState.drawingToolbar = drawingToolbar;
     pageState.observer = observer;
     pageState.rangeStartInput = rangeStartInput;
     pageState.rangeEndInput = rangeEndInput;

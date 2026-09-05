@@ -72,7 +72,7 @@
             <div id="bwChart" class="bw-chart" tabindex="0" aria-label="Basic Workflow financial chart" aria-keyshortcuts="Delete Backspace" aria-busy="false"></div>
             <div id="bwChartState" class="bw-chart-state">
               <strong>Preparing the Trade Engine result…</strong>
-              <span>The chart appears only after Dataset, Pipeline, Backtest and Result materialization completes.</span>
+              <span>The chart opens from a sealed Dataset → Sampler DataKey cache; Backtest is not required.</span>
             </div>
           </div>
         </div>
@@ -86,8 +86,8 @@
         </div>
         <div class="bw-provenance">
           <div><span>Market data</span><strong id="bwChartDataset">Waiting for data</strong></div>
-          <div><span>Analysis setup</span><strong id="bwChartPipeline">Preparing</strong></div>
-          <div><span>Run status</span><strong id="bwChartBacktest">Not started</strong></div>
+          <div><span>Chart data path</span><strong id="bwChartPipeline">Preparing Sampler cache</strong></div>
+          <div><span>Backtest</span><strong id="bwChartBacktest">Not required</strong></div>
         </div>
       </section>
     </main>

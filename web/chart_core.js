@@ -977,6 +977,38 @@
 
   let visualizerDefinitions = [];
   let temporaryModuleDefinitions = [];
+  let projectionDecoder = null;
+  let projectionDecodeSequence = 0;
+  const projectionDecodeRequests = new Map();
+
+  function parseProjectionResponse(response) {
+    if (!response || typeof response.arrayBuffer !== "function") {
+      return Promise.reject(new TypeError("Projection response is invalid."));
+    }
+    if (typeof Worker !== "function") return response.json();
+    return response.arrayBuffer().then((buffer) => new Promise((resolve, reject) => {
+      if (!projectionDecoder) {
+        projectionDecoder = new Worker("/projection_decode_worker.js");
+        projectionDecoder.addEventListener("message", (event) => {
+          const pending = projectionDecodeRequests.get(event.data?.requestId);
+          if (!pending) return;
+          projectionDecodeRequests.delete(event.data.requestId);
+          if (event.data.ok === true) pending.resolve(event.data.value);
+          else pending.reject(new Error(event.data.error || "Projection JSON could not be decoded."));
+        });
+        projectionDecoder.addEventListener("error", () => {
+          const failure = new Error("Projection decoding Worker failed.");
+          projectionDecodeRequests.forEach((pending) => pending.reject(failure));
+          projectionDecodeRequests.clear();
+          try { projectionDecoder.terminate(); } catch { /* failed Worker is discarded */ }
+          projectionDecoder = null;
+        });
+      }
+      const requestId = `projection-${++projectionDecodeSequence}`;
+      projectionDecodeRequests.set(requestId, { resolve, reject });
+      projectionDecoder.postMessage({ requestId, buffer }, [buffer]);
+    }));
+  }
 
   function setVisualizerDefinitions(definitions) {
     visualizerDefinitions = Array.isArray(definitions) ? structuredClone(definitions) : [];
@@ -1364,7 +1396,65 @@
     return Array.isArray(rows) ? rows : [];
   }
 
+  const columnarProjectionValues = new WeakMap();
+
+  function validatedColumnarProjection(result) {
+    if (!result || typeof result !== "object" || result.projectionFormat !== "columns-v2") return null;
+    let cached = columnarProjectionValues.get(result);
+    if (cached) return cached;
+    if (result.projectionSchemaVersion !== 2
+        || !Number.isSafeInteger(result.totalRowCount) || result.totalRowCount < 0
+        || !result.window || typeof result.window !== "object" || Array.isArray(result.window)
+        || Object.keys(result.window).length !== 2
+        || !Number.isSafeInteger(result.window.startIndex) || result.window.startIndex < 0
+        || !Number.isSafeInteger(result.window.endIndexExclusive)
+        || result.window.endIndexExclusive < result.window.startIndex
+        || result.window.endIndexExclusive > result.totalRowCount
+        || !Array.isArray(result.columnOrder)
+        || new Set(result.columnOrder).size !== result.columnOrder.length
+        || !result.columns || typeof result.columns !== "object" || Array.isArray(result.columns)
+        || Object.keys(result.columns).length !== result.columnOrder.length
+        || result.columnOrder.some((path) => typeof path !== "string" || !path
+          || !Object.prototype.hasOwnProperty.call(result.columns, path))) {
+      throw runtimeError("invalid-columnar-projection", "Columnar Visualizer projection has an invalid contract.");
+    }
+    const rowCount = result.window.endIndexExclusive - result.window.startIndex;
+    cached = new Map();
+    for (const path of result.columnOrder) {
+      const column = result.columns[path];
+      if (!column || typeof column !== "object" || Array.isArray(column)
+          || Object.keys(column).length !== 2
+          || !Object.prototype.hasOwnProperty.call(column, "values")
+          || !Object.prototype.hasOwnProperty.call(column, "absent")
+          || !Array.isArray(column.values) || column.values.length !== rowCount
+          || !Array.isArray(column.absent)) {
+        throw runtimeError("invalid-columnar-projection", `Column '${path}' has an invalid contract.`);
+      }
+      let previous = -1;
+      const values = column.values.slice();
+      for (const index of column.absent) {
+        if (!Number.isSafeInteger(index) || index < 0 || index >= rowCount
+            || index <= previous || values[index] !== null) {
+          throw runtimeError("invalid-columnar-projection", `Column '${path}' has invalid absence evidence.`);
+        }
+        previous = index;
+        values[index] = undefined;
+      }
+      cached.set(path, values);
+    }
+    columnarProjectionValues.set(result, cached);
+    return cached;
+  }
+
   function dataKeyValues(result, declaration) {
+    const columns = validatedColumnarProjection(result);
+    if (columns) {
+      const sourcePath = declaration?.source?.path;
+      if (typeof sourcePath !== "string" || !columns.has(sourcePath)) {
+        throw runtimeError("missing-columnar-input", `Columnar projection omitted '${String(sourcePath || "unknown")}'.`);
+      }
+      return columns.get(sourcePath);
+    }
     const rows = dataKeyRows(result, declaration);
     const valuePath = declaration?.encoding?.value;
     return valuePath ? rows.map((row) => fieldValue(row, valuePath)) : rows;
@@ -1651,22 +1741,30 @@
     return right;
   }
 
-  function schemaHasLiteralConstraint(schemaValue) {
-    const schema = normalizeSchema(schemaValue);
+  function schemaHasLiteralConstraintNormalized(schema) {
     if (schema === false) return true;
     if (Object.prototype.hasOwnProperty.call(schema, "const") || Array.isArray(schema.enum)) return true;
-    return Object.values(schema.properties || {}).some(schemaHasLiteralConstraint)
+    return Object.values(schema.properties || {}).some(schemaHasLiteralConstraintNormalized)
       || ["allOf", "anyOf", "oneOf"].some((keyword) => (
-        (schema[keyword] || []).some(schemaHasLiteralConstraint)
+        (schema[keyword] || []).some(schemaHasLiteralConstraintNormalized)
       ));
   }
 
-  function schemaMatchesForAttenuation(value, schemaValue) {
-    const schema = normalizeSchema(schemaValue);
+  function schemaTypesNormalized(schema) {
+    if (schema === false) return new Set();
+    if (schema.type !== undefined) {
+      return new Set(Array.isArray(schema.type) ? schema.type : [schema.type]);
+    }
+    if (schema.properties || schema.required) return new Set(["object"]);
+    if (schema.items) return new Set(["array"]);
+    return new Set(jsonTypes);
+  }
+
+  function schemaMatchesForAttenuationNormalized(value, schema) {
     if (schema === false) return false;
     const actual = jsonType(value);
     if (actual === "non-json") return false;
-    const allowed = schemaTypes(schema);
+    const allowed = schemaTypesNormalized(schema);
     if (!allowed.has(actual) && !(actual === "integer" && allowed.has("number"))) return false;
     if (Object.prototype.hasOwnProperty.call(schema, "const")
         && !jsonValuesEqual(value, schema.const)) return false;
@@ -1674,26 +1772,25 @@
     if (actual === "object") {
       if ((schema.required || []).some((name) => !Object.prototype.hasOwnProperty.call(value, name))) return false;
       const properties = Object.entries(schema.properties || {}).sort(([, left], [, right]) => (
-        Number(schemaHasLiteralConstraint(right)) - Number(schemaHasLiteralConstraint(left))
+        Number(schemaHasLiteralConstraintNormalized(right)) - Number(schemaHasLiteralConstraintNormalized(left))
       ));
       for (const [name, childSchema] of properties) {
         if (Object.prototype.hasOwnProperty.call(value, name)
-            && !schemaMatchesForAttenuation(value[name], childSchema)) return false;
+            && !schemaMatchesForAttenuationNormalized(value[name], childSchema)) return false;
       }
     } else if (actual === "array" && Object.prototype.hasOwnProperty.call(schema, "items")) {
-      if (value.some((item) => !schemaMatchesForAttenuation(item, schema.items))) return false;
+      if (value.some((item) => !schemaMatchesForAttenuationNormalized(item, schema.items))) return false;
     }
     const allOf = [...(schema.allOf || [])].sort((left, right) => (
-      Number(schemaHasLiteralConstraint(right)) - Number(schemaHasLiteralConstraint(left))
+      Number(schemaHasLiteralConstraintNormalized(right)) - Number(schemaHasLiteralConstraintNormalized(left))
     ));
-    if (allOf.some((branch) => !schemaMatchesForAttenuation(value, branch))) return false;
-    if (schema.anyOf && !schema.anyOf.some((branch) => schemaMatchesForAttenuation(value, branch))) return false;
-    if (schema.oneOf && schema.oneOf.filter((branch) => schemaMatchesForAttenuation(value, branch)).length !== 1) return false;
+    if (allOf.some((branch) => !schemaMatchesForAttenuationNormalized(value, branch))) return false;
+    if (schema.anyOf && !schema.anyOf.some((branch) => schemaMatchesForAttenuationNormalized(value, branch))) return false;
+    if (schema.oneOf && schema.oneOf.filter((branch) => schemaMatchesForAttenuationNormalized(value, branch)).length !== 1) return false;
     return true;
   }
 
-  function attenuateInputValue(value, schemaValue) {
-    const schema = normalizeSchema(schemaValue);
+  function attenuateInputValueNormalized(value, schema) {
     if (schema === false) return undefined;
     let projected;
     if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -1701,7 +1798,7 @@
       const properties = schema.properties || {};
       for (const [name, childSchema] of Object.entries(properties)) {
         if (!Object.prototype.hasOwnProperty.call(value, name)) continue;
-        const child = attenuateInputValue(value[name], childSchema);
+        const child = attenuateInputValueNormalized(value[name], childSchema);
         if (child !== undefined) projected[name] = child;
       }
       if (Object.prototype.hasOwnProperty.call(schema, "additionalProperties")) {
@@ -1711,30 +1808,30 @@
             if (Object.prototype.hasOwnProperty.call(properties, name)) continue;
             const child = additional === true
               ? structuredClone(value[name])
-              : attenuateInputValue(value[name], additional);
+              : attenuateInputValueNormalized(value[name], additional);
             if (child !== undefined) projected[name] = child;
           }
         }
       }
     } else if (Array.isArray(value)) {
       projected = Object.prototype.hasOwnProperty.call(schema, "items")
-        ? value.map((item) => attenuateInputValue(item, schema.items))
+        ? value.map((item) => attenuateInputValueNormalized(item, schema.items))
         : [];
     } else {
-      projected = structuredClone(value);
+      projected = value;
     }
 
     for (const branch of schema.allOf || []) {
-      projected = mergeAttenuatedValues(projected, attenuateInputValue(value, branch));
+      projected = mergeAttenuatedValues(projected, attenuateInputValueNormalized(value, branch));
     }
     for (const keyword of ["anyOf", "oneOf"]) {
       if (!Array.isArray(schema[keyword])) continue;
       const matching = schema[keyword].filter((branch) => {
-        try { return schemaMatchesForAttenuation(value, branch); } catch { return false; }
+        try { return schemaMatchesForAttenuationNormalized(value, branch); } catch { return false; }
       });
       if (keyword === "oneOf" && matching.length !== 1) continue;
       for (const branch of matching) {
-        projected = mergeAttenuatedValues(projected, attenuateInputValue(value, branch));
+        projected = mergeAttenuatedValues(projected, attenuateInputValueNormalized(value, branch));
       }
     }
     return projected;
@@ -1755,8 +1852,11 @@
       if (!visualizerSchemasCompatible(declaration.schema || {}, port.schema || {})) {
         throw runtimeError("input-schema-mismatch", `Input '${portName}' DataKey '${dataKey}' does not satisfy the visualizer contract.`);
       }
-      inputs[portName] = frozenClone(
-        dataKeyValues(result, declaration).map((value) => attenuateInputValue(value, port.schema || {})),
+      const inputSchema = normalizeSchema(port.schema || {});
+      inputs[portName] = deepFreeze(
+        dataKeyValues(result, declaration).map(
+          (value) => attenuateInputValueNormalized(value, inputSchema),
+        ),
       );
     }
     return deepFreeze(inputs);
@@ -1836,8 +1936,9 @@
         }
       });
     });
+    const resolvedResult = resultForVisualizer(result, instance, definition);
     const inputs = bindVisualizerInputs(
-      resultForVisualizer(result, instance, definition), spec, definition, params,
+      resolvedResult, spec, definition, params,
     );
     const plan = {
       instance,
@@ -1849,6 +1950,9 @@
       inputs,
       prepared: null,
       displayLabel: visualizerDisplayBase(instance, definition),
+      sourceResult: Object.keys(definition?.inputPorts || {}).length
+        ? resolvedResult
+        : null,
     };
     const prepared = typeof renderer.prepare === "function"
       ? renderer.prepare(rendererPreparePayload(plan))
@@ -1869,22 +1973,55 @@
     };
   }
 
-  function paneTimeInfo(result, pane, spec = {}) {
+  const PREPARED_PANE_TOKEN = Symbol("trade-prepared-financial-pane");
+  const CONSUMED_PREPARED_PANES = new WeakSet();
+
+  function prepareFinancialPane(result, pane, spec = {}) {
     const diagnostics = [];
-    const values = [];
-    let explicitIntraday = false;
-    let timeDomainId = null;
+    const plans = [];
     const duplicateIds = duplicatePaneVisualizerIds(pane);
     for (const instance of pane?.visualizers || []) {
       if (!instance || instance.visible === false) continue;
-      let plan;
       try {
         requireUniquePaneVisualizerInstance(instance, duplicateIds);
-        plan = prepareVisualizerPlan(result, spec, instance);
+        plans.push(prepareVisualizerPlan(result, spec, instance));
       } catch (error) {
         diagnostics.push(planDiagnostic(instance, error, "renderer-prepare-error"));
-        continue;
       }
+    }
+    return Object.freeze({
+      token: PREPARED_PANE_TOKEN,
+      result,
+      pane,
+      spec,
+      plans: Object.freeze(plans),
+      diagnostics: Object.freeze(diagnostics),
+    });
+  }
+
+  function requirePreparedPane(result, pane, spec, prepared, options = {}) {
+    const consume = options.consume === true;
+    const value = prepared || prepareFinancialPane(result, pane, spec);
+    if (value?.token !== PREPARED_PANE_TOKEN
+        || value.result !== result || value.pane !== pane || value.spec !== spec
+        || (consume && CONSUMED_PREPARED_PANES.has(value))) {
+      throw runtimeError(
+        "invalid-pane-preparation",
+        "Financial Pane preparation does not match this Result and Pane.",
+      );
+    }
+    if (consume) CONSUMED_PREPARED_PANES.add(value);
+    return value;
+  }
+
+  function paneTimeInfo(result, pane, spec = {}, prepared = null) {
+    const preparation = requirePreparedPane(result, pane, spec, prepared);
+    const diagnostics = [...preparation.diagnostics];
+    const values = [];
+    let explicitIntraday = false;
+    let timeDomainId = null;
+    for (const plan of preparation.plans) {
+      const { instance } = plan;
       const planDomains = planTimeDomainValues(plan);
       if (!planDomains.length) continue;
       if (planDomains.length !== 1 || typeof planDomains[0] !== "string" || !planDomains[0].trim()) {
@@ -4009,21 +4146,13 @@
     });
   }
 
-  function drawFinancialPane(library, chart, result, pane, spec = {}) {
-    const diagnostics = [];
+  function drawFinancialPane(library, chart, result, pane, spec = {}, prepared = null) {
+    const preparation = requirePreparedPane(
+      result, pane, spec, prepared, { consume: true },
+    );
+    const diagnostics = [...preparation.diagnostics];
     const cleanups = [];
-    const plans = [];
-    const duplicateIds = duplicatePaneVisualizerIds(pane);
-    for (const instance of pane?.visualizers || []) {
-      if (!instance || instance.visible === false) continue;
-      try {
-        requireUniquePaneVisualizerInstance(instance, duplicateIds);
-        const plan = prepareVisualizerPlan(result, spec, instance);
-        plans.push(plan);
-      } catch (error) {
-        diagnostics.push(planDiagnostic(instance, error, "renderer-prepare-error"));
-      }
-    }
+    const plans = preparation.plans;
     assignVisualizerDisplayLabels(plans);
     let paneTimeDomainId = null;
     const rejected = new Set();
@@ -4081,10 +4210,189 @@
     // Interaction disposal must run before primitive cleanup so an in-flight
     // preview can restore without recreating an already removed primitive.
     cleanups.unshift(() => interactionController.dispose());
+    let currentPane = pane;
+    let currentResult = result;
+    let currentSpec = spec;
+    let disposed = false;
+    cleanups.unshift(() => { disposed = true; });
+
+    const reusablePlan = (current, next) => (
+      !!current && !!next
+      && current.renderer === next.renderer
+      && current.sourceResult === next.sourceResult
+      && jsonValuesEqual(current.instance, next.instance)
+    );
+
+    const reconcile = (nextResult, nextPane, nextSpec = {}, nextPrepared = null) => {
+      if (disposed) {
+        throw runtimeError("pane-reconcile-disposed", "Financial Pane session is disposed.");
+      }
+      if (nextPane?.id !== currentPane?.id) {
+        throw runtimeError("pane-reconcile-identity", "Financial Pane identity changed.");
+      }
+      const nextPreparation = requirePreparedPane(
+        nextResult, nextPane, nextSpec, nextPrepared, { consume: true },
+      );
+      const nextDiagnostics = [...nextPreparation.diagnostics];
+      const nextPlans = [...nextPreparation.plans];
+      assignVisualizerDisplayLabels(nextPlans);
+      const nextById = new Map();
+      let nextTimeDomain = null;
+      const rejectedIds = new Set();
+      for (const plan of nextPlans) {
+        const domains = planTimeDomainValues(plan);
+        if (domains.length) {
+          if (domains.length !== 1 || typeof domains[0] !== "string" || !domains[0].trim()) {
+            rejectedIds.add(plan.instance.id);
+            nextDiagnostics.push(planDiagnostic(plan.instance, runtimeError(
+              "invalid-time-domain-capability",
+              "A visible provided resource must expose exactly one non-empty time-domain attribute.",
+            )));
+            continue;
+          }
+          if (nextTimeDomain === null) nextTimeDomain = domains[0];
+          if (domains[0] !== nextTimeDomain) {
+            rejectedIds.add(plan.instance.id);
+            nextDiagnostics.push(planDiagnostic(plan.instance, runtimeError(
+              "time-domain-mismatch",
+              `Provided time-domain '${domains[0]}' cannot share a pane with '${nextTimeDomain}'.`,
+            )));
+            continue;
+          }
+        }
+        nextById.set(plan.instance.id, plan);
+      }
+
+      const changed = new Set();
+      for (const [id, currentPlan] of activePlansById) {
+        const nextPlan = nextById.get(id);
+        if (!reusablePlan(currentPlan, nextPlan)) changed.add(id);
+      }
+      for (const id of nextById.keys()) {
+        if (!activePlansById.has(id)) changed.add(id);
+      }
+      let expanded = true;
+      while (expanded) {
+        expanded = false;
+        for (const plan of nextById.values()) {
+          if (changed.has(plan.instance.id)) continue;
+          if (plan.capabilities.requires.some((requirement) => (
+            changed.has(plan.params[requirement.bindingParam])
+          ))) {
+            changed.add(plan.instance.id);
+            expanded = true;
+          }
+        }
+      }
+
+      const stagingResources = new Map(internals.resourcesByVisualizerId);
+      changed.forEach((id) => stagingResources.delete(id));
+      const stagedCleanups = [];
+      const stagedMountCleanups = new Map();
+      const stagedDiagnostics = [];
+      const stagingInternals = {
+        ...internals,
+        result: nextResult,
+        spec: nextSpec,
+        resourcesByVisualizerId: stagingResources,
+        drawingPreviewsById: new Map(),
+        mountCleanupsByVisualizerId: stagedMountCleanups,
+        diagnostics: stagedDiagnostics,
+        cleanups: stagedCleanups,
+      };
+      const stagedPlans = nextPlans.filter((plan) => (
+        !rejectedIds.has(plan.instance.id)
+        && changed.has(plan.instance.id)
+        && !plan.renderer.interaction
+      ));
+      const mountedIds = new Set();
+      const mountPass = (requiresResources) => {
+        for (const plan of stagedPlans) {
+          if (mountedIds.has(plan.instance.id)
+              || Boolean(plan.capabilities.requires.length) !== requiresResources) continue;
+          let requiredResources;
+          try {
+            requiredResources = resolveRequiredResources(plan, stagingResources);
+          } catch (error) {
+            stagedDiagnostics.push(planDiagnostic(plan.instance, error, "renderer-draw-error"));
+            continue;
+          }
+          if (drawVisualizerPlan(plan, stagingInternals, requiredResources)) {
+            mountedIds.add(plan.instance.id);
+          }
+        }
+      };
+      mountPass(false);
+      mountPass(true);
+      if (mountedIds.size !== stagedPlans.length) {
+        stagedCleanups.slice().reverse().forEach((cleanup) => {
+          try { cleanup(); } catch { /* staged mount is already rejected */ }
+        });
+        diagnostics.push(...nextDiagnostics, ...stagedDiagnostics);
+        return Object.freeze({ updated: false, diagnostics: frozenClone([...nextDiagnostics, ...stagedDiagnostics]) });
+      }
+
+      const currentOrder = [...activePlansById.keys()];
+      for (const id of currentOrder.reverse()) {
+        if (!changed.has(id)) continue;
+        const currentPlan = activePlansById.get(id);
+        if (currentPlan?.renderer?.interaction) continue;
+        const owned = internals.mountCleanupsByVisualizerId.get(id) || [];
+        owned.slice().reverse().forEach((cleanup) => cleanup());
+        internals.mountCleanupsByVisualizerId.delete(id);
+        activePlansById.delete(id);
+      }
+      for (const id of changed) internals.resourcesByVisualizerId.delete(id);
+      for (const [id, resources] of stagingResources) {
+        internals.resourcesByVisualizerId.set(id, resources);
+      }
+      for (const plan of stagedPlans) {
+        activePlansById.set(plan.instance.id, plan);
+        internals.mountCleanupsByVisualizerId.set(
+          plan.instance.id,
+          stagedMountCleanups.get(plan.instance.id) || [],
+        );
+      }
+      cleanups.push(...stagedCleanups);
+      internals.result = nextResult;
+      internals.spec = nextSpec;
+      currentResult = nextResult;
+      currentPane = nextPane;
+      currentSpec = nextSpec;
+      const interactiveInstances = nextPlans
+        .filter((plan) => !rejectedIds.has(plan.instance.id) && plan.renderer.interaction)
+        .map((plan) => effectivePlanInstance(plan));
+      const presentationUpdated = interactionController.reconcilePresentation({
+        visualizers: interactiveInstances,
+      });
+      if (!presentationUpdated) {
+        diagnostics.push(...nextDiagnostics, ...stagedDiagnostics, planDiagnostic(
+          { id: "", callback: "" },
+          runtimeError("pane-reconcile-interaction", "Interactive presentation reconciliation failed."),
+          "renderer-draw-error",
+        ));
+        return Object.freeze({ updated: false, diagnostics: frozenClone([...nextDiagnostics, ...stagedDiagnostics]) });
+      }
+      for (const id of [...activePlansById.keys()]) {
+        if (!nextById.has(id)) activePlansById.delete(id);
+      }
+      for (const [id, plan] of nextById) {
+        if (!plan.renderer.interaction && !activePlansById.has(id)) {
+          activePlansById.set(id, plan);
+        }
+      }
+      diagnostics.push(...nextDiagnostics, ...stagedDiagnostics);
+      return Object.freeze({
+        updated: true,
+        diagnostics: frozenClone([...nextDiagnostics, ...stagedDiagnostics]),
+      });
+    };
     return Object.freeze({
       diagnostics,
       cleanups,
       interactionController,
+      reconcile,
+      paneId: pane.id,
       styleNormalizationChanged: false,
     });
   }
@@ -4102,6 +4410,7 @@
     visualizerSchemasCompatible,
     drawCallbackCatalog,
     drawFinancialPane,
+    prepareFinancialPane,
     visualizerCatalog,
     setVisualizerDefinitions,
     setTemporaryModuleDefinitions,
@@ -4111,6 +4420,7 @@
     visualizerDependencyPlan,
     layerId,
     normalizeVisualizationSpec,
+    parseProjectionResponse,
     paneTimeInfo,
     parseRangeInput,
     formatRangeInput,

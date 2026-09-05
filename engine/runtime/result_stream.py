@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import codecs
+import copy
 import hashlib
 import json
 import os
@@ -35,6 +36,9 @@ FRAMED_RESULT_METADATA_PREFIX = b'],"schemaVersion":'
 MAX_RESULT_VERIFICATION_SHARDS = 8
 RESULT_VERIFICATION_TARGET_BYTES = 32 * 1024 * 1024
 _READ_CHUNK_BYTES = 1024 * 1024
+COLUMNAR_PROJECTION_FORMAT = "columns-v2"
+COLUMNAR_PROJECTION_SCHEMA_VERSION = 2
+MAX_COLUMNAR_PROJECTION_COLUMNS = 256
 
 
 class UniqueTextIndex:
@@ -399,11 +403,26 @@ class ResultArchiveReader:
     calculated over the same read, so archive size does not determine RSS.
     """
 
-    def __init__(self, path, *, expected_digest, expected_size, chunk_size=1024 * 1024):
+    def __init__(
+        self,
+        path,
+        *,
+        expected_digest,
+        expected_size,
+        top_level_fields=None,
+        chunk_size=1024 * 1024,
+    ):
         self.path = Path(path)
         self.expected_digest = expected_digest
         self.expected_size = expected_size
         self.chunk_size = chunk_size
+        self.top_level_fields = (
+            _RESULT_FIELDS
+            if top_level_fields is None
+            else frozenset(top_level_fields)
+        )
+        if "cycles" not in self.top_level_fields:
+            raise ValueError("Result archive top-level fields must include cycles.")
         self.handle = None
         self.buffer = ""
         self.position = 0
@@ -521,7 +540,7 @@ class ResultArchiveReader:
             self._skip_whitespace()
         if self.position != len(self.buffer):
             raise ValueError("Result archive contains trailing content.")
-        if set(metadata) | {"cycles"} != _RESULT_FIELDS:
+        if set(metadata) | {"cycles"} != self.top_level_fields:
             raise ValueError("Result archive top-level fields do not match its schema.")
         if self.byte_count != self.expected_size:
             raise ValueError("Result archive size does not match its immutable index.")
@@ -531,7 +550,7 @@ class ResultArchiveReader:
         self.metadata = metadata
 
 
-def normalize_projection_paths(paths):
+def normalize_projection_paths(paths, *, top_level_fields=None):
     if not isinstance(paths, list):
         raise ValueError("Result slice paths must be an array.")
     if (
@@ -539,13 +558,365 @@ def normalize_projection_paths(paths):
         or len(paths) != len(set(paths))
     ):
         raise ValueError("Result slice paths must be unique non-empty strings.")
+    allowed_fields = (
+        _RESULT_FIELDS if top_level_fields is None else frozenset(top_level_fields)
+    )
     normalized = []
     for path in paths:
         parts = split_data_path(path)
-        if parts[0] not in _RESULT_FIELDS:
+        if parts[0] not in allowed_fields:
             raise ValueError(f"Result slice references unknown path '{path}'.")
         normalized.append((path, parts))
     return tuple(normalized)
+
+
+def normalize_projection_window(value):
+    """Return one exact half-open cycle window without changing execution scope.
+
+    Temporary Modules still execute from the first cycle so state and warm-up
+    semantics are identical to a full Result projection.  The window only
+    limits rows encoded for the Visualizer transport boundary.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) - {
+        "startIndex", "endIndexExclusive",
+    }:
+        raise ValueError("Result projection window has an invalid exact shape.")
+    if "startIndex" not in value or "endIndexExclusive" not in value:
+        raise ValueError("Result projection window requires both boundaries.")
+    start = value["startIndex"]
+    end = value["endIndexExclusive"]
+    if (
+        isinstance(start, bool)
+        or not isinstance(start, int)
+        or start < 0
+        or isinstance(end, bool)
+        or not isinstance(end, int)
+        or end <= start
+    ):
+        raise ValueError("Result projection window must be a positive half-open range.")
+    return {"startIndex": start, "endIndexExclusive": end}
+
+
+class _ColumnarProjectionSink:
+    """Bounded-memory column encoder for the Visualizer projection contract."""
+
+    def __init__(self, root, cycle_paths, window):
+        if any(parts == ("cycles",) for _path, parts in cycle_paths):
+            raise ValueError(
+                "Columnar Result projection requires explicit cycle child paths."
+            )
+        if len(cycle_paths) > MAX_COLUMNAR_PROJECTION_COLUMNS:
+            raise ValueError("Columnar Result projection requests too many columns.")
+        self.root = Path(root)
+        self.cycle_paths = tuple(cycle_paths)
+        self.window = normalize_projection_window(window)
+        self.value_handles = []
+        self.absent_handles = []
+        self.selected_count = 0
+        for index, _item in enumerate(self.cycle_paths):
+            value_path = self.root / f"value-{index}.jsonl"
+            absent_path = self.root / f"absent-{index}.jsonl"
+            self.value_handles.append(value_path.open("w", encoding="utf-8"))
+            self.absent_handles.append(absent_path.open("w", encoding="ascii"))
+
+    def _selected(self, index):
+        if self.window is None:
+            return True
+        return (
+            self.window["startIndex"]
+            <= index
+            < self.window["endIndexExclusive"]
+        )
+
+    def add(self, index, cycle):
+        if not self._selected(index):
+            return
+        output_index = self.selected_count
+        for column_index, (_path, parts) in enumerate(self.cycle_paths):
+            value = get_data_segments(cycle, parts[1:], _MISSING)
+            if value is _MISSING:
+                encoded = "null"
+                self.absent_handles[column_index].write(str(output_index) + "\n")
+            else:
+                encoded = strict_json.dumps(
+                    value, sort_keys=True, separators=(",", ":")
+                )
+            self.value_handles[column_index].write(encoded + "\n")
+        self.selected_count += 1
+
+    def close(self):
+        first_error = None
+        for handle in (*self.value_handles, *self.absent_handles):
+            try:
+                handle.close()
+            except BaseException as exc:
+                first_error = first_error or exc
+        self.value_handles = []
+        self.absent_handles = []
+        if first_error is not None:
+            raise first_error
+
+    @staticmethod
+    def _write_array(output, path):
+        output.write("[")
+        first = True
+        with Path(path).open("r", encoding="utf-8") as handle:
+            for line in handle:
+                value = line.rstrip("\n")
+                if not value:
+                    raise ValueError("Columnar Result projection spool is invalid.")
+                if not first:
+                    output.write(",")
+                output.write(value)
+                first = False
+        output.write("]")
+
+    def write_columns(self, output):
+        output.write('"columnOrder":')
+        output.write(strict_json.dumps(
+            [path for path, _parts in self.cycle_paths],
+            separators=(",", ":"),
+        ))
+        output.write(',"columns":{')
+        for index, (path, _parts) in enumerate(self.cycle_paths):
+            if index:
+                output.write(",")
+            output.write(strict_json.dumps(path, separators=(",", ":")))
+            output.write(':{"values":')
+            self._write_array(output, self.root / f"value-{index}.jsonl")
+            output.write(',"absent":')
+            self._write_array(output, self.root / f"absent-{index}.jsonl")
+            output.write("}")
+        output.write("}")
+
+
+def _columnar_projected_metadata(metadata, metadata_paths):
+    projected = {}
+    for path, parts in metadata_paths:
+        value = get_data_segments(metadata, parts, _MISSING)
+        if value is _MISSING:
+            raise ValueError(f"Result slice path '{path}' is missing.")
+        if parts[0] == "dataKeys":
+            continue
+        set_data_segments(projected, parts, value)
+    return projected
+
+
+def _write_columnar_document(
+    destination,
+    *,
+    sink,
+    data_keys,
+    metadata,
+    metadata_paths,
+    total_count,
+):
+    start = 0 if sink.window is None else min(
+        sink.window["startIndex"], total_count
+    )
+    requested_end = total_count if sink.window is None else sink.window[
+        "endIndexExclusive"
+    ]
+    end = min(requested_end, total_count)
+    projected_metadata = _columnar_projected_metadata(metadata, metadata_paths)
+    with Path(destination).open("w", encoding="utf-8") as output:
+        output.write('{"projectionSchemaVersion":')
+        output.write(str(COLUMNAR_PROJECTION_SCHEMA_VERSION))
+        output.write(',"projectionFormat":')
+        output.write(strict_json.dumps(COLUMNAR_PROJECTION_FORMAT))
+        output.write(',"dataKeys":')
+        output.write(strict_json.dumps(
+            data_keys, sort_keys=True, separators=(",", ":")
+        ))
+        output.write(',"totalRowCount":')
+        output.write(str(total_count))
+        output.write(',"window":{"startIndex":')
+        output.write(str(start))
+        output.write(',"endIndexExclusive":')
+        output.write(str(end))
+        output.write('},')
+        sink.write_columns(output)
+        for key, value in projected_metadata.items():
+            output.write(",")
+            output.write(strict_json.dumps(key, separators=(",", ":")))
+            output.write(":")
+            output.write(strict_json.dumps(
+                value, sort_keys=True, separators=(",", ":")
+            ))
+        output.write("}")
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def _write_columnar_projection(
+    source_path,
+    destination_path,
+    *,
+    normalized,
+    data_keys,
+    expected_digest,
+    expected_size,
+    prepare_cycle,
+    finalize_cycles,
+    validate_metadata,
+    top_level_fields,
+    capture_cycle,
+    capture_metadata,
+    window,
+):
+    cycle_paths = tuple(item for item in normalized if item[1][0] == "cycles")
+    metadata_paths = tuple(item for item in normalized if item[1][0] != "cycles")
+    destination = Path(destination_path)
+    temporary = destination.with_name(destination.name + ".tmp")
+    temporary.unlink(missing_ok=True)
+    cycle_count = 0
+    first_cycle_id = None
+    last_cycle_id = None
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="trade-result-columns-", dir=destination.parent
+        ) as spool_root:
+            sink = _ColumnarProjectionSink(spool_root, cycle_paths, window)
+            sink_error = None
+            try:
+                with ResultArchiveReader(
+                    source_path,
+                    expected_digest=expected_digest,
+                    expected_size=expected_size,
+                    top_level_fields=top_level_fields,
+                ) as reader:
+                    for index, cycle in enumerate(reader.cycles()):
+                        if capture_cycle is not None:
+                            capture_cycle(copy.deepcopy(cycle))
+                        cycle = prepare_cycle(index, cycle)
+                        cycle_id = cycle["cycleId"]
+                        if first_cycle_id is None:
+                            first_cycle_id = cycle_id
+                        last_cycle_id = cycle_id
+                        cycle_count += 1
+                        sink.add(index, cycle)
+                    finalize_cycles()
+                    metadata = reader.metadata
+                    if capture_metadata is not None:
+                        capture_metadata(copy.deepcopy(metadata))
+                    validate_metadata(
+                        metadata,
+                        cycle_count=cycle_count,
+                        first_cycle_id=first_cycle_id,
+                        last_cycle_id=last_cycle_id,
+                    )
+            except BaseException as exc:
+                sink_error = exc
+            try:
+                sink.close()
+            except BaseException as exc:
+                if sink_error is None:
+                    sink_error = exc
+                else:
+                    _attach_cleanup_context(sink_error, exc)
+            if sink_error is not None:
+                raise sink_error
+            _write_columnar_document(
+                temporary,
+                sink=sink,
+                data_keys=data_keys,
+                metadata=metadata,
+                metadata_paths=metadata_paths,
+                total_count=cycle_count,
+            )
+        os.replace(temporary, destination)
+        return destination
+    except BaseException as primary_error:
+        primary_traceback = primary_error.__traceback__
+        cleanup_error = None
+        for path in (temporary, destination):
+            try:
+                path.unlink(missing_ok=True)
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+        if cleanup_error is not None:
+            _attach_cleanup_context(primary_error, cleanup_error)
+        raise primary_error.with_traceback(primary_traceback)
+
+
+def _write_columnar_projection_from_cycles(
+    cycles,
+    metadata,
+    destination_path,
+    *,
+    normalized,
+    data_keys,
+    prepare_cycle,
+    finalize_cycles,
+    validate_metadata,
+    copy_cycle,
+    window,
+):
+    cycle_paths = tuple(item for item in normalized if item[1][0] == "cycles")
+    metadata_paths = tuple(item for item in normalized if item[1][0] != "cycles")
+    destination = Path(destination_path)
+    temporary = destination.with_name(destination.name + ".tmp")
+    temporary.unlink(missing_ok=True)
+    cycle_count = 0
+    first_cycle_id = None
+    last_cycle_id = None
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="trade-result-columns-", dir=destination.parent
+        ) as spool_root:
+            sink = _ColumnarProjectionSink(spool_root, cycle_paths, window)
+            sink_error = None
+            try:
+                for index, base_cycle in enumerate(cycles):
+                    cycle = prepare_cycle(index, copy_cycle(base_cycle))
+                    cycle_id = cycle["cycleId"]
+                    if first_cycle_id is None:
+                        first_cycle_id = cycle_id
+                    last_cycle_id = cycle_id
+                    cycle_count += 1
+                    sink.add(index, cycle)
+                finalize_cycles()
+                validate_metadata(
+                    metadata,
+                    cycle_count=cycle_count,
+                    first_cycle_id=first_cycle_id,
+                    last_cycle_id=last_cycle_id,
+                )
+            except BaseException as exc:
+                sink_error = exc
+            try:
+                sink.close()
+            except BaseException as exc:
+                if sink_error is None:
+                    sink_error = exc
+                else:
+                    _attach_cleanup_context(sink_error, exc)
+            if sink_error is not None:
+                raise sink_error
+            _write_columnar_document(
+                temporary,
+                sink=sink,
+                data_keys=data_keys,
+                metadata=metadata,
+                metadata_paths=metadata_paths,
+                total_count=cycle_count,
+            )
+        os.replace(temporary, destination)
+        return destination
+    except BaseException as primary_error:
+        primary_traceback = primary_error.__traceback__
+        cleanup_error = None
+        for path in (temporary, destination):
+            try:
+                path.unlink(missing_ok=True)
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+        if cleanup_error is not None:
+            _attach_cleanup_context(primary_error, cleanup_error)
+        raise primary_error.with_traceback(primary_traceback)
 
 
 def _project_cycle(cycle, cycle_paths, *, full_cycles):
@@ -582,12 +953,14 @@ def _projection_resources(
     *,
     expected_digest,
     expected_size,
+    top_level_fields,
 ):
     """Own reader/output cleanup while preserving the operation's first error."""
     reader = ResultArchiveReader(
         source_path,
         expected_digest=expected_digest,
         expected_size=expected_size,
+        top_level_fields=top_level_fields,
     )
     output = None
     primary_error = None
@@ -627,9 +1000,35 @@ def write_projection(
     prepare_cycle,
     finalize_cycles,
     validate_metadata,
+    top_level_fields=None,
+    capture_cycle=None,
+    capture_metadata=None,
+    projection_format="rows",
+    window=None,
 ):
     """Validate and project a Result to one atomically published JSON file."""
-    normalized = normalize_projection_paths(paths)
+    normalized = normalize_projection_paths(
+        paths,
+        top_level_fields=top_level_fields,
+    )
+    if projection_format == COLUMNAR_PROJECTION_FORMAT:
+        return _write_columnar_projection(
+            source_path,
+            destination_path,
+            normalized=normalized,
+            data_keys=data_keys,
+            expected_digest=expected_digest,
+            expected_size=expected_size,
+            prepare_cycle=prepare_cycle,
+            finalize_cycles=finalize_cycles,
+            validate_metadata=validate_metadata,
+            top_level_fields=top_level_fields,
+            capture_cycle=capture_cycle,
+            capture_metadata=capture_metadata,
+            window=window,
+        )
+    if projection_format != "rows" or window is not None:
+        raise ValueError("Result projection format or window is unsupported.")
     cycle_paths = tuple(item for item in normalized if item[1][0] == "cycles")
     metadata_paths = tuple(item for item in normalized if item[1][0] != "cycles")
     full_cycles = any(parts == ("cycles",) for _path, parts in cycle_paths)
@@ -645,6 +1044,7 @@ def write_projection(
             temporary,
             expected_digest=expected_digest,
             expected_size=expected_size,
+            top_level_fields=top_level_fields,
         ) as (reader, output):
             output.write('{"dataKeys":')
             output.write(strict_json.dumps(data_keys, sort_keys=True, separators=(",", ":")))
@@ -652,6 +1052,8 @@ def write_projection(
                 output.write(',"cycles":[')
             first_output = True
             for index, cycle in enumerate(reader.cycles()):
+                if capture_cycle is not None:
+                    capture_cycle(copy.deepcopy(cycle))
                 cycle = prepare_cycle(index, cycle)
                 cycle_id = cycle["cycleId"]
                 if first_cycle_id is None:
@@ -673,6 +1075,8 @@ def write_projection(
             if cycle_paths:
                 output.write("]")
             metadata = reader.metadata
+            if capture_metadata is not None:
+                capture_metadata(copy.deepcopy(metadata))
             validate_metadata(
                 metadata,
                 cycle_count=cycle_count,
@@ -715,7 +1119,132 @@ def write_projection(
         raise primary_error.with_traceback(primary_traceback)
 
 
+def write_projection_from_cycles(
+    cycles,
+    metadata,
+    destination_path,
+    *,
+    paths,
+    data_keys,
+    prepare_cycle,
+    finalize_cycles,
+    validate_metadata,
+    top_level_fields=None,
+    copy_cycle=copy.deepcopy,
+    projection_format="rows",
+    window=None,
+):
+    """Project verified cached Result frames to one atomic JSON document.
+
+    Cached base cycles are copied before temporary Modules execute.  The cache
+    therefore never owns or reuses mutable Signal state, while the same cycle
+    and metadata validators still run for every projection request.
+    """
+
+    if not isinstance(cycles, (list, tuple)) or not isinstance(metadata, dict):
+        raise ValueError("Cached Result frames are invalid.")
+    normalized = normalize_projection_paths(
+        paths,
+        top_level_fields=top_level_fields,
+    )
+    if projection_format == COLUMNAR_PROJECTION_FORMAT:
+        return _write_columnar_projection_from_cycles(
+            cycles,
+            metadata,
+            destination_path,
+            normalized=normalized,
+            data_keys=data_keys,
+            prepare_cycle=prepare_cycle,
+            finalize_cycles=finalize_cycles,
+            validate_metadata=validate_metadata,
+            copy_cycle=copy_cycle,
+            window=window,
+        )
+    if projection_format != "rows" or window is not None:
+        raise ValueError("Result projection format or window is unsupported.")
+    cycle_paths = tuple(item for item in normalized if item[1][0] == "cycles")
+    metadata_paths = tuple(item for item in normalized if item[1][0] != "cycles")
+    full_cycles = any(parts == ("cycles",) for _path, parts in cycle_paths)
+    destination = Path(destination_path)
+    temporary = destination.with_name(destination.name + ".tmp")
+    temporary.unlink(missing_ok=True)
+    cycle_count = 0
+    first_cycle_id = None
+    last_cycle_id = None
+    output = None
+    try:
+        output = temporary.open("w", encoding="utf-8")
+        output.write('{"dataKeys":')
+        output.write(strict_json.dumps(data_keys, sort_keys=True, separators=(",", ":")))
+        if cycle_paths:
+            output.write(',"cycles":[')
+        first_output = True
+        for index, base_cycle in enumerate(cycles):
+            cycle = prepare_cycle(index, copy_cycle(base_cycle))
+            cycle_id = cycle["cycleId"]
+            if first_cycle_id is None:
+                first_cycle_id = cycle_id
+            last_cycle_id = cycle_id
+            cycle_count += 1
+            if cycle_paths:
+                if not first_output:
+                    output.write(",")
+                output.write(strict_json.dumps(
+                    _project_cycle(cycle, cycle_paths, full_cycles=full_cycles),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ))
+                first_output = False
+        finalize_cycles()
+        if cycle_paths:
+            output.write("]")
+        validate_metadata(
+            metadata,
+            cycle_count=cycle_count,
+            first_cycle_id=first_cycle_id,
+            last_cycle_id=last_cycle_id,
+        )
+        projected_metadata = {}
+        for path, parts in metadata_paths:
+            value = get_data_segments(metadata, parts, _MISSING)
+            if value is _MISSING:
+                raise ValueError(f"Result slice path '{path}' is missing.")
+            if parts[0] == "dataKeys":
+                continue
+            set_data_segments(projected_metadata, parts, value)
+        for key, value in projected_metadata.items():
+            output.write(",")
+            output.write(strict_json.dumps(key, separators=(",", ":")))
+            output.write(":")
+            output.write(strict_json.dumps(value, sort_keys=True, separators=(",", ":")))
+        output.write("}")
+        output.flush()
+        os.fsync(output.fileno())
+        output.close()
+        output = None
+        os.replace(temporary, destination)
+        return destination
+    except BaseException as primary_error:
+        primary_traceback = primary_error.__traceback__
+        cleanup_error = None
+        if output is not None:
+            try:
+                output.close()
+            except BaseException as exc:
+                cleanup_error = exc
+        for path in (temporary, destination):
+            try:
+                path.unlink(missing_ok=True)
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+        if cleanup_error is not None:
+            _attach_cleanup_context(primary_error, cleanup_error)
+        raise primary_error.with_traceback(primary_traceback)
+
+
 __all__ = (
+    "COLUMNAR_PROJECTION_FORMAT",
+    "COLUMNAR_PROJECTION_SCHEMA_VERSION",
     "FRAMED_RESULT_METADATA_PREFIX",
     "FRAMED_RESULT_PREFIX",
     "MAX_RESULT_VERIFICATION_SHARDS",
@@ -727,7 +1256,9 @@ __all__ = (
     "iter_framed_cycle_values",
     "merge_cycle_identity_ledgers",
     "normalize_projection_paths",
+    "normalize_projection_window",
     "plan_framed_cycle_ranges",
     "read_framed_result_metadata",
     "write_projection",
+    "write_projection_from_cycles",
 )

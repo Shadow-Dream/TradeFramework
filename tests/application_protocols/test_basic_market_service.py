@@ -28,7 +28,9 @@ from application_protocols.basic_workflow.market_data import (
 from application_protocols.basic_workflow.market_service import (
     _bar_snapshot,
     market_state,
+    open_chart,
     open_instrument,
+    project_sample_result_cached,
     project_result_cached,
     run_snapshot_jobs,
     set_watchlist,
@@ -38,11 +40,18 @@ from builtin_implementations import resources as builtin_resources
 from engine.authority.dataset import verify_dataset_version_storage_authority
 from engine.authority.sampler import verify_sampler_runtime_bundle_authority
 from engine.control import database as engine_database
-from engine.repository import datasets, pipelines, samplers
+from engine.repository import (
+    backtest_results,
+    datasets,
+    module_definitions,
+    pipelines,
+    samplers,
+)
 from engine.runtime.dataset import create_dataset_handle
 from engine.runtime.sampler import create_verified_sampler_runtime
 from engine.service import pipelines as pipeline_service
 from engine.service import visualizations as visualization_service
+from engine.service import sample_visualizations as sample_visualization_service
 from engine.service.backtest_submissions import PreparedBacktestSubmissionStore
 
 
@@ -64,6 +73,7 @@ class _FixtureProvider:
                 }
             ],
         }
+
 
     def download_bars(self, instrument, period):
         if instrument["instrumentId"] != "US-AAPL" or period != "day":
@@ -96,6 +106,32 @@ class _FixtureProvider:
                 },
             ],
         }
+
+
+class _MultiFixtureProvider(_FixtureProvider):
+    def sync_catalog(self):
+        base = super().sync_catalog()
+        base["instruments"].extend([
+            {
+                "instrumentId": "US-MSFT",
+                "symbol": "MSFT",
+                "name": "Microsoft Corporation",
+                "exchange": "NASDAQ",
+                "currency": "USD",
+                "assetType": "stock",
+                "availablePeriods": ["day"],
+            },
+            {
+                "instrumentId": "US-NVDA",
+                "symbol": "NVDA",
+                "name": "NVIDIA Corporation",
+                "exchange": "NASDAQ",
+                "currency": "USD",
+                "assetType": "stock",
+                "availablePeriods": ["day"],
+            },
+        ])
+        return base
 
 
 class _PreparedBoundaryJobManager:
@@ -635,7 +671,11 @@ class BasicMarketServiceTests(unittest.TestCase):
         }
         result_digest = "sha256:" + ("c" * 64)
 
+        engine_calls = 0
+
         def write_slice(_config, backtest_id, paths, modules, destination, **_kwargs):
+            nonlocal engine_calls
+            engine_calls += 1
             self.assertEqual(backtest_id, opened["job"]["backtestId"])
             self.assertEqual(paths, sorted(request["paths"]))
             self.assertEqual(modules, [])
@@ -643,6 +683,15 @@ class BasicMarketServiceTests(unittest.TestCase):
                 json.dumps({"cycles": {"time": ["2026-01-02T21:00:00Z"]}}),
                 encoding="utf-8",
             )
+            return {
+                "path": destination,
+                "cache": {
+                    "hit": engine_calls > 1,
+                    "cacheKey": "sha256:" + ("d" * 64),
+                    "payloadDigest": "sha256:" + ("e" * 64),
+                    "payloadSize": destination.stat().st_size,
+                },
+            }
 
         with (
             mock.patch.object(
@@ -655,7 +704,7 @@ class BasicMarketServiceTests(unittest.TestCase):
             ),
             mock.patch.object(
                 market_service_module.result_projection_service,
-                "write_backtest_result_slice",
+                "write_backtest_result_slice_cached",
                 side_effect=write_slice,
             ) as writer,
         ):
@@ -672,17 +721,16 @@ class BasicMarketServiceTests(unittest.TestCase):
         self.assertFalse(first["cache"]["hit"])
         self.assertTrue(second["cache"]["hit"])
         self.assertEqual(first["result"], second["result"])
-        self.assertEqual(writer.call_count, 1)
-        cache_files = list(
+        self.assertEqual(writer.call_count, 2)
+        self.assertFalse(
             (
                 Path(self.config["controlRoot"])
                 / "application-protocols"
                 / "basic-workflow"
                 / "market"
                 / "projection-cache"
-            ).glob("*.json")
+            ).exists()
         )
-        self.assertEqual(len(cache_files), 1)
 
     def test_watchlist_snapshot_jobs_publish_bars_without_a_backtest(self):
         with mock.patch.object(
@@ -748,7 +796,169 @@ class BasicMarketServiceTests(unittest.TestCase):
             [job["status"] for job in state["snapshotJobs"]],
             ["completed", "completed"],
         )
-        self.assertEqual(download.call_count, 2)
+        self.assertEqual(download.call_count, 1)
+
+    def test_chart_cache_materializes_sampler_projection_without_backtest(self):
+        with mock.patch.object(
+            self.provider,
+            "download_bars",
+            wraps=self.provider.download_bars,
+        ) as download:
+            synced = sync_market(
+                self.config,
+                {"providerId": DEFAULT_PROVIDER_ID},
+                providers=self.providers,
+            )
+            self.assertEqual(run_snapshot_jobs(
+                self.config,
+                providers=self.providers,
+            ), 1)
+            selection = {
+                "snapshotId": synced["snapshot"]["snapshotId"],
+                "instrumentId": "US-AAPL",
+                "period": "day",
+            }
+            opened = open_chart(
+                self.config,
+                selection,
+                providers=self.providers,
+            )
+            with mock.patch.object(
+                market_service_module,
+                "_saved_bar_materialization",
+                side_effect=AssertionError("warm chart reopened its Dataset"),
+            ):
+                reopened = open_chart(
+                    self.config,
+                    selection,
+                    providers=self.providers,
+                )
+        self.assertTrue(opened["ready"])
+        self.assertEqual(opened, reopened)
+        self.assertEqual(download.call_count, 1)
+        catalog = market_service_module.chart_module_catalog(self.config)
+        with mock.patch.object(
+            market_service_module.control_state,
+            "load_state",
+            side_effect=AssertionError("warm chart catalog reloaded the Module index"),
+        ):
+            self.assertEqual(
+                market_service_module.chart_module_catalog(self.config),
+                catalog,
+            )
+        self.assertEqual(len(catalog["modules"]), 22)
+        sample = opened["materialization"]["sampleResult"]
+        self.assertEqual(sample["cycleCount"], 3)
+        self.assertEqual(
+            backtest_results.list_backtests(self.config, include_archived=True),
+            [],
+        )
+        projection = project_sample_result_cached(self.config, {
+            "sampleResultId": sample["sampleResultId"],
+            "paths": ["cycles.data.price.day.US-AAPL"],
+            "temporaryModules": [],
+        })
+        self.assertTrue(projection["cache"]["hit"])
+        self.assertEqual(len(projection["result"]["cycles"]), 3)
+        visualizations = sample_visualization_service.list_sample_visualizations(
+            self.config,
+            sample["sampleResultId"],
+        )
+        self.assertEqual(len(visualizations), 1)
+        self.assertEqual(visualizations[0]["revision"], 1)
+        definitions = list(
+            module_definitions.load_pipeline_definitions(self.config).values()
+        )
+
+        def latest_version(module_id):
+            return max(
+                (
+                    value for value in definitions
+                    if value["kind"] == "Signal" and value["moduleId"] == module_id
+                ),
+                key=lambda value: int(value["version"]),
+            )["version"]
+
+        temporary_modules = [
+            {
+                "instanceId": "chart-source",
+                "kind": "Signal",
+                "moduleId": "basic-price-close-selector",
+                "version": latest_version("basic-price-close-selector"),
+                "config": {"decisionPeriod": "day", "instrumentId": "US-AAPL"},
+                "inputs": {"price": "price"},
+                "outputs": {"close": "chart.close"},
+            },
+            {
+                "instanceId": "chart-sma",
+                "kind": "Signal",
+                "moduleId": "sma-indicator",
+                "version": latest_version("sma-indicator"),
+                "config": {"period": 2},
+                "inputs": {"value": "chart.close"},
+                "outputs": {"sma": "chart.sma"},
+            },
+        ]
+        signal_projection = project_sample_result_cached(self.config, {
+            "sampleResultId": sample["sampleResultId"],
+            "paths": ["cycles.data.chart.sma"],
+            "temporaryModules": temporary_modules,
+        })
+        self.assertEqual(
+            [cycle["data"]["chart"]["sma"] for cycle in signal_projection["result"]["cycles"]],
+            [None, 102.0, 102.5],
+        )
+
+    def test_interactive_open_promotes_queued_chart_cache(self):
+        provider = _MultiFixtureProvider()
+        providers = {provider.provider_id: provider}
+        synced = sync_market(
+            self.config,
+            {"providerId": DEFAULT_PROVIDER_ID},
+            providers=providers,
+        )
+        snapshot = synced["snapshot"]
+        instrument = next(
+            item for item in snapshot["instruments"]
+            if item["instrumentId"] == "US-NVDA"
+        )
+        promoted = market_service_module._promote_snapshot_job(
+            self.config,
+            snapshot,
+            instrument,
+            "day",
+        )
+        self.assertEqual(promoted["status"], "queued")
+        claimed = market_service_module._claim_snapshot_job(self.config)
+        self.assertEqual(claimed["instrumentId"], "US-NVDA")
+
+    def test_interactive_open_requeues_failed_chart_cache(self):
+        synced = sync_market(
+            self.config,
+            {"providerId": DEFAULT_PROVIDER_ID},
+            providers=self.providers,
+        )
+        first = market_service_module._claim_snapshot_job(self.config)
+        market_service_module._finish_snapshot_job(
+            self.config,
+            first["jobId"],
+            error="RuntimeError: snapshot acquisition failed",
+        )
+        snapshot = synced["snapshot"]
+        instrument = next(
+            item for item in snapshot["instruments"]
+            if item["instrumentId"] == first["instrumentId"]
+        )
+        retried = market_service_module._promote_snapshot_job(
+            self.config,
+            snapshot,
+            instrument,
+            first["period"],
+        )
+        self.assertNotEqual(retried["jobId"], first["jobId"])
+        self.assertEqual(retried["status"], "queued")
+        claimed = market_service_module._claim_snapshot_job(self.config)
+        self.assertEqual(claimed["jobId"], retried["jobId"])
 
     def test_materialization_cache_is_owner_scoped_and_content_addressed(self):
         synced = sync_market(

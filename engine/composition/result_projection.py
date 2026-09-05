@@ -3,7 +3,20 @@
 from __future__ import annotations
 
 from engine.compiler.result_projection import compile_temporary_module_plan
-from engine.runtime.result_projection import write_verified_result_projection
+from engine.runtime.result_projection import (
+    write_verified_result_projection,
+    write_verified_result_projection_from_frames,
+)
+
+
+def compile_result_projection_plan(result, temporary_modules, module_definitions):
+    """Compile the pure temporary projection Graph at the composition boundary."""
+
+    return compile_temporary_module_plan(
+        result,
+        temporary_modules,
+        module_definitions,
+    )
 
 
 def project_result(
@@ -12,6 +25,11 @@ def project_result(
     temporary_modules,
     module_definitions,
     destination_path,
+    *,
+    capture_cycle=None,
+    capture_metadata=None,
+    projection_format="rows",
+    window=None,
 ):
     temporary_plan = None
     if temporary_modules:
@@ -25,7 +43,44 @@ def project_result(
         paths,
         destination_path,
         temporary_plan=temporary_plan,
+        capture_cycle=capture_cycle,
+        capture_metadata=capture_metadata,
+        projection_format=projection_format,
+        window=window,
     )
 
 
-__all__ = ("project_result",)
+def project_result_frames(
+    evidence,
+    frames,
+    paths,
+    temporary_modules,
+    module_definitions,
+    destination_path,
+    *,
+    projection_format="rows",
+    window=None,
+):
+    temporary_plan = None
+    if temporary_modules:
+        temporary_plan = compile_temporary_module_plan(
+            {"dataKeys": evidence["dataKeys"]},
+            temporary_modules,
+            module_definitions,
+        )
+    return write_verified_result_projection_from_frames(
+        evidence,
+        frames,
+        paths,
+        destination_path,
+        temporary_plan=temporary_plan,
+        projection_format=projection_format,
+        window=window,
+    )
+
+
+__all__ = (
+    "compile_result_projection_plan",
+    "project_result",
+    "project_result_frames",
+)

@@ -43,6 +43,26 @@ def content_digest(value) -> str:
     return "sha256:" + hashlib.sha256(canonical_json(value)).hexdigest()
 
 
+def file_content_digest(path, *, expected_size):
+    """Hash one exact archive byte stream with a verified size boundary."""
+
+    if (
+        isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or expected_size < 0
+    ):
+        raise ValueError("Archive file size is invalid.")
+    digest = hashlib.sha256()
+    size = 0
+    with Path(path).open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            size += len(chunk)
+            digest.update(chunk)
+    if size != expected_size:
+        raise ValueError("Archive file size does not match its immutable index.")
+    return "sha256:" + digest.hexdigest()
+
+
 def next_version(records, *, identity_key: str, identity: str) -> str:
     if not isinstance(identity_key, str) or not identity_key:
         raise ValueError("Archived version identity key must be a non-empty string.")

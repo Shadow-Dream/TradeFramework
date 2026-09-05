@@ -17,6 +17,10 @@ class TemporaryResultRuntimeTests(BacktestIntegrationTestCase):
                 "engine.contracts.result.compile_cycle_validator",
                 return_value=lambda _data: None,
             ),
+            mock.patch(
+                "engine.runtime.module_invoker.seal_runtime_validated_module_inputs",
+                side_effect=lambda _authority, inputs: inputs,
+            ),
         ):
             with result_projection_runtime.ResultCycleProcessor(
                 result.get("dataKeys", {}), (plan, {}, frozenset())
@@ -47,7 +51,7 @@ class TemporaryResultRuntimeTests(BacktestIntegrationTestCase):
             def from_authority(cls, *_args, **_kwargs):
                 return cls()
 
-            def invoke(self, inputs):
+            def invoke_validated(self, inputs):
                 events.append(("invoke", inputs["value"]))
                 return {"value": inputs["value"] + 1}
 
@@ -220,7 +224,7 @@ class TemporaryResultRuntimeTests(BacktestIntegrationTestCase):
             def from_authority(cls, *_args, **_kwargs):
                 return cls()
 
-            def invoke(self, inputs):
+            def invoke_validated(self, inputs):
                 seen.append(inputs)
                 return {}
 
@@ -276,7 +280,7 @@ class TemporaryResultRuntimeTests(BacktestIntegrationTestCase):
             def from_authority(cls, authority, *_args, **_kwargs):
                 return cls(authority)
 
-            def invoke(self, inputs):
+            def invoke_validated(self, inputs):
                 value = next(iter(inputs.values()), 0)
                 events.append(("invoke", self.name, value))
                 return {"value": value + 1}

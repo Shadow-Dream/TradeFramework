@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import gzip
 import hmac
 import mimetypes
 import os
@@ -50,6 +51,7 @@ from engine.service import dataset_workspaces as dataset_workspace_service
 from engine.runtime import result_runtime
 from engine.service import backtest_results as backtest_result_service
 from engine.service import result_projection as result_projection_service
+from engine.service import projection_prewarm
 from engine.service import analysis as analysis_service
 from engine.service import environment as environment_service
 from engine.service import jupyter_proxy
@@ -674,10 +676,33 @@ def write_extra_headers(handler, headers):
         handler.send_header(name, value)
 
 
+def request_accepts_gzip(handler):
+    for raw in str(handler.headers.get("Accept-Encoding", "")).split(","):
+        parts = [part.strip() for part in raw.split(";")]
+        if not parts or parts[0].lower() != "gzip":
+            continue
+        quality = 1.0
+        for parameter in parts[1:]:
+            if parameter.lower().startswith("q="):
+                try:
+                    quality = float(parameter[2:])
+                except ValueError:
+                    quality = 0.0
+        return quality > 0
+    return False
+
+
 def response_json(handler, status, payload, headers=None):
     body = strict_json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    accepts_gzip = request_accepts_gzip(handler)
+    compressed = accepts_gzip and len(body) >= 64 * 1024
+    if compressed:
+        body = gzip.compress(body, compresslevel=6, mtime=0)
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Vary", "Accept-Encoding")
+    if compressed:
+        handler.send_header("Content-Encoding", "gzip")
     handler.send_header("Content-Length", str(len(body)))
     write_security_headers(handler, no_store=True)
     write_extra_headers(handler, headers)
@@ -718,11 +743,34 @@ def response_file(handler, path, filename, content_type="application/zip"):
 def response_json_file(handler, status, path, *, prefix=b"", suffix=b""):
     """Stream one already-encoded JSON document without a host-memory copy."""
     path = Path(path)
+    source_size = len(prefix) + path.stat().st_size + len(suffix)
+    accepts_gzip = request_accepts_gzip(handler)
+    if accepts_gzip and source_size >= 64 * 1024:
+        with tempfile.TemporaryFile(prefix="trade-result-gzip-") as compressed:
+            with gzip.GzipFile(fileobj=compressed, mode="wb", mtime=0) as encoder:
+                if prefix:
+                    encoder.write(prefix)
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        encoder.write(chunk)
+                if suffix:
+                    encoder.write(suffix)
+            compressed_size = compressed.tell()
+            compressed.seek(0)
+            handler.send_response(status)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Encoding", "gzip")
+            handler.send_header("Vary", "Accept-Encoding")
+            handler.send_header("Content-Length", str(compressed_size))
+            write_security_headers(handler, no_store=True)
+            handler.end_headers()
+            for chunk in iter(lambda: compressed.read(1024 * 1024), b""):
+                handler.wfile.write(chunk)
+        return
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header(
-        "Content-Length", str(len(prefix) + path.stat().st_size + len(suffix))
-    )
+    handler.send_header("Vary", "Accept-Encoding")
+    handler.send_header("Content-Length", str(source_size))
     write_security_headers(handler, no_store=True)
     handler.end_headers()
     if prefix:
@@ -735,11 +783,18 @@ def response_json_file(handler, status, path, *, prefix=b"", suffix=b""):
 
 
 def response_backtest_result_slice(
-    handler, config, backtest_id, paths, temporary_modules
+    handler,
+    config,
+    backtest_id,
+    paths,
+    temporary_modules,
+    *,
+    projection_format="rows",
+    window=None,
 ):
     with tempfile.TemporaryDirectory(prefix="trade-result-http-") as root:
         document = Path(root) / "result.json"
-        result_projection_service.write_backtest_result_slice(
+        projected = result_projection_service.write_backtest_result_slice_cached(
             config,
             backtest_id,
             paths,
@@ -750,10 +805,14 @@ def response_backtest_result_slice(
                 if temporary_modules
                 else None
             ),
+            projection_format=projection_format,
+            window=window,
         )
         prefix = (
             '{"backtestId":'
             + strict_json.dumps(backtest_id, separators=(",", ":"))
+            + ',"cache":'
+            + strict_json.dumps(projected["cache"], separators=(",", ":"))
             + ',"result":'
         ).encode("utf-8")
         response_json_file(
@@ -2051,7 +2110,9 @@ class EngineServiceHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[:2] == ["api", "backtests"] and parts[3] == "result":
                 control.require_exact_fields(
                     payload,
-                    allowed={"paths", "temporaryModules"},
+                    allowed={
+                        "paths", "temporaryModules", "projectionFormat", "window",
+                    },
                     required={"paths", "temporaryModules"},
                     label="Result slice request",
                 )
@@ -2063,6 +2124,8 @@ class EngineServiceHandler(BaseHTTPRequestHandler):
                     parts[2],
                     payload.get("paths") or [],
                     payload.get("temporaryModules") or [],
+                    projection_format=payload.get("projectionFormat", "rows"),
+                    window=payload.get("window"),
                 )
                 return
             if path == "/api/modules":
@@ -2272,6 +2335,7 @@ def _shutdown_engine_service(
             first_error = first_error or exc
     if manager is not None or server is not None:
         for action in (
+            projection_prewarm.shutdown_projection_prewarm,
             result_runtime.shutdown_result_runtimes,
             dataset_build_runtime.shutdown_build_processes,
         ):
@@ -2343,7 +2407,10 @@ def _run_engine_service(args):
     EngineServiceHandler.config = control.load_config(args.config)
     try:
         public_origin = normalize_public_origin(args.public_url, "public URL")
-        agent_origin = normalize_public_origin(args.agent_public_url, "Agent public URL")
+        agent_origin = normalize_public_origin(
+            getattr(args, "agent_public_url", args.public_url),
+            "Agent public URL",
+        )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     if urlparse(public_origin).hostname != urlparse(agent_origin).hostname:

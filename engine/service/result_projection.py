@@ -8,11 +8,13 @@ from pathlib import Path
 
 from engine.control import database as engine_database
 from engine.repository import backtest_results as result_repository
+from engine.runtime.projection_worker import write_result_projection_in_worker
 from engine.runtime.result_projection import write_verified_result_projection
-from engine.runtime.result_runtime import write_result_projection_in_runtime
+from engine.service import projection_cache
+from engine.service import projection_prewarm
 
 
-def write_backtest_result_slice(
+def write_backtest_result_slice_cached(
     config,
     backtest_id,
     paths,
@@ -20,6 +22,9 @@ def write_backtest_result_slice(
     destination_path,
     *,
     module_definitions_loader=None,
+    projection_format="rows",
+    window=None,
+    priority="interactive",
 ):
     """Write one bounded-memory Result projection for HTTP or local consumers."""
     if not isinstance(temporary_modules, list):
@@ -37,22 +42,72 @@ def write_backtest_result_slice(
     evidence = result_repository.load_result_archive_evidence(
         config, backtest_id, verify_digest=False
     )
+    module_definitions = {}
     if temporary_modules:
         if not callable(module_definitions_loader):
             raise ValueError(
                 "Temporary visualization requires the Archived Module repository."
             )
-        module_definitions = module_definitions_loader()
-        return write_result_projection_in_runtime(
+        available_definitions = module_definitions_loader()
+        references = {
+            (module.get("kind"), module.get("moduleId"), module.get("version"))
+            for module in temporary_modules
+        }
+        module_definitions = {
+            key: definition
+            for key, definition in available_definitions.items()
+            if (
+                definition.get("kind"),
+                definition.get("moduleId"),
+                definition.get("version"),
+            ) in references
+        }
+        matched = {
+            (
+                definition.get("kind"),
+                definition.get("moduleId"),
+                definition.get("version"),
+            )
+            for definition in module_definitions.values()
+        }
+        if matched != references:
+            raise ValueError(
+                "Temporary visualization requires every exact Archived Module Definition."
+            )
+    identity = projection_cache.projection_identity(
+        kind="backtest",
+        result_id=backtest_id,
+        result_content_digest=evidence["contentDigest"],
+        paths=paths,
+        temporary_modules=temporary_modules,
+        module_definitions=module_definitions,
+        projection_format=projection_format,
+        window=window,
+    )
+    cache = projection_cache.write_cached_projection(
+        config,
+        identity,
+        destination_path,
+        lambda staged: write_result_projection_in_worker(
             evidence,
             paths,
             temporary_modules,
             module_definitions,
-            destination_path,
-        )
-    return write_verified_result_projection(
-        evidence, paths, destination_path
+            staged,
+            projection_format=projection_format,
+            window=window,
+            priority=priority,
+        ),
     )
+    if cache["hit"]:
+        projection_prewarm.prepare_projection_source(
+            "backtest", evidence, interactive=priority == "interactive"
+        )
+    return {"path": destination_path, "cache": cache}
+
+
+def write_backtest_result_slice(*args, **kwargs):
+    return write_backtest_result_slice_cached(*args, **kwargs)["path"]
 
 
 def validate_backtest_result_archive(config, backtest_id):
@@ -74,4 +129,8 @@ def validate_backtest_result_archive(config, backtest_id):
     }
 
 
-__all__ = ("validate_backtest_result_archive", "write_backtest_result_slice")
+__all__ = (
+    "validate_backtest_result_archive",
+    "write_backtest_result_slice",
+    "write_backtest_result_slice_cached",
+)

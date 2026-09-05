@@ -413,9 +413,11 @@ vm.runInContext(source, context);
   assert.equal(result.calls.length, 3);
   assert.deepEqual(result.calls[0], {
     paths: ['cycles.data.a'], temporaryModules: [],
+    projectionFormat: 'columns-v2', window: null,
   });
   assert.deepEqual(result.calls[1], {
     paths: ['cycles.data.raw'], temporaryModules: [{ instanceId: 'thrower' }],
+    projectionFormat: 'columns-v2', window: null,
   });
   assert.deepEqual(result.calls[2], result.calls[1]);
   assert.equal(result.keyBefore, result.keyAfterStyle);
@@ -617,7 +619,10 @@ vm.runInContext(source, context);
     pageState.pane.visualizers[1].params.dataKey = 'b2';
     await loadPaneResult();
     assert.equal(calls.length, 3);
-    assert.deepEqual(calls[2], { paths: ['cycles.data.b2'], temporaryModules: [] });
+    assert.deepEqual(calls[2], {
+      paths: ['cycles.data.b2'], temporaryModules: [],
+      projectionFormat: 'columns-v2', window: null,
+    });
     assert.equal(cache.entries.get('a'), aEntry);
     assert.equal(pageState.result.instanceResults.a.token, 'cycles.data.a');
 
@@ -1307,6 +1312,7 @@ const output = vm.runInContext(`(() => {
   renderPaneDiagnostics = () => {};
   subscribePaneView = () => {};
   window.TradeChartCore = {
+    prepareFinancialPane() { return {}; },
     paneTimeInfo() {
       if (phase === 'time') throw new Error('paneTimeInfo exploded');
       return { start: 1, end: 2, showTime: false, diagnostics: [] };
@@ -1427,9 +1433,9 @@ process.stdout.write(output);
                 self.assertTrue(item["drawingCleanupIsNull"])
                 self.assertTrue(item["redrawn"])
         self.assertEqual(result["boundControls"], 10)
-        self.assertEqual(result["removedCharts"], 6)
+        self.assertEqual(result["removedCharts"], 5)
         self.assertEqual(result["toolbarCleanups"], 5)
-        self.assertEqual(result["contextCleanups"], 10)
+        self.assertEqual(result["contextCleanups"], 8)
         self.assertGreaterEqual(result["errors"], 5)
         self.assertEqual(result["status"], "Ready")
 
